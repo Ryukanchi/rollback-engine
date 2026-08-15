@@ -112,6 +112,38 @@
       }
     },
     "/order/{id}": {
+      "get": {
+        "tags": ["Reads"],
+        "operationId": "getOrder",
+        "summary": "Get single order by aggregate ID",
+        "parameters": [
+          { "$ref": "#/components/parameters/OrderId" },
+          {
+            "name": "consistency",
+            "in": "query",
+            "required": false,
+            "description": "Consistency mode for reading order state (materialized view vs authoritative replay)",
+            "schema": {
+              "type": "string",
+              "enum": ["materialized", "authoritative"],
+              "default": "materialized"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Order entity",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/OrderEntity" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ValidationError" },
+          "404": { "$ref": "#/components/responses/NotFoundError" },
+          "500": { "$ref": "#/components/responses/TechnicalError" }
+        }
+      },
       "delete": {
         "tags": ["Commands"],
         "operationId": "deleteOrder",
@@ -682,6 +714,95 @@
           },
           "400": { "$ref": "#/components/responses/ValidationError" },
           "404": { "$ref": "#/components/responses/NotFoundError" },
+          "500": { "$ref": "#/components/responses/TechnicalError" }
+        }
+      }
+    },
+    "/state-at/{orderId}/sequence/{sequence}": {
+      "get": {
+        "tags": ["Reads", "Developer"],
+        "operationId": "stateAtSequence",
+        "summary": "Replay a contiguous event prefix up to an exact sequence number",
+        "parameters": [
+          { "$ref": "#/components/parameters/OrderIdByName" },
+          {
+            "name": "sequence",
+            "in": "path",
+            "required": true,
+            "description": "Sequence number of the event prefix to project",
+            "schema": { "type": "integer", "minimum": 0 }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "State at the requested sequence",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ProjectionState" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ValidationError" },
+          "404": { "$ref": "#/components/responses/NotFoundError" },
+          "500": { "$ref": "#/components/responses/TechnicalError" }
+        }
+      }
+    },
+    "/diagnostics": {
+      "get": {
+        "tags": ["Developer"],
+        "operationId": "getDiagnostics",
+        "summary": "Query recorded engine diagnostics",
+        "parameters": [
+          {
+            "name": "type",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "aggregateId",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "commandId",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "minimum": 1 }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Diagnostic records",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "count": { "type": "integer" },
+                    "diagnostics": {
+                      "type": "array",
+                      "items": { "type": "object" }
+                    }
+                  }
+                }
+              }
+            }
+          },
           "500": { "$ref": "#/components/responses/TechnicalError" }
         }
       }

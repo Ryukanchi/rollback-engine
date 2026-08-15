@@ -42,6 +42,10 @@ function assertSnapshot(snapshot) {
 
   assertNormalizedTimestamp(snapshot.timestamp);
 
+  if (snapshot.lastEventId !== undefined && (typeof snapshot.lastEventId !== "string" || snapshot.lastEventId.trim().length === 0)) {
+    throw new TypeError("snapshot.lastEventId must be a non-empty string");
+  }
+
   if (!snapshot.state || typeof snapshot.state !== "object" || Array.isArray(snapshot.state)) {
     throw new TypeError("snapshot.state must be an object");
   }

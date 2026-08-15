@@ -94,7 +94,10 @@ function registerEventStoreContract({ adapterName, createStore }) {
       store.append(otherAggregate, { expectedVersion: 0 });
 
       assert.deepEqual(store.getByAggregateId(1), [first, second]);
+      assert.deepEqual(store.getByAggregateIdAfter(1, 0), [first, second]);
       assert.deepEqual(store.getByAggregateIdAfter(1, 1), [second]);
+      assert.deepEqual(store.getByAggregateIdAfter(1, 2), []);
+      assert.deepEqual(store.getByAggregateIdAfter(1, 99), []);
       assert.deepEqual(store.getByAggregateId(2), [otherAggregate]);
       assert.equal(store.getLastSequence(1), 2);
       assert.equal(store.getLastSequence(2), 1);

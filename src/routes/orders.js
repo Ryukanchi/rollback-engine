@@ -37,6 +37,34 @@ function createOrdersRouter({ rollbackEngine }) {
     }
   });
 
+  router.get("/order/:id", (req, res, next) => {
+    try {
+      const aggregateId = parseAggregateId(req.params.id);
+      const consistency = req.query.consistency || "materialized";
+
+      if (consistency !== "materialized" && consistency !== "authoritative") {
+        throw createHttpError(
+          400,
+          "consistency must be either 'materialized' or 'authoritative'"
+        );
+      }
+
+      const order = rollbackEngine.getOrder(aggregateId, { consistency });
+
+      if (!order) {
+        throw createHttpError(
+          404,
+          `Order ${aggregateId} does not exist`,
+          "AGGREGATE_NOT_FOUND"
+        );
+      }
+
+      return res.json(order);
+    } catch (error) {
+      return next(error);
+    }
+  });
+
   router.post("/order", (req, res, next) => {
     try {
       assertRequestBody(req.body);

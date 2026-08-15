@@ -3,6 +3,10 @@ const DIAGNOSTIC_TYPES = Object.freeze({
   EVENT_APPEND: "EVENT_APPEND",
   MATERIALIZED_VIEW_REPAIR: "MATERIALIZED_VIEW_REPAIR",
   SNAPSHOT_SAVE: "SNAPSHOT_SAVE",
+  IDEMPOTENCY_DEDUPLICATED: "IDEMPOTENCY_DEDUPLICATED",
+  CONCURRENCY_CONFLICT: "CONCURRENCY_CONFLICT",
+  SNAPSHOT_FALLBACK_REPLAY: "SNAPSHOT_FALLBACK_REPLAY",
+  SUBSCRIPTION_ERROR: "SUBSCRIPTION_ERROR",
 });
 
 const DIAGNOSTIC_STATUSES = Object.freeze({
@@ -12,7 +16,13 @@ const DIAGNOSTIC_STATUSES = Object.freeze({
   REPAIRED: "REPAIRED",
   REPAIR_FAILED: "REPAIR_FAILED",
   SAVE_FAILED: "SAVE_FAILED",
+  DEDUPLICATED: "DEDUPLICATED",
+  CONFLICT_DETECTED: "CONFLICT_DETECTED",
+  FALLBACK_TO_FULL_REPLAY: "FALLBACK_TO_FULL_REPLAY",
+  HANDLER_FAILED: "HANDLER_FAILED",
 });
+
+const DEFAULT_BUFFER_SIZE = 500;
 
 function deepFreeze(value, seen = new WeakSet()) {
   if (!value || typeof value !== "object" || seen.has(value)) {
@@ -28,12 +38,70 @@ function deepFreeze(value, seen = new WeakSet()) {
   return Object.freeze(value);
 }
 
-function createDiagnosticEmitter(reporter = () => {}) {
+class DiagnosticBuffer {
+  #buffer = [];
+
+  #maxSize;
+
+  constructor(maxSize = DEFAULT_BUFFER_SIZE) {
+    this.#maxSize = maxSize;
+  }
+
+  push(diagnostic) {
+    this.#buffer.push(diagnostic);
+
+    if (this.#buffer.length > this.#maxSize) {
+      this.#buffer.shift();
+    }
+  }
+
+  query({
+    type,
+    status,
+    aggregateId,
+    commandId,
+    limit,
+  } = {}) {
+    let results = [...this.#buffer];
+
+    if (type !== undefined) {
+      results = results.filter((d) => d.type === type);
+    }
+
+    if (status !== undefined) {
+      results = results.filter((d) => d.status === status);
+    }
+
+    if (aggregateId !== undefined) {
+      results = results.filter(
+        (d) => String(d.aggregateId) === String(aggregateId)
+      );
+    }
+
+    if (commandId !== undefined) {
+      results = results.filter((d) => d.commandId === commandId);
+    }
+
+    if (Number.isSafeInteger(limit) && limit > 0) {
+      results = results.slice(-limit);
+    }
+
+    return results;
+  }
+
+  clear() {
+    this.#buffer = [];
+  }
+}
+
+function createDiagnosticEmitter(reporter = () => {}, { bufferSize = DEFAULT_BUFFER_SIZE } = {}) {
   if (typeof reporter !== "function") {
     throw new TypeError("diagnosticReporter must be a function");
   }
 
-  return function emitDiagnostic({ type, status, ...context }) {
+  const buffer = new DiagnosticBuffer(bufferSize);
+
+  const emitter = function emitDiagnostic({ type, status, ...context }) {
     if (typeof type !== "string" || type.length === 0) {
       throw new TypeError("diagnostic.type must be a non-empty string");
     }
@@ -51,6 +119,8 @@ function createDiagnosticEmitter(reporter = () => {}) {
       })
     );
 
+    buffer.push(diagnostic);
+
     try {
       const outcome = reporter(diagnostic);
 
@@ -63,10 +133,16 @@ function createDiagnosticEmitter(reporter = () => {}) {
 
     return diagnostic;
   };
+
+  emitter.query = (filter) => buffer.query(filter);
+  emitter.clear = () => buffer.clear();
+
+  return emitter;
 }
 
 module.exports = {
   DIAGNOSTIC_STATUSES,
   DIAGNOSTIC_TYPES,
+  DiagnosticBuffer,
   createDiagnosticEmitter,
 };

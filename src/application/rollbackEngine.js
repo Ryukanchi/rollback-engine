@@ -53,6 +53,12 @@ function assertPositiveInteger(value, name) {
   }
 }
 
+function assertNonNegativeInteger(value, name) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`${name} must be a non-negative safe integer`);
+  }
+}
+
 function normalizeTimestamp(timestamp) {
   if (typeof timestamp !== "string" || timestamp.length === 0) {
     throw new TypeError("timestamp must be a valid date string");
@@ -175,6 +181,7 @@ class RollbackEngine {
       commandStore,
       operationIdGenerator,
       diagnosticReporter,
+      emitDiagnostic: this.#emitDiagnostic,
     });
     this.#nextAggregateId = startingIds.aggregateId ?? 1;
     this.#nextReservationId = startingIds.reservationId ?? 1;
@@ -319,6 +326,38 @@ class RollbackEngine {
       .map((state) => state.order);
   }
 
+  getOrder(aggregateId, { consistency = "materialized" } = {}) {
+    if (consistency === "authoritative") {
+      const state = this.#ensureLiveState(aggregateId);
+      if (!state || state.deleted || !state.order) {
+        return null;
+      }
+      return state.order;
+    }
+
+    if (consistency === "materialized") {
+      const state = this.#stateRepository.getByAggregateId(aggregateId);
+      if (!state || state.deleted || !state.order) {
+        return null;
+      }
+      return state.order;
+    }
+
+    throw new TypeError(`Unsupported consistency level: ${consistency}`);
+  }
+
+  getState(aggregateId, { consistency = "materialized" } = {}) {
+    if (consistency === "authoritative") {
+      return this.#ensureLiveState(aggregateId);
+    }
+
+    if (consistency === "materialized") {
+      return this.#stateRepository.getByAggregateId(aggregateId);
+    }
+
+    throw new TypeError(`Unsupported consistency level: ${consistency}`);
+  }
+
   compensate(
     aggregateId,
     reason = "Manual checkout compensation",
@@ -386,6 +425,11 @@ class RollbackEngine {
     }
 
     if (!this.#snapshotMatchesEventPrefix(snapshot, aggregateId, aggregateEvents)) {
+      this.#emitDiagnostic({
+        type: DIAGNOSTIC_TYPES.SNAPSHOT_FALLBACK_REPLAY,
+        status: DIAGNOSTIC_STATUSES.FALLBACK_TO_FULL_REPLAY,
+        aggregateId,
+      });
       return fullReplay();
     }
 
@@ -423,6 +467,27 @@ class RollbackEngine {
       : createInitialState(aggregateId);
   }
 
+  replayAtSequence(aggregateId, targetSequence) {
+    assertNonNegativeInteger(targetSequence, "targetSequence");
+    const aggregateEvents = this.#eventStore.getByAggregateId(aggregateId);
+
+    if (aggregateEvents.length === 0) {
+      return null;
+    }
+
+    if (targetSequence === 0) {
+      return createInitialState(aggregateId);
+    }
+
+    const eventsUpToSequence = aggregateEvents.filter(
+      (event) => event.sequence <= targetSequence
+    );
+
+    return eventsUpToSequence.length > 0
+      ? projectEvents(eventsUpToSequence)
+      : createInitialState(aggregateId);
+  }
+
   createSnapshot(aggregateId) {
     const state = this.replay(aggregateId);
 
@@ -430,10 +495,14 @@ class RollbackEngine {
       throw createAggregateNotFoundError(aggregateId);
     }
 
+    const aggregateEvents = this.#eventStore.getByAggregateId(aggregateId);
+    const lastEvent = aggregateEvents[state.version - 1];
+
     return this.#snapshotStore.save({
       aggregateId,
       version: state.version,
       timestamp: normalizeTimestamp(this.#clock()),
+      lastEventId: lastEvent?.eventId,
       state,
     });
   }
@@ -468,6 +537,20 @@ class RollbackEngine {
 
   getTimeline(aggregateId) {
     return buildEventTimeline(this.#eventStore.getByAggregateId(aggregateId));
+  }
+
+  getDiagnostics(filter = {}) {
+    if (typeof this.#emitDiagnostic?.query === "function") {
+      return this.#emitDiagnostic.query(filter);
+    }
+    return [];
+  }
+
+  subscribe(filter, handler) {
+    if (typeof this.#eventStore.subscribe === "function") {
+      return this.#eventStore.subscribe(filter, handler);
+    }
+    return () => {};
   }
 
   #allocateAggregateId() {

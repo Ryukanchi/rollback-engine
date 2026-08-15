@@ -164,3 +164,31 @@ test("rejects a conflicting replacement at the same snapshot version", () => {
   );
   assert.deepEqual(store.getByAggregateId(1), original);
 });
+
+test("saves and loads snapshot with optional lastEventId", () => {
+  const store = new InMemorySnapshotStore();
+  const state = stateAtVersionOne(1);
+  const snapshot = {
+    aggregateId: 1,
+    version: 1,
+    timestamp: "2026-08-14T10:00:01.000Z",
+    lastEventId: "event-1-1",
+    state,
+  };
+
+  assert.deepEqual(store.save(snapshot), snapshot);
+  assert.deepEqual(store.getByAggregateId(1), snapshot);
+
+  assert.throws(
+    () =>
+      store.save({
+        aggregateId: 1,
+        version: 2,
+        timestamp: "2026-08-14T10:00:02.000Z",
+        lastEventId: "",
+        state: stateAtVersionTwo(1),
+      }),
+    TypeError
+  );
+});
+

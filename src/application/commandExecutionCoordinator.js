@@ -230,6 +230,7 @@ class CommandExecutionCoordinator {
     commandStore,
     operationIdGenerator,
     diagnosticReporter,
+    emitDiagnostic,
   }) {
     if (typeof operationIdGenerator !== "function") {
       throw new TypeError("operationIdGenerator must be a function");
@@ -238,7 +239,8 @@ class CommandExecutionCoordinator {
     this.#eventStore = assertEventStoreAdapter(eventStore);
     this.#commandStore = assertCommandStoreAdapter(commandStore);
     this.#operationIdGenerator = operationIdGenerator;
-    this.#emitDiagnostic = createDiagnosticEmitter(diagnosticReporter);
+    this.#emitDiagnostic =
+      emitDiagnostic ?? createDiagnosticEmitter(diagnosticReporter);
   }
 
   execute(commandType, payload, options, executeCommand) {
@@ -292,6 +294,17 @@ class CommandExecutionCoordinator {
 
       return result;
     } catch (caughtError) {
+      if (caughtError?.code === "OPTIMISTIC_CONCURRENCY_CONFLICT") {
+        this.#emitDiagnostic({
+          type: DIAGNOSTIC_TYPES.CONCURRENCY_CONFLICT,
+          status: DIAGNOSTIC_STATUSES.CONFLICT_DETECTED,
+          commandId,
+          aggregateId: caughtError.aggregateId,
+          expectedVersion: caughtError.expectedVersion,
+          actualVersion: caughtError.actualVersion,
+        });
+      }
+
       return this.#handleExecutionError(caughtError, commandContext);
     }
   }
@@ -456,6 +469,13 @@ class CommandExecutionCoordinator {
       ) {
         throw createCommandHistoryInconsistentError(record.commandId, events);
       }
+
+      this.#emitDiagnostic({
+        type: DIAGNOSTIC_TYPES.IDEMPOTENCY_DEDUPLICATED,
+        status: DIAGNOSTIC_STATUSES.DEDUPLICATED,
+        commandId: record.commandId,
+        commandType,
+      });
 
       return record.result;
     }

@@ -57,6 +57,14 @@ class InMemoryEventStore {
 
   #eventsByCommandId = new Map();
 
+  #subscribers = new Set();
+
+  #upcasterRegistry;
+
+  constructor({ upcasterRegistry } = {}) {
+    this.#upcasterRegistry = upcasterRegistry;
+  }
+
   append(event, { expectedVersion } = {}) {
     assertDomainEvent(event);
     assertExpectedVersion(expectedVersion);
@@ -106,13 +114,23 @@ class InMemoryEventStore {
     commandEvents.push(storedEvent);
     this.#eventsByCommandId.set(storedEvent.metadata.commandId, commandEvents);
 
+    this.#notifySubscribers(storedEvent);
+
     return storedEvent;
+  }
+
+  #transform(event) {
+    if (!this.#upcasterRegistry || !event) {
+      return event;
+    }
+    return this.#upcasterRegistry.upcast(event);
   }
 
   getByAggregateId(aggregateId) {
     assertAggregateId(aggregateId);
 
-    return [...(this.#eventsByAggregateId.get(aggregateId) || [])];
+    const events = this.#eventsByAggregateId.get(aggregateId) || [];
+    return events.map((event) => this.#transform(event));
   }
 
   getByAggregateIdAfter(aggregateId, sequence) {
@@ -122,7 +140,12 @@ class InMemoryEventStore {
       throw new TypeError("sequence must be a non-negative safe integer");
     }
 
-    return this.getByAggregateId(aggregateId).filter((event) => event.sequence > sequence);
+    const events = this.#eventsByAggregateId.get(aggregateId) || [];
+    const filtered = sequence < events.length
+      ? events.slice(sequence)
+      : events.filter((event) => event.sequence > sequence);
+
+    return filtered.map((event) => this.#transform(event));
   }
 
   getByCommandId(commandId) {
@@ -130,11 +153,12 @@ class InMemoryEventStore {
       throw new TypeError("commandId must be a non-empty string or a positive safe integer");
     }
 
-    return [...(this.#eventsByCommandId.get(commandId) || [])];
+    const events = this.#eventsByCommandId.get(commandId) || [];
+    return events.map((event) => this.#transform(event));
   }
 
   getAll() {
-    return [...this.#events];
+    return this.#events.map((event) => this.#transform(event));
   }
 
   getLastSequence(aggregateId) {
@@ -147,6 +171,50 @@ class InMemoryEventStore {
     }
 
     return aggregateEvents[aggregateEvents.length - 1].sequence;
+  }
+
+  subscribe(filterOrHandler, maybeHandler) {
+    let filter = {};
+    let handler = filterOrHandler;
+
+    if (typeof filterOrHandler === "object" && filterOrHandler !== null) {
+      filter = filterOrHandler;
+      handler = maybeHandler;
+    }
+
+    if (typeof handler !== "function") {
+      throw new TypeError("subscription handler must be a function");
+    }
+
+    const subscription = { filter, handler };
+    this.#subscribers.add(subscription);
+
+    return () => {
+      this.#subscribers.delete(subscription);
+    };
+  }
+
+  #notifySubscribers(event) {
+    for (const subscription of this.#subscribers) {
+      const { filter, handler } = subscription;
+
+      if (filter.aggregateId !== undefined && filter.aggregateId !== event.aggregateId) {
+        continue;
+      }
+
+      if (filter.eventType !== undefined && filter.eventType !== event.eventType) {
+        continue;
+      }
+
+      try {
+        const result = handler(event);
+        if (result && typeof result.catch === "function") {
+          result.catch(() => {});
+        }
+      } catch {
+        // Subscribers are asynchronous / side-effects with error isolation.
+      }
+    }
   }
 }
 

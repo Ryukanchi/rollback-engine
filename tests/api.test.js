@@ -106,6 +106,7 @@ test("GET /openapi.json exposes the complete public contract", async () => {
     const expectedPaths = [
       "/",
       "/checkout",
+      "/diagnostics",
       "/history",
       "/openapi.json",
       "/order",
@@ -114,6 +115,7 @@ test("GET /openapi.json exposes the complete public contract", async () => {
       "/replay-restore/{orderId}",
       "/replay-state/{orderId}",
       "/snapshot/{orderId}",
+      "/state-at/{orderId}/sequence/{sequence}",
       "/state-at/{orderId}/{timestamp}",
       "/timeline/{orderId}",
     ];

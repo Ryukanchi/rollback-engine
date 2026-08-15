@@ -47,8 +47,10 @@ test("appends valid events and reads them in aggregate sequence", () => {
   assert.deepEqual(append(store, created), created);
   assert.deepEqual(append(store, reserved), reserved);
   assert.deepEqual(store.getByAggregateId(1), [created, reserved]);
+  assert.deepEqual(store.getByAggregateIdAfter(1, 0), [created, reserved]);
   assert.deepEqual(store.getByAggregateIdAfter(1, 1), [reserved]);
   assert.deepEqual(store.getByAggregateIdAfter(1, 2), []);
+  assert.deepEqual(store.getByAggregateIdAfter(1, 100), []);
   assert.deepEqual(store.getAll(), [created, reserved]);
   assert.equal(store.getLastSequence(1), 2);
   assert.equal(store.getLastSequence(999), 0);
