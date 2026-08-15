@@ -2,6 +2,7 @@ const express = require("express");
 const openApiDocument = require("../openapi.json");
 
 const { RollbackEngine } = require("./application/rollbackEngine");
+const { createStorageAdapters } = require("./infrastructure/storageFactory");
 const {
   errorHandler,
   notFoundHandler,
@@ -10,7 +11,25 @@ const { createCheckoutRouter } = require("./routes/checkout");
 const { createOrdersRouter } = require("./routes/orders");
 const { createReplayRouter } = require("./routes/replay");
 
-function createApp({ rollbackEngine = new RollbackEngine() } = {}) {
+function createDefaultEngine() {
+  const storageType = process.env.STORAGE || "memory";
+  const dbPath = process.env.DB_PATH || ":memory:";
+
+  if (storageType === "sqlite") {
+    const adapters = createStorageAdapters({ type: "sqlite", dbPath });
+    return new RollbackEngine({
+      eventStore: adapters.eventStore,
+      commandStore: adapters.commandStore,
+      snapshotStore: adapters.snapshotStore,
+      stateRepository: adapters.stateRepository,
+    });
+  }
+
+  return new RollbackEngine();
+}
+
+function createApp({ rollbackEngine } = {}) {
+  const effectiveEngine = rollbackEngine ?? createDefaultEngine();
   const app = express();
 
   app.use(express.json());
@@ -23,9 +42,9 @@ function createApp({ rollbackEngine = new RollbackEngine() } = {}) {
     res.json(openApiDocument);
   });
 
-  app.use(createOrdersRouter({ rollbackEngine }));
-  app.use(createCheckoutRouter({ rollbackEngine }));
-  app.use(createReplayRouter({ rollbackEngine }));
+  app.use(createOrdersRouter({ rollbackEngine: effectiveEngine }));
+  app.use(createCheckoutRouter({ rollbackEngine: effectiveEngine }));
+  app.use(createReplayRouter({ rollbackEngine: effectiveEngine }));
 
   app.use(notFoundHandler);
   app.use(errorHandler);

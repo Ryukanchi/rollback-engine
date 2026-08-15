@@ -356,18 +356,28 @@ Required adapter capabilities are declared in
 `src/application/storeContracts.js`; reusable semantic suites live in
 `tests/support/storeContractSuites.js`.
 
+The engine provides two storage implementations:
+1. **InMemory Adapters**: Fast, isolated, ideal for unit testing.
+2. **SQLite WAL Adapters (`src/infrastructure/sqlite/`)**: Persistent, file-backed or in-memory, using native `node:sqlite` (`DatabaseSync`).
+
 | Store | Critical semantics |
 | --- | --- |
-| Event Store | Atomic expected-version check and append, global event-ID uniqueness, aggregate and command indexes, read-after-write consistency |
+| Event Store | Atomic expected-version check and append, global event-ID uniqueness, explicit `command_id` index, aggregate ordering, read-after-write consistency |
 | Command Store | Atomic absent-key reservation, valid status transitions, atomic result/error persistence and defensive values |
 | Snapshot Store | Atomic version comparison and replacement, equivalent same-version idempotency |
 | State Repository | Atomic whole-state save/replace and defensive materialized values |
 
-These contracts make assumptions visible; they do not make the application
-database-ready. The call chain is synchronous. A typical networked database
-adapter requires a deliberate async conversion plus backend integration tests
-for real transaction isolation, competing writers, restart recovery and index
-consistency.
+### Storage Configuration
+
+By default, the server runs with in-memory adapters. To run with persistent SQLite storage:
+
+```bash
+# In-Memory (default)
+STORAGE=memory npm start
+
+# Persistent SQLite WAL Storage
+STORAGE=sqlite DB_PATH=./data/rollback.db npm start
+```
 
 ## Run and verify
 
@@ -386,32 +396,23 @@ git diff --check
 
 The tests cover domain transitions, compensation order, replay equivalence,
 snapshot fallback, time-travel prefixes, commit uncertainty, view repair,
-idempotency reconciliation, optimistic concurrency, store contracts, the
-OpenAPI route set, representative API flows and diagnostic boundary outcomes.
+idempotency reconciliation, optimistic concurrency, store contracts (both In-Memory and SQLite),
+file-backed restart durability across separate Node processes, lost ACK reconciliation,
+multi-process optimistic concurrency, the OpenAPI route set, and representative API flows.
 
 ## Deliberate limits
 
-- All stores are process-local, in-memory and unbounded. Restarting loses data.
-- There is no crash durability or multi-process command coordination.
-- A `processing` command without events has no lease or timeout.
+- **Synchronous SQLite I/O**: SQLite runs synchronously via `node:sqlite` `DatabaseSync`. While this guarantees zero async race conditions and preserves existing contracts, synchronous I/O can block the Node.js event loop under high concurrent loads.
+- **`processing + 0 events` boundary**: A command found in `processing` state without committed events after a crash is NOT automatically stolen or reset upon restart. It remains `COMMAND_IN_PROGRESS` (`WAIT_AND_RETRY_SAME_KEY`) until distributed lease/fencing logic is introduced.
+- **Single-Machine Storage**: SQLite WAL provides single-machine durability, not distributed multi-node consensus.
+- **No Multi-Machine Leases / Fencing Tokens**: Command coordination is local; distributed worker fencing is reserved for future phases.
 - One command event range currently belongs to one aggregate.
 - Aggregate, reservation and payment IDs are allocated in process.
-- Requests without `Idempotency-Key` cannot replay an outcome after a lost HTTP
-  response.
-- Diagnostics are callback-based and not persisted or queryable through HTTP.
-- OpenAPI is a reviewed static contract, not runtime request/response
-  validation. Contract tests protect its route set and canonical examples.
-- Schema version `1` is the only event format. Upcasting is intentionally absent
-  until a real second schema creates a migration requirement.
+- Requests without `Idempotency-Key` cannot replay an outcome after a lost HTTP response.
+- OpenAPI is a reviewed static contract, not runtime request/response validation.
 
 ## Sensible next steps
 
-The next high-value step is not a larger UI. It is either:
-
-1. add a second in-process adapter behind the existing store contract suites to
-   prove the persistence boundary, followed by an explicit async design; or
-2. introduce event upcasting only when a real version-2 payload can demonstrate
-   compatibility requirements.
-
-A minimal human-readable CLI could later consume `/timeline`, but should remain
-a client of the existing contract and contain no domain logic.
+1. **Interactive Chaos & Time-Travel Cockpit**: A lightweight dashboard visualizing the persistent event log, saga compensations, and live fault injection.
+2. **Deterministic Chaos Invariant Fuzzing**: Continuous fault-injection testing running thousands of interleaved operations against the persistent store.
+3. **Distributed Command Leases & Fencing Tokens**: Solving multi-worker crash recovery for unresolved processing commands.
