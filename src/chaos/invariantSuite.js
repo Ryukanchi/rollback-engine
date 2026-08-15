@@ -6,7 +6,7 @@ class InvariantSuite {
 
   constructor() {
     this.#counters = {
-      ReplayAuthority: 0,
+      ReplayStability: 0,
       SnapshotEquivalence: 0,
       EventSequenceContiguous: 0,
       EventIdUniqueness: 0,
@@ -25,6 +25,10 @@ class InvariantSuite {
       TimeTravelPrefix: 0,
       DefensiveCopies: 0,
       SchemaUpcasting: 0,
+      SagaFailureAfterOrder: 0,
+      SagaFailureAfterInventory: 0,
+      SagaFailureAfterPayment: 0,
+      InvalidFailurePointRejected: 0,
     };
   }
 
@@ -70,10 +74,10 @@ class InvariantSuite {
       this.#checkProjectionDeterminism(aggId, events);
       checked.push("ProjectionDeterminism");
 
-      // Inv A: Replay Authority
+      // Inv A: Replay Stability (Pure repeatability of replay)
       const replayState = engine.replay(aggId);
-      this.#checkReplayAuthority(engine, aggId, replayState);
-      checked.push("ReplayAuthority");
+      this.#checkReplayStability(engine, aggId, replayState);
+      checked.push("ReplayStability");
 
       // Inv B: Snapshot Equivalence
       this.#checkSnapshotEquivalence(engine, aggId, replayState);
@@ -177,14 +181,14 @@ class InvariantSuite {
     }
   }
 
-  #checkReplayAuthority(engine, aggregateId, replayState) {
-    this.#counters.ReplayAuthority++;
-    const authoritativeState = engine.replay(aggregateId);
-    if (JSON.stringify(replayState) !== JSON.stringify(authoritativeState)) {
+  #checkReplayStability(engine, aggregateId, replayState) {
+    this.#counters.ReplayStability++;
+    const secondReplay = engine.replay(aggregateId);
+    if (JSON.stringify(replayState) !== JSON.stringify(secondReplay)) {
       throw new InvariantViolationError(
-        "ReplayAuthority",
-        `Replay state does not match authoritative state for aggregate ${aggregateId}`,
-        { aggregateId, replayState, authoritativeState }
+        "ReplayStability",
+        `Repeated replay produced unstable state for aggregate ${aggregateId}`,
+        { aggregateId, replayState, secondReplay }
       );
     }
   }
@@ -223,35 +227,133 @@ class InvariantSuite {
 
     const eventTypes = events.map((e) => e.eventType);
 
-    // If order was compensated after payment
-    const compIdx = eventTypes.indexOf(EVENT_TYPES.PAYMENT_REFUNDED);
-    if (compIdx !== -1) {
-      // Must be followed by INVENTORY_RELEASED and ORDER_ROLLED_BACK
-      const relIdx = eventTypes.indexOf(EVENT_TYPES.INVENTORY_RELEASED, compIdx);
-      const rollIdx = eventTypes.indexOf(EVENT_TYPES.ORDER_ROLLED_BACK, relIdx);
+    const hasCreated = eventTypes.includes(EVENT_TYPES.ORDER_CREATED);
+    const hasReserved = eventTypes.includes(EVENT_TYPES.INVENTORY_RESERVED);
+    const hasCharged = eventTypes.includes(EVENT_TYPES.PAYMENT_CHARGED);
+    const hasRefunded = eventTypes.includes(EVENT_TYPES.PAYMENT_REFUNDED);
+    const hasReleased = eventTypes.includes(EVENT_TYPES.INVENTORY_RELEASED);
+    const hasRolledBack = eventTypes.includes(EVENT_TYPES.ORDER_ROLLED_BACK);
 
-      if (relIdx === -1 || rollIdx === -1 || relIdx < compIdx || rollIdx < relIdx) {
+    // If order was compensated
+    if (hasRolledBack) {
+      const createIdx = eventTypes.indexOf(EVENT_TYPES.ORDER_CREATED);
+      const reserveIdx = eventTypes.indexOf(EVENT_TYPES.INVENTORY_RESERVED);
+      const chargeIdx = eventTypes.indexOf(EVENT_TYPES.PAYMENT_CHARGED);
+      const refundIdx = eventTypes.indexOf(EVENT_TYPES.PAYMENT_REFUNDED);
+      const releaseIdx = eventTypes.indexOf(EVENT_TYPES.INVENTORY_RELEASED);
+      const rollIdx = eventTypes.indexOf(EVENT_TYPES.ORDER_ROLLED_BACK);
+
+      // 1. PAYMENT checks
+      if (hasCharged) {
+        if (!hasRefunded) {
+          throw new InvariantViolationError(
+            "CompensationOrdering",
+            `Payment was charged but not refunded before rollback for aggregate ${aggregateId}`,
+            { aggregateId, eventTypes }
+          );
+        }
+        if (refundIdx < chargeIdx) {
+          throw new InvariantViolationError(
+            "CompensationOrdering",
+            `PAYMENT_REFUNDED occurred before PAYMENT_CHARGED for aggregate ${aggregateId}`,
+            { aggregateId, eventTypes }
+          );
+        }
+      } else if (hasRefunded) {
         throw new InvariantViolationError(
           "CompensationOrdering",
-          `Invalid compensation event sequence for aggregate ${aggregateId}: ${eventTypes.join(" -> ")}`,
+          `PAYMENT_REFUNDED occurred without PAYMENT_CHARGED for aggregate ${aggregateId}`,
           { aggregateId, eventTypes }
         );
       }
 
-      if (state.lifecycle !== "rolled_back" && !state.deleted) {
+      // 2. INVENTORY checks
+      if (hasReserved) {
+        if (!hasReleased) {
+          throw new InvariantViolationError(
+            "CompensationOrdering",
+            `Inventory was reserved but not released before rollback for aggregate ${aggregateId}`,
+            { aggregateId, eventTypes }
+          );
+        }
+        if (releaseIdx < reserveIdx) {
+          throw new InvariantViolationError(
+            "CompensationOrdering",
+            `INVENTORY_RELEASED occurred before INVENTORY_RESERVED for aggregate ${aggregateId}`,
+            { aggregateId, eventTypes }
+          );
+        }
+        if (hasRefunded && releaseIdx < refundIdx) {
+          throw new InvariantViolationError(
+            "CompensationOrdering",
+            `INVENTORY_RELEASED occurred before PAYMENT_REFUNDED for aggregate ${aggregateId}`,
+            { aggregateId, eventTypes }
+          );
+        }
+      } else if (hasReleased) {
         throw new InvariantViolationError(
-          "NoImpossibleFinalState",
-          `Compensated order has lifecycle '${state.lifecycle}' instead of 'rolled_back'`,
-          { aggregateId, state }
+          "CompensationOrdering",
+          `INVENTORY_RELEASED occurred without INVENTORY_RESERVED for aggregate ${aggregateId}`,
+          { aggregateId, eventTypes }
         );
       }
 
-      if (!state.deleted && (state.payment?.status !== "refunded" || state.inventory?.status !== "released")) {
+      // 3. ORDER_ROLLED_BACK finality
+      if (rollIdx < createIdx || (hasReleased && rollIdx < releaseIdx) || (hasRefunded && rollIdx < refundIdx)) {
         throw new InvariantViolationError(
-          "NoImpossibleFinalState",
-          `Compensated order state has inconsistent payment/inventory status`,
-          { aggregateId, state }
+          "CompensationOrdering",
+          `ORDER_ROLLED_BACK occurred before all compensation steps completed for aggregate ${aggregateId}`,
+          { aggregateId, eventTypes }
         );
+      }
+
+      // 4. Final state check on non-deleted aggregates
+      if (!state.deleted) {
+        if (state.lifecycle !== "rolled_back") {
+          throw new InvariantViolationError(
+            "NoImpossibleFinalState",
+            `Compensated order has lifecycle '${state.lifecycle}' instead of 'rolled_back'`,
+            { aggregateId, state }
+          );
+        }
+
+        if (state.order?.status !== "rolled_back") {
+          throw new InvariantViolationError(
+            "NoImpossibleFinalState",
+            `Compensated order status is '${state.order?.status}' instead of 'rolled_back'`,
+            { aggregateId, state }
+          );
+        }
+
+        if (hasCharged && state.payment?.status !== "refunded") {
+          throw new InvariantViolationError(
+            "NoImpossibleFinalState",
+            `Compensated order with charged payment has payment status '${state.payment?.status}' instead of 'refunded'`,
+            { aggregateId, state }
+          );
+        }
+        if (!hasCharged && state.payment !== null) {
+          throw new InvariantViolationError(
+            "NoImpossibleFinalState",
+            `Compensated order without payment charge has unexpected payment state`,
+            { aggregateId, state }
+          );
+        }
+
+        if (hasReserved && state.inventory?.status !== "released") {
+          throw new InvariantViolationError(
+            "NoImpossibleFinalState",
+            `Compensated order with reservation has inventory status '${state.inventory?.status}' instead of 'released'`,
+            { aggregateId, state }
+          );
+        }
+        if (!hasReserved && state.inventory !== null) {
+          throw new InvariantViolationError(
+            "NoImpossibleFinalState",
+            `Compensated order without inventory reservation has unexpected inventory state`,
+            { aggregateId, state }
+          );
+        }
       }
     }
 
@@ -268,10 +370,10 @@ class InvariantSuite {
 
     // If deleted
     if (state.deleted) {
-      if (state.payment?.status === "charged" || state.inventory?.status === "reserved") {
+      if (state.payment !== null || state.inventory !== null || state.order !== null) {
         throw new InvariantViolationError(
           "NoImpossibleFinalState",
-          `Deleted order still holds active payment or inventory reservation`,
+          `Deleted order still holds active order, payment or inventory records`,
           { aggregateId, state }
         );
       }
@@ -416,6 +518,18 @@ class InvariantSuite {
 
   recordSchemaUpcastingCheck() {
     this.#counters.SchemaUpcasting++;
+  }
+
+  recordSagaFailure(failurePoint) {
+    if (failurePoint === "after_order") {
+      this.#counters.SagaFailureAfterOrder++;
+    } else if (failurePoint === "after_inventory") {
+      this.#counters.SagaFailureAfterInventory++;
+    } else if (failurePoint === "after_payment") {
+      this.#counters.SagaFailureAfterPayment++;
+    } else {
+      this.#counters.InvalidFailurePointRejected++;
+    }
   }
 }
 

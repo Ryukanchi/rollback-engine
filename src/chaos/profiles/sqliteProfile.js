@@ -25,6 +25,7 @@ class SqliteProfileRunner {
       knownCommands: [],
       driftedAggregates: new Set(),
       isFaultInjected: false,
+      supportsSnapshotDelete: true,
       dbPath,
     };
 
@@ -144,6 +145,7 @@ function executeSqliteOperation({ op, engine, adapters, context, stats, invarian
       if (payload.simulateFailureAt) {
         context.isFaultInjected = true;
         stats.failuresInjected++;
+        if (invariantSuite) invariantSuite.recordSagaFailure(payload.simulateFailureAt);
       }
       const res = engine.checkout(payload, options);
       if (!context.knownAggregates.includes(res.aggregateId)) {

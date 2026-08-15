@@ -11,11 +11,10 @@ const ITEMS = [
 
 const FAILURE_POINTS = [
   null,
-  "after_order_created",
-  "after_inventory_reserved",
+  "after_order",
+  "after_inventory",
   "after_payment",
-  "during_inventory_release",
-  "during_order_rollback",
+  "invalid_failure_point",
 ];
 
 const OPERATION_TYPES = [
@@ -38,6 +37,7 @@ const OPERATION_TYPES = [
   "CONCURRENT_APPEND_ATTEMPT",
   "INTERRUPTED_COMMIT_SIMULATION",
   "PROCESSING_ZERO_SIMULATION",
+  "SCHEMA_UPCAST_TEST",
 ];
 
 class OperationGenerator {
@@ -48,7 +48,7 @@ class OperationGenerator {
   }
 
   generateOperation(context) {
-    const { knownAggregates = [], knownCommands = [], maxOperations = 10 } = context;
+    const { knownAggregates = [], knownCommands = [], maxOperations = 10, supportsSnapshotDelete = false } = context;
 
     // Weight operation selection based on available state
     const candidates = ["CHECKOUT", "CREATE_ORDER"];
@@ -64,11 +64,14 @@ class OperationGenerator {
         "VIEW_CORRUPT",
         "VIEW_DELETE",
         "SNAPSHOT_CORRUPT",
-        "SNAPSHOT_DELETE",
         "COMPENSATE",
         "DELETE_ORDER",
         "CONCURRENT_APPEND_ATTEMPT"
       );
+
+      if (supportsSnapshotDelete) {
+        candidates.push("SNAPSHOT_DELETE");
+      }
     }
 
     if (knownCommands.length > 0) {

@@ -12,7 +12,7 @@ test("High-volume in-memory chaos campaign verifies all invariants without viola
 
   assert.equal(result.violations, 0);
   assert.ok(result.operationsExecuted > 500);
-  assert.ok(result.invariantCoverage.ReplayAuthority > 0);
+  assert.ok(result.invariantCoverage.ReplayStability > 0);
   assert.ok(result.invariantCoverage.SnapshotEquivalence > 0);
   assert.ok(result.invariantCoverage.EventSequenceContiguous > 0);
   assert.ok(result.invariantCoverage.EventIdUniqueness > 0);
@@ -23,4 +23,7 @@ test("High-volume in-memory chaos campaign verifies all invariants without viola
   assert.ok(result.invariantCoverage.NoImpossibleFinalState > 0);
   assert.ok(result.invariantCoverage.CommandEventRangeConsistency > 0);
   assert.ok(result.invariantCoverage.DefensiveCopies > 0);
+  assert.ok(result.invariantCoverage.SagaFailureAfterOrder > 0, "SagaFailureAfterOrder should be > 0");
+  assert.ok(result.invariantCoverage.SagaFailureAfterInventory > 0, "SagaFailureAfterInventory should be > 0");
+  assert.ok(result.invariantCoverage.SagaFailureAfterPayment > 0, "SagaFailureAfterPayment should be > 0");
 });

@@ -412,23 +412,24 @@ Open `http://localhost:3000/lab` in your browser.
 
 ## Deterministic Chaos & Invariant Fuzzing
 
-The repository includes a deterministic chaos and invariant fuzzing harness designed to explore thousands of interleaved operations, fault injections, retries, view drifts, snapshot corruptions, and concurrency attempts against both In-Memory and persistent SQLite storage adapters.
+The repository includes a deterministic chaos and invariant fuzzing harness designed to explore thousands of interleaved operations, real saga fault injections, command retries, logical read-model view drifts, snapshot corruptions, and connection reopen cycles against both In-Memory and persistent SQLite storage adapters.
 
 ### Design Principles
 
-- **100% Deterministic Seeded PRNG**: Built with a custom 32-bit Mulberry32 PRNG. Zero calls to unseeded `Math.random()`. Every single execution is 100% reproducible by providing the exact seed.
+- **Seed-Deterministic Operation Generation**: Built with a custom 32-bit Mulberry32 PRNG. Zero calls to unseeded `Math.random()`. Every execution sequence and logical trace is 100% reproducible by providing the exact seed.
 - **Real Engine & Real Stores**: The harness exercises the actual `RollbackEngine`, `CommandExecutionCoordinator`, projections, sagas, and SQLite/in-memory store contracts without mock semantics.
+- **Real Saga Fault Injection Coverage**: Directly exercises all supported saga failure points (`after_order`, `after_inventory`, `after_payment`) and validates that partial and full reverse compensation streams are executed in strict inverse order.
 - **Granular Single-Iteration Reproduction**: Any discovered failure or invariant violation can be reproduced directly on its specific iteration index:
   ```bash
   npm run chaos -- --seed=482971 --iteration=7312 --profile=memory
   ```
-- **Per-Invariant Coverage Counting**: Aggregates and reports the exact number of times each invariant was evaluated during a campaign.
+- **Per-Invariant Coverage Counting**: Aggregates and reports the exact number of times each invariant and failure path was evaluated during a campaign.
 
 ### Invariant Catalog (19 Checked Invariants)
 
 | Invariant | Description | Verification Method |
 | :--- | :--- | :--- |
-| **Replay Authority** | `replay(agg)` equals authoritative state | Strict JSON deep equality between full event replay and authoritative projection |
+| **Replay Stability** | Pure repeatability of event replay | Asserts that repeated `replay(agg)` on the same immutable event stream produces identical state |
 | **Snapshot Equivalence** | Snapshot + suffix equals full replay | Compares `replayFromSnapshot(agg)` against `replay(agg)` |
 | **Event Sequence Contiguity** | $1..N$ contiguous sequence without gaps | Verifies $Sequence_i == i + 1$ for all aggregate streams |
 | **Global Event ID Uniqueness** | Unique event IDs across all aggregates | Tracks global set of event IDs across store |
@@ -439,9 +440,9 @@ The repository includes a deterministic chaos and invariant fuzzing harness desi
 | **Idempotency Conflict Detection** | Same ID with altered payload rejected | Asserts conflict error without aggregate state mutation |
 | **Post-Commit Retry Safety** | Interrupted commit cannot duplicate side effects | Verifies reconciliation prevents re-execution |
 | **`processing + 0` Boundary** | Uncompleted commands without events not stolen | Confirms `COMMAND_IN_PROGRESS` (`WAIT_AND_RETRY_SAME_KEY`) |
-| **Compensation Ordering** | Correct forward and reverse saga steps | Asserts refund precedes release and rollback in saga history |
+| **Compensation Ordering** | Correct forward and inverse saga steps | Asserts refund precedes release and rollback in saga history depending on completed forward steps |
 | **No Impossible Final State** | Domain state machine invariants | Prevents invalid states (e.g. `rolled_back` with active charges or `deleted` with reservations) |
-| **Commit Boundary** | Persistence of committed events is final | Derived store errors do not remove committed event log entries |
+| **Commit Boundary** | Persistence of committed events is final | Derived store errors or stale attempts do not remove committed event log entries |
 | **Command Range Consistency** | Recorded range matches Event Store | Validates `firstSequence` and `lastSequence` against store |
 | **Aggregate Isolation** | Streams do not leak across aggregate IDs | Replay of Aggregate A depends exclusively on Events of Aggregate A |
 | **Time Travel Prefix** | `replayAtSequence(N)` equals prefix projection | Projects $Events[0..N]$ and compares with time-travel query |
@@ -460,7 +461,7 @@ npm run chaos -- --campaign=smoke
 # Run high-volume in-memory campaign with specific seed
 npm run chaos -- --profile=memory --iterations=10000 --seed=482971
 
-# Run persistent SQLite campaign with specific seed
+# Run persistent SQLite campaign with specific seed (with connection reopen cycles)
 npm run chaos -- --profile=sqlite --iterations=500 --seed=6006
 
 # Reproduce a specific single iteration
@@ -469,7 +470,9 @@ npm run chaos -- --seed=482971 --iteration=7312 --profile=memory
 
 ### Claim Hygiene
 
-The chaos harness provides strong empirical evidence for the system's core invariants under complex local interleaving and single-machine crash/reopen boundaries. It is **not** a formal mathematical proof or a distributed multi-node consensus verification (e.g. Jepsen cluster partition testing).
+- **Empirical Fuzzing vs. Formal Proof**: The chaos harness provides strong empirical verification for the system's core invariants under local interleaving and single-machine crash/reopen boundaries. It is an empirical testing tool, not a formal mathematical verification or distributed multi-node consensus proof (no Jepsen claims).
+- **SQLite Connection Reopens vs. OS Process Restarts**: In the chaos harness, SQLite chaos exercises frequent connection close/reopen cycles within the Node.js process. OS-level process crash recovery and restart durability are proven separately in dedicated multi-process test suites (`tests/sqliteCrashDurability.test.js`, `tests/sqliteMultiProcessConcurrency.test.js`).
+- **Harness Evolution**: Initial harness development exposed three flaws in the chaos tester itself (strict mode mutation attempt on frozen events, an over-strict deletion assertion in invariant checking, and single-flag drift tracking), which were corrected during harness hardening. 0 engine domain bugs were introduced.
 
 ## Run and verify
 

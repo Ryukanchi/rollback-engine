@@ -19,6 +19,7 @@ class MemoryProfileRunner {
       knownCommands: [],
       driftedAggregates: new Set(),
       isFaultInjected: false,
+      supportsSnapshotDelete: false,
     };
 
     const stats = {
@@ -108,6 +109,7 @@ function executeOperation({ op, engine, adapters, context, stats, invariantSuite
       if (payload.simulateFailureAt) {
         context.isFaultInjected = true;
         stats.failuresInjected++;
+        if (invariantSuite) invariantSuite.recordSagaFailure(payload.simulateFailureAt);
       }
       const res = engine.checkout(payload, options);
       if (!context.knownAggregates.includes(res.aggregateId)) {

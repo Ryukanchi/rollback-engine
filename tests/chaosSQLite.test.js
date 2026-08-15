@@ -16,7 +16,7 @@ test("Persistent SQLite chaos campaign survives reopens, drift, and cleans up da
   assert.equal(result.violations, 0);
   assert.ok(result.operationsExecuted > 50);
   assert.ok(result.reopens > 0, "Should have executed at least one DB close/reopen cycle");
-  assert.ok(result.invariantCoverage.ReplayAuthority > 0);
+  assert.ok(result.invariantCoverage.ReplayStability > 0);
   assert.ok(result.invariantCoverage.MaterializedViewConsistency > 0);
 
   // Verify no orphaned temporary chaos DB files in os.tmpdir()

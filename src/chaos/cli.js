@@ -79,6 +79,13 @@ function main() {
     }
   }
 
+  if (result.warnings && result.warnings.length > 0) {
+    console.log("\n--- COVERAGE WARNINGS ---");
+    for (const w of result.warnings) {
+      console.warn(`  ⚠ ${w}`);
+    }
+  }
+
   console.log("\nRESULT: PASS (All Invariants 100% Satisfied)\n");
 }
 

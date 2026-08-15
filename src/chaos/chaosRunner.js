@@ -198,6 +198,20 @@ class ChaosRunner {
     totals.invariantCoverage = invariantSuite.getCounters();
     totals.invariantChecksCount = Object.values(totals.invariantCoverage).reduce((a, b) => a + b, 0);
 
+    const warnings = [];
+    if (totals.totalIterations >= 100) {
+      if (totals.invariantCoverage.SagaFailureAfterOrder === 0) {
+        warnings.push("COVERAGE WARNING: SagaFailureAfterOrder was not exercised");
+      }
+      if (totals.invariantCoverage.SagaFailureAfterInventory === 0) {
+        warnings.push("COVERAGE WARNING: SagaFailureAfterInventory was not exercised");
+      }
+      if (totals.invariantCoverage.SagaFailureAfterPayment === 0) {
+        warnings.push("COVERAGE WARNING: SagaFailureAfterPayment was not exercised");
+      }
+    }
+    totals.warnings = warnings;
+
     return totals;
   }
 }
