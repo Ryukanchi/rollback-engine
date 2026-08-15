@@ -1,5 +1,9 @@
 const { isDeepStrictEqual } = require("node:util");
 const { COMMAND_STATUSES } = require("../../application/storeContracts");
+const {
+  createFencingTokenStaleError,
+  createCommandLeaseExpiredError,
+} = require("../../application/errors");
 
 function assertNonEmptyString(value, fieldName) {
   if (typeof value !== "string" || value.trim().length === 0) {
@@ -73,6 +77,9 @@ function rowToRecord(row) {
     eventRange: row.event_range ? JSON.parse(row.event_range) : null,
     result: row.result ? JSON.parse(row.result) : null,
     error: row.error ? JSON.parse(row.error) : null,
+    leaseOwner: row.lease_owner ?? null,
+    leaseToken: row.lease_token !== null && row.lease_token !== undefined ? Number(row.lease_token) : 1,
+    leaseExpiresAt: row.lease_expires_at !== null && row.lease_expires_at !== undefined ? Number(row.lease_expires_at) : null,
   };
 }
 
@@ -93,6 +100,12 @@ class SqliteCommandStore {
 
   #stmtReconcileFailure;
 
+  #stmtTakeOver;
+
+  #stmtRenewLease;
+
+  #stmtCountEvents;
+
   constructor({ db } = {}) {
     if (!db || typeof db.prepare !== "function") {
       throw new TypeError("db must be a valid SQLite database instance");
@@ -101,15 +114,15 @@ class SqliteCommandStore {
     this.#db = db;
 
     this.#stmtGetCommand = this.#db.prepare(`
-      SELECT command_id, command_type, payload, status, aggregate_id, event_range, result, error
+      SELECT command_id, command_type, payload, status, aggregate_id, event_range, result, error, lease_owner, lease_token, lease_expires_at
       FROM commands
       WHERE command_id = ?
     `);
 
     this.#stmtInsertCommand = this.#db.prepare(`
       INSERT INTO commands (
-        command_id, command_type, payload, status, aggregate_id, event_range, result, error
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        command_id, command_type, payload, status, aggregate_id, event_range, result, error, lease_owner, lease_token, lease_expires_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     this.#stmtUpdateEventRange = this.#db.prepare(`
@@ -120,13 +133,13 @@ class SqliteCommandStore {
 
     this.#stmtCompleteCommand = this.#db.prepare(`
       UPDATE commands
-      SET status = ?, result = ?, updated_at = CURRENT_TIMESTAMP
+      SET status = ?, result = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = CURRENT_TIMESTAMP
       WHERE command_id = ?
     `);
 
     this.#stmtFailCommand = this.#db.prepare(`
       UPDATE commands
-      SET status = ?, error = ?, updated_at = CURRENT_TIMESTAMP
+      SET status = ?, error = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = CURRENT_TIMESTAMP
       WHERE command_id = ?
     `);
 
@@ -139,9 +152,32 @@ class SqliteCommandStore {
       SET aggregate_id = ?, event_range = ?, error = ?, updated_at = CURRENT_TIMESTAMP
       WHERE command_id = ?
     `);
+
+    this.#stmtTakeOver = this.#db.prepare(`
+      UPDATE commands
+      SET lease_owner = ?, lease_token = ?, lease_expires_at = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE command_id = ?
+    `);
+
+    this.#stmtRenewLease = this.#db.prepare(`
+      UPDATE commands
+      SET lease_expires_at = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE command_id = ?
+    `);
+
+    this.#stmtCountEvents = this.#db.prepare(`
+      SELECT COUNT(*) as cnt FROM events WHERE command_id = ?
+    `);
   }
 
-  reserve({ commandId, commandType, payload } = {}) {
+  reserve({
+    commandId,
+    commandType,
+    payload,
+    workerId = null,
+    leaseTtlMs = 5000,
+    now = Date.now(),
+  } = {}) {
     assertNonEmptyString(commandId, "commandId");
     assertNonEmptyString(commandType, "commandType");
     assertPayload(payload);
@@ -161,6 +197,10 @@ class SqliteCommandStore {
       };
     }
 
+    const leaseOwner = workerId;
+    const leaseToken = 1;
+    const leaseExpiresAt = workerId ? now + leaseTtlMs : null;
+
     const record = {
       commandId,
       commandType,
@@ -170,6 +210,9 @@ class SqliteCommandStore {
       eventRange: null,
       result: null,
       error: null,
+      leaseOwner,
+      leaseToken,
+      leaseExpiresAt,
     };
 
     this.#stmtInsertCommand.run(
@@ -180,7 +223,10 @@ class SqliteCommandStore {
       null,
       null,
       null,
-      null
+      null,
+      leaseOwner,
+      leaseToken,
+      leaseExpiresAt
     );
 
     return {
@@ -190,8 +236,135 @@ class SqliteCommandStore {
     };
   }
 
-  recordEvent(commandId, event) {
+  takeOverExpired({
+    commandId,
+    workerId,
+    leaseTtlMs = 5000,
+    now = Date.now(),
+    expectedToken,
+  } = {}) {
+    assertNonEmptyString(commandId, "commandId");
+    assertNonEmptyString(workerId, "workerId");
+
+    this.#db.exec("BEGIN IMMEDIATE;");
+
+    try {
+      const row = this.#stmtGetCommand.get(commandId);
+
+      if (!row) {
+        this.#db.exec("ROLLBACK;");
+        return { success: false, reason: "NOT_FOUND" };
+      }
+
+      if (row.status !== COMMAND_STATUSES.PROCESSING) {
+        this.#db.exec("ROLLBACK;");
+        return { success: false, reason: "NOT_PROCESSING" };
+      }
+
+      if (row.event_range) {
+        this.#db.exec("ROLLBACK;");
+        return { success: false, reason: "HAS_EVENTS" };
+      }
+
+      const eventCountRow = this.#stmtCountEvents.get(commandId);
+      if (eventCountRow && Number(eventCountRow.cnt) > 0) {
+        this.#db.exec("ROLLBACK;");
+        return { success: false, reason: "HAS_EVENTS" };
+      }
+
+      const expiresAt = row.lease_expires_at !== null ? Number(row.lease_expires_at) : null;
+      if (expiresAt !== null && expiresAt > now) {
+        this.#db.exec("ROLLBACK;");
+        return { success: false, reason: "NOT_EXPIRED" };
+      }
+
+      const currentToken = row.lease_token !== null ? Number(row.lease_token) : 1;
+      if (expectedToken !== undefined && currentToken !== expectedToken) {
+        this.#db.exec("ROLLBACK;");
+        return { success: false, reason: "TOKEN_MISMATCH" };
+      }
+
+      const newToken = currentToken + 1;
+      const newExpiresAt = now + leaseTtlMs;
+
+      this.#stmtTakeOver.run(workerId, newToken, newExpiresAt, commandId);
+      this.#db.exec("COMMIT;");
+
+      return { success: true, record: this.get(commandId) };
+    } catch (err) {
+      try {
+        this.#db.exec("ROLLBACK;");
+      } catch {}
+      throw err;
+    }
+  }
+
+  renewLease({
+    commandId,
+    workerId,
+    fencingToken,
+    leaseTtlMs = 5000,
+    now = Date.now(),
+  } = {}) {
+    assertNonEmptyString(commandId, "commandId");
+    assertNonEmptyString(workerId, "workerId");
+
+    this.#db.exec("BEGIN IMMEDIATE;");
+
+    try {
+      const row = this.#stmtGetCommand.get(commandId);
+
+      if (!row || row.status !== COMMAND_STATUSES.PROCESSING) {
+        throw new Error(`Command ${commandId} is not processing`);
+      }
+
+      const currentToken = row.lease_token !== null ? Number(row.lease_token) : 1;
+
+      if (row.lease_owner !== workerId || (fencingToken !== undefined && currentToken !== fencingToken)) {
+        throw createFencingTokenStaleError({
+          commandId,
+          providedToken: fencingToken,
+          currentToken,
+          workerId,
+          leaseOwner: row.lease_owner,
+        });
+      }
+
+      const expiresAt = row.lease_expires_at !== null ? Number(row.lease_expires_at) : null;
+      if (expiresAt !== null && expiresAt <= now) {
+        throw createCommandLeaseExpiredError({
+          commandId,
+          fencingToken: currentToken,
+          leaseExpiresAt: expiresAt,
+          now,
+          workerId,
+        });
+      }
+
+      const newExpiresAt = now + leaseTtlMs;
+      this.#stmtRenewLease.run(newExpiresAt, commandId);
+      this.#db.exec("COMMIT;");
+
+      return { renewed: true, leaseExpiresAt: newExpiresAt };
+    } catch (err) {
+      try {
+        this.#db.exec("ROLLBACK;");
+      } catch {}
+      throw err;
+    }
+  }
+
+  recordEvent(commandId, event, { fencingToken } = {}) {
     const record = this.#requireProcessing(commandId);
+
+    if (fencingToken !== undefined && record.leaseToken !== fencingToken) {
+      throw createFencingTokenStaleError({
+        commandId,
+        providedToken: fencingToken,
+        currentToken: record.leaseToken,
+        leaseOwner: record.leaseOwner,
+      });
+    }
 
     if (
       !event ||
@@ -245,12 +418,24 @@ class SqliteCommandStore {
     return clone(record);
   }
 
-  complete(commandId, result) {
+  complete(commandId, result, { fencingToken } = {}) {
     const record = this.#requireProcessing(commandId);
+
+    if (fencingToken !== undefined && record.leaseToken !== fencingToken) {
+      throw createFencingTokenStaleError({
+        commandId,
+        providedToken: fencingToken,
+        currentToken: record.leaseToken,
+        leaseOwner: record.leaseOwner,
+      });
+    }
+
     const clonedResult = clone(result);
 
     record.status = COMMAND_STATUSES.COMPLETED;
     record.result = clonedResult;
+    record.leaseOwner = null;
+    record.leaseExpiresAt = null;
 
     this.#stmtCompleteCommand.run(
       COMMAND_STATUSES.COMPLETED,
@@ -261,8 +446,17 @@ class SqliteCommandStore {
     return clone(record);
   }
 
-  fail(commandId, error) {
+  fail(commandId, error, { fencingToken } = {}) {
     const record = this.#requireProcessing(commandId);
+
+    if (fencingToken !== undefined && record.leaseToken !== fencingToken) {
+      throw createFencingTokenStaleError({
+        commandId,
+        providedToken: fencingToken,
+        currentToken: record.leaseToken,
+        leaseOwner: record.leaseOwner,
+      });
+    }
 
     if (!error || typeof error !== "object" || Array.isArray(error)) {
       throw new TypeError("error must be an object");
@@ -272,6 +466,8 @@ class SqliteCommandStore {
 
     record.status = COMMAND_STATUSES.FAILED;
     record.error = clonedError;
+    record.leaseOwner = null;
+    record.leaseExpiresAt = null;
 
     this.#stmtFailCommand.run(
       COMMAND_STATUSES.FAILED,

@@ -5,6 +5,7 @@ const { runReadModelDriftScenario, repairReadModelDrift } = require("./scenarios
 const { runReconciliationScenario } = require("./scenarios/reconciliationScenario");
 const { runBoundaryScenario } = require("./scenarios/boundaryScenario");
 const { runRestartScenario } = require("./scenarios/restartScenario");
+const { runLeaseFencingScenario } = require("./scenarios/leaseFencingScenario");
 
 const SCENARIO_RUNNERS = {
   successful_checkout: runSuccessfulCheckoutScenario,
@@ -13,6 +14,7 @@ const SCENARIO_RUNNERS = {
   post_commit_reconciliation: runReconciliationScenario,
   processing_zero_events_boundary: runBoundaryScenario,
   process_restart_durability: runRestartScenario,
+  lease_recovery_and_zombie_fencing: runLeaseFencingScenario,
 };
 
 function runScenario({ scenarioType = "successful_checkout", storageType = "sqlite", options = {} } = {}) {

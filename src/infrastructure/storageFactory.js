@@ -14,6 +14,7 @@ function createStorageAdapters({
   dbPath = ":memory:",
   db = null,
   upcasterRegistry = null,
+  now = null,
   wal = true,
   busyTimeout = 5000,
 } = {}) {
@@ -30,7 +31,7 @@ function createStorageAdapters({
       ownedDb = true;
     }
 
-    const eventStore = new SqliteEventStore({ db: database, upcasterRegistry });
+    const eventStore = new SqliteEventStore({ db: database, upcasterRegistry, now });
     const commandStore = new SqliteCommandStore({ db: database });
     const snapshotStore = new SqliteSnapshotStore({ db: database });
     const stateRepository = new SqliteStateRepository({ db: database });
@@ -53,8 +54,8 @@ function createStorageAdapters({
   }
 
   if (type === "memory") {
-    const eventStore = new InMemoryEventStore({ upcasterRegistry });
     const commandStore = new InMemoryCommandStore();
+    const eventStore = new InMemoryEventStore({ upcasterRegistry, commandStore, now });
     const snapshotStore = new InMemorySnapshotStore();
     const stateRepository = new InMemoryStateRepository();
 

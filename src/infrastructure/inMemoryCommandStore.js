@@ -1,8 +1,9 @@
 const { isDeepStrictEqual } = require("node:util");
-
+const { COMMAND_STATUSES } = require("../application/storeContracts");
 const {
-  COMMAND_STATUSES,
-} = require("../application/storeContracts");
+  createFencingTokenStaleError,
+  createCommandLeaseExpiredError,
+} = require("../application/errors");
 
 function assertNonEmptyString(value, fieldName) {
   if (typeof value !== "string" || value.trim().length === 0) {
@@ -65,7 +66,14 @@ function buildEventRange(events, commandId) {
 class InMemoryCommandStore {
   #commands = new Map();
 
-  reserve({ commandId, commandType, payload } = {}) {
+  reserve({
+    commandId,
+    commandType,
+    payload,
+    workerId = null,
+    leaseTtlMs = 5000,
+    now = Date.now(),
+  } = {}) {
     assertNonEmptyString(commandId, "commandId");
     assertNonEmptyString(commandType, "commandType");
     assertPayload(payload);
@@ -84,6 +92,10 @@ class InMemoryCommandStore {
       };
     }
 
+    const leaseOwner = workerId;
+    const leaseToken = 1;
+    const leaseExpiresAt = workerId ? now + leaseTtlMs : null;
+
     const record = {
       commandId,
       commandType,
@@ -93,6 +105,9 @@ class InMemoryCommandStore {
       eventRange: null,
       result: null,
       error: null,
+      leaseOwner,
+      leaseToken,
+      leaseExpiresAt,
     };
 
     this.#commands.set(commandId, record);
@@ -104,8 +119,99 @@ class InMemoryCommandStore {
     };
   }
 
-  recordEvent(commandId, event) {
+  takeOverExpired({
+    commandId,
+    workerId,
+    leaseTtlMs = 5000,
+    now = Date.now(),
+    expectedToken,
+  } = {}) {
+    assertNonEmptyString(commandId, "commandId");
+    assertNonEmptyString(workerId, "workerId");
+
+    const record = this.#commands.get(commandId);
+
+    if (!record) {
+      return { success: false, reason: "NOT_FOUND" };
+    }
+
+    if (record.status !== COMMAND_STATUSES.PROCESSING) {
+      return { success: false, reason: "NOT_PROCESSING" };
+    }
+
+    if (record.eventRange && record.eventRange.eventIds.length > 0) {
+      return { success: false, reason: "HAS_EVENTS" };
+    }
+
+    if (record.leaseExpiresAt !== null && record.leaseExpiresAt > now) {
+      return { success: false, reason: "NOT_EXPIRED" };
+    }
+
+    if (expectedToken !== undefined && record.leaseToken !== expectedToken) {
+      return { success: false, reason: "TOKEN_MISMATCH" };
+    }
+
+    record.leaseOwner = workerId;
+    record.leaseToken = (record.leaseToken || 1) + 1;
+    record.leaseExpiresAt = now + leaseTtlMs;
+
+    return {
+      success: true,
+      record: clone(record),
+    };
+  }
+
+  renewLease({
+    commandId,
+    workerId,
+    fencingToken,
+    leaseTtlMs = 5000,
+    now = Date.now(),
+  } = {}) {
+    assertNonEmptyString(commandId, "commandId");
+    assertNonEmptyString(workerId, "workerId");
+
+    const record = this.#commands.get(commandId);
+
+    if (!record || record.status !== COMMAND_STATUSES.PROCESSING) {
+      throw new Error(`Command ${commandId} is not processing`);
+    }
+
+    if (record.leaseOwner !== workerId || (fencingToken !== undefined && record.leaseToken !== fencingToken)) {
+      throw createFencingTokenStaleError({
+        commandId,
+        providedToken: fencingToken,
+        currentToken: record.leaseToken,
+        workerId,
+        leaseOwner: record.leaseOwner,
+      });
+    }
+
+    if (record.leaseExpiresAt !== null && record.leaseExpiresAt <= now) {
+      throw createCommandLeaseExpiredError({
+        commandId,
+        fencingToken: record.leaseToken,
+        leaseExpiresAt: record.leaseExpiresAt,
+        now,
+        workerId,
+      });
+    }
+
+    record.leaseExpiresAt = now + leaseTtlMs;
+    return { renewed: true, leaseExpiresAt: record.leaseExpiresAt };
+  }
+
+  recordEvent(commandId, event, { fencingToken } = {}) {
     const record = this.#requireProcessing(commandId);
+
+    if (fencingToken !== undefined && record.leaseToken !== fencingToken) {
+      throw createFencingTokenStaleError({
+        commandId,
+        providedToken: fencingToken,
+        currentToken: record.leaseToken,
+        leaseOwner: record.leaseOwner,
+      });
+    }
 
     if (
       !event ||
@@ -146,18 +252,39 @@ class InMemoryCommandStore {
     return clone(record);
   }
 
-  complete(commandId, result) {
+  complete(commandId, result, { fencingToken } = {}) {
     const record = this.#requireProcessing(commandId);
+
+    if (fencingToken !== undefined && record.leaseToken !== fencingToken) {
+      throw createFencingTokenStaleError({
+        commandId,
+        providedToken: fencingToken,
+        currentToken: record.leaseToken,
+        leaseOwner: record.leaseOwner,
+      });
+    }
+
     const clonedResult = clone(result);
 
     record.status = COMMAND_STATUSES.COMPLETED;
     record.result = clonedResult;
+    record.leaseOwner = null;
+    record.leaseExpiresAt = null;
 
     return clone(record);
   }
 
-  fail(commandId, error) {
+  fail(commandId, error, { fencingToken } = {}) {
     const record = this.#requireProcessing(commandId);
+
+    if (fencingToken !== undefined && record.leaseToken !== fencingToken) {
+      throw createFencingTokenStaleError({
+        commandId,
+        providedToken: fencingToken,
+        currentToken: record.leaseToken,
+        leaseOwner: record.leaseOwner,
+      });
+    }
 
     if (!error || typeof error !== "object" || Array.isArray(error)) {
       throw new TypeError("error must be an object");
@@ -167,6 +294,8 @@ class InMemoryCommandStore {
 
     record.status = COMMAND_STATUSES.FAILED;
     record.error = clonedError;
+    record.leaseOwner = null;
+    record.leaseExpiresAt = null;
 
     return clone(record);
   }

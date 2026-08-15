@@ -370,6 +370,163 @@ function registerCommandStoreContract({ adapterName, createStore }) {
         )
       );
     });
+
+    test("allows safe takeover only when processing, expired, and without committed events", () => {
+      const store = createStore();
+      const descriptor = commandDescriptor("takeover-cmd");
+
+      // Worker A reserves with lease TTL 1000ms at now = 1000
+      const initial = store.reserve({
+        ...descriptor,
+        workerId: "worker-a",
+        leaseTtlMs: 1000,
+        now: 1000,
+      });
+      assert.equal(initial.created, true);
+      assert.equal(initial.record.leaseOwner, "worker-a");
+      assert.equal(initial.record.leaseToken, 1);
+      assert.equal(initial.record.leaseExpiresAt, 2000);
+
+      // Attempt takeover before expiry (at now = 1500)
+      const earlyTakeover = store.takeOverExpired({
+        commandId: descriptor.commandId,
+        workerId: "worker-b",
+        leaseTtlMs: 1000,
+        now: 1500,
+      });
+      assert.equal(earlyTakeover.success, false);
+      assert.equal(earlyTakeover.reason, "NOT_EXPIRED");
+
+      // Attempt takeover after expiry (at now = 2001)
+      const validTakeover = store.takeOverExpired({
+        commandId: descriptor.commandId,
+        workerId: "worker-b",
+        leaseTtlMs: 1000,
+        now: 2001,
+      });
+      assert.equal(validTakeover.success, true);
+      assert.equal(validTakeover.record.leaseOwner, "worker-b");
+      assert.equal(validTakeover.record.leaseToken, 2);
+      assert.equal(validTakeover.record.leaseExpiresAt, 3001);
+
+      // Record an event under Worker B
+      store.recordEvent(descriptor.commandId, createEvent({ commandId: descriptor.commandId }), {
+        fencingToken: 2,
+      });
+
+      // Attempt takeover after events committed (even if expired at now = 5000)
+      const postEventTakeover = store.takeOverExpired({
+        commandId: descriptor.commandId,
+        workerId: "worker-c",
+        leaseTtlMs: 1000,
+        now: 5000,
+      });
+      assert.equal(postEventTakeover.success, false);
+      assert.equal(postEventTakeover.reason, "HAS_EVENTS");
+    });
+
+    test("renews lease only for active owner and valid fencing token", () => {
+      const store = createStore();
+      const descriptor = commandDescriptor("renewal-cmd");
+
+      store.reserve({
+        ...descriptor,
+        workerId: "worker-a",
+        leaseTtlMs: 1000,
+        now: 1000,
+      });
+
+      // Valid renewal by Worker A
+      const renewed = store.renewLease({
+        commandId: descriptor.commandId,
+        workerId: "worker-a",
+        fencingToken: 1,
+        leaseTtlMs: 2000,
+        now: 1500,
+      });
+      assert.equal(renewed.renewed, true);
+      assert.equal(renewed.leaseExpiresAt, 3500);
+
+      // Impostor Worker B renewal rejected
+      assert.throws(
+        () =>
+          store.renewLease({
+            commandId: descriptor.commandId,
+            workerId: "worker-b",
+            fencingToken: 1,
+            leaseTtlMs: 1000,
+            now: 2000,
+          }),
+        (err) => err.code === "FENCING_TOKEN_STALE"
+      );
+
+      // Stale fencing token rejected
+      assert.throws(
+        () =>
+          store.renewLease({
+            commandId: descriptor.commandId,
+            workerId: "worker-a",
+            fencingToken: 99,
+            leaseTtlMs: 1000,
+            now: 2000,
+          }),
+        (err) => err.code === "FENCING_TOKEN_STALE"
+      );
+    });
+
+    test("fences complete and fail transitions against stale fencing tokens", () => {
+      const store = createStore();
+      const descriptor = commandDescriptor("fencing-test-cmd");
+
+      store.reserve({
+        ...descriptor,
+        workerId: "worker-a",
+        leaseTtlMs: 1000,
+        now: 1000,
+      });
+
+      // Worker B takes over after expiration
+      const takeover = store.takeOverExpired({
+        commandId: descriptor.commandId,
+        workerId: "worker-b",
+        leaseTtlMs: 2000,
+        now: 2500,
+      });
+      assert.equal(takeover.success, true);
+      assert.equal(takeover.record.leaseToken, 2);
+
+      // Worker A (zombie) tries to complete with stale token 1
+      assert.throws(
+        () =>
+          store.complete(
+            descriptor.commandId,
+            { status: "completed" },
+            { fencingToken: 1 }
+          ),
+        (err) => err.code === "FENCING_TOKEN_STALE"
+      );
+
+      // Worker A (zombie) tries to fail with stale token 1
+      assert.throws(
+        () =>
+          store.fail(
+            descriptor.commandId,
+            { code: "ZOMBIE_FAIL", message: "Failed" },
+            { fencingToken: 1 }
+          ),
+        (err) => err.code === "FENCING_TOKEN_STALE"
+      );
+
+      // Worker B completes successfully with token 2
+      const completed = store.complete(
+        descriptor.commandId,
+        { status: "completed" },
+        { fencingToken: 2 }
+      );
+      assert.equal(completed.status, "completed");
+      assert.equal(completed.leaseOwner, null);
+      assert.equal(completed.leaseExpiresAt, null);
+    });
   });
 }
 

@@ -338,6 +338,77 @@ function executeOperation({ op, engine, adapters, context, stats, invariantSuite
       return { success: isUpcast, result: { upcast: isUpcast } };
     }
 
+    case "LEASE_TAKEOVER_SIMULATION": {
+      if (invariantSuite) invariantSuite.recordLeaseTakeoverCheck();
+      const { commandId } = op.params;
+      const rawPayload = { item: "LeaseItem", quantity: 1, amount: 150 };
+      adapters.commandStore.reserve({
+        commandId,
+        commandType: "CHECKOUT",
+        payload: { ...rawPayload, simulateFailureAt: null },
+        workerId: "chaos-worker-1",
+        leaseTtlMs: 10,
+        now: 1000,
+      });
+      const engineWorker2 = new RollbackEngine({
+        eventStore: adapters.eventStore,
+        commandStore: adapters.commandStore,
+        snapshotStore: adapters.snapshotStore,
+        stateRepository: adapters.stateRepository,
+        workerId: "chaos-worker-2",
+        leaseTtlMs: 5000,
+        now: () => 2000,
+      });
+      try {
+        const res = engineWorker2.checkout(rawPayload, { commandId });
+        if (res.aggregateId && !context.knownAggregates.includes(res.aggregateId)) {
+          context.knownAggregates.push(res.aggregateId);
+        }
+        return { success: true, result: res };
+      } catch (err) {
+        return { success: false, error: err };
+      }
+    }
+
+    case "ZOMBIE_FENCING_SIMULATION": {
+      if (invariantSuite) invariantSuite.recordFencingSafetyCheck();
+      const { commandId } = op.params;
+      const rawPayload = { item: "ZombieItem", quantity: 1, amount: 200 };
+      adapters.commandStore.reserve({
+        commandId,
+        commandType: "CHECKOUT",
+        payload: { ...rawPayload, simulateFailureAt: null },
+        workerId: "chaos-worker-1",
+        leaseTtlMs: 10,
+        now: 1000,
+      });
+      adapters.commandStore.takeOverExpired({
+        commandId,
+        workerId: "chaos-worker-2",
+        leaseTtlMs: 5000,
+        now: 2000,
+      });
+      try {
+        const { createDomainEvent, EVENT_TYPES } = require("../../domain/events");
+        const staleEvent = createDomainEvent({
+          eventId: `zombie-evt-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          eventType: EVENT_TYPES.ORDER_CREATED,
+          aggregateId: 999,
+          sequence: 1,
+          timestamp: new Date().toISOString(),
+          payload: { item: "ZombieItem", quantity: 1 },
+          metadata: { schemaVersion: 1, commandId, correlationId: commandId, causationId: commandId },
+        });
+        adapters.eventStore.append(staleEvent, { expectedVersion: 0, fencingToken: 1 });
+        return { success: false, error: new Error("Zombie append should have been fenced!") };
+      } catch (err) {
+        if (err.code === "FENCING_TOKEN_STALE") {
+          return { success: true, result: { fenced: true } };
+        }
+        return { success: false, error: err };
+      }
+    }
+
     default:
       return { success: false, error: new Error(`Unknown operation ${op.type}`) };
   }

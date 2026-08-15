@@ -29,6 +29,8 @@ class InvariantSuite {
       SagaFailureAfterInventory: 0,
       SagaFailureAfterPayment: 0,
       InvalidFailurePointRejected: 0,
+      LeaseOwnershipConsistency: 0,
+      FencingSafety: 0,
     };
   }
 
@@ -428,6 +430,7 @@ class InvariantSuite {
 
   #checkCommandEventRangeConsistency(commandStore, eventStore) {
     this.#counters.CommandEventRangeConsistency++;
+    this.#counters.LeaseOwnershipConsistency++;
     // Verify command store records match event store
     const allEvents = eventStore.getAll();
     const commandEventMap = new Map();
@@ -443,20 +446,40 @@ class InvariantSuite {
 
     for (const [cmdId, events] of commandEventMap.entries()) {
       const cmdRecord = commandStore.get(cmdId);
-      if (cmdRecord && cmdRecord.status === "completed" && cmdRecord.eventRange) {
-        if (cmdRecord.eventRange.firstSequence !== events[0].sequence) {
+      if (cmdRecord) {
+        if (cmdRecord.leaseToken !== undefined && (!Number.isSafeInteger(cmdRecord.leaseToken) || cmdRecord.leaseToken < 1)) {
           throw new InvariantViolationError(
-            "CommandEventRangeConsistency",
-            `Command ${cmdId} firstSequence mismatch: recorded ${cmdRecord.eventRange.firstSequence}, actual ${events[0].sequence}`,
-            { cmdId, recorded: cmdRecord.eventRange, actualFirst: events[0].sequence }
+            "LeaseOwnershipConsistency",
+            `Command ${cmdId} has invalid fencing token: ${cmdRecord.leaseToken}`,
+            { cmdId, leaseToken: cmdRecord.leaseToken }
           );
         }
-        if (cmdRecord.eventRange.lastSequence !== events[events.length - 1].sequence) {
-          throw new InvariantViolationError(
-            "CommandEventRangeConsistency",
-            `Command ${cmdId} lastSequence mismatch: recorded ${cmdRecord.eventRange.lastSequence}, actual ${events[events.length - 1].sequence}`,
-            { cmdId, recorded: cmdRecord.eventRange, actualLast: events[events.length - 1].sequence }
-          );
+
+        if (cmdRecord.status === "completed" || cmdRecord.status === "failed") {
+          if (cmdRecord.leaseOwner !== null || cmdRecord.leaseExpiresAt !== null) {
+            throw new InvariantViolationError(
+              "LeaseOwnershipConsistency",
+              `Finalized command ${cmdId} (${cmdRecord.status}) still holds active lease (owner: ${cmdRecord.leaseOwner}, expires: ${cmdRecord.leaseExpiresAt})`,
+              { cmdId, status: cmdRecord.status, leaseOwner: cmdRecord.leaseOwner }
+            );
+          }
+        }
+
+        if (cmdRecord.status === "completed" && cmdRecord.eventRange) {
+          if (cmdRecord.eventRange.firstSequence !== events[0].sequence) {
+            throw new InvariantViolationError(
+              "CommandEventRangeConsistency",
+              `Command ${cmdId} firstSequence mismatch: recorded ${cmdRecord.eventRange.firstSequence}, actual ${events[0].sequence}`,
+              { cmdId, recorded: cmdRecord.eventRange, actualFirst: events[0].sequence }
+            );
+          }
+          if (cmdRecord.eventRange.lastSequence !== events[events.length - 1].sequence) {
+            throw new InvariantViolationError(
+              "CommandEventRangeConsistency",
+              `Command ${cmdId} lastSequence mismatch: recorded ${cmdRecord.eventRange.lastSequence}, actual ${events[events.length - 1].sequence}`,
+              { cmdId, recorded: cmdRecord.eventRange, actualLast: events[events.length - 1].sequence }
+            );
+          }
         }
       }
     }
@@ -518,6 +541,14 @@ class InvariantSuite {
 
   recordSchemaUpcastingCheck() {
     this.#counters.SchemaUpcasting++;
+  }
+
+  recordFencingSafetyCheck() {
+    this.#counters.FencingSafety++;
+  }
+
+  recordLeaseTakeoverCheck() {
+    this.#counters.LeaseOwnershipConsistency++;
   }
 
   recordSagaFailure(failurePoint) {

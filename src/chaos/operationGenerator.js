@@ -78,9 +78,15 @@ class OperationGenerator {
       candidates.push("RETRY_SAME_COMMAND", "RETRY_CONFLICTING_COMMAND");
     }
 
-    // Occasionally test boundaries
-    if (this.#random.nextBoolean(0.15)) {
-      candidates.push("INTERRUPTED_COMMIT_SIMULATION", "PROCESSING_ZERO_SIMULATION", "SCHEMA_UPCAST_TEST");
+    // Occasionally test boundaries & leases
+    if (this.#random.nextBoolean(0.2)) {
+      candidates.push(
+        "INTERRUPTED_COMMIT_SIMULATION",
+        "PROCESSING_ZERO_SIMULATION",
+        "SCHEMA_UPCAST_TEST",
+        "LEASE_TAKEOVER_SIMULATION",
+        "ZOMBIE_FENCING_SIMULATION"
+      );
     }
 
     const opType = this.#random.pick(candidates);
@@ -234,6 +240,22 @@ class OperationGenerator {
           type: "SCHEMA_UPCAST_TEST",
           params: {
             item: this.#random.pick(ITEMS),
+          },
+        };
+
+      case "LEASE_TAKEOVER_SIMULATION":
+        return {
+          type: "LEASE_TAKEOVER_SIMULATION",
+          params: {
+            commandId: `cmd-lease-${this.#random.nextInt(1000, 99999)}`,
+          },
+        };
+
+      case "ZOMBIE_FENCING_SIMULATION":
+        return {
+          type: "ZOMBIE_FENCING_SIMULATION",
+          params: {
+            commandId: `cmd-fencing-${this.#random.nextInt(1000, 99999)}`,
           },
         };
 

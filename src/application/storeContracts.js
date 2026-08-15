@@ -23,6 +23,8 @@ const STORE_ADAPTER_METHODS = Object.freeze({
     "get",
     "reconcileEvents",
     "reconcileFailure",
+    "takeOverExpired",
+    "renewLease",
   ]),
   snapshotStore: Object.freeze(["save", "getByAggregateId"]),
   stateRepository: Object.freeze([

@@ -24,6 +24,9 @@ CREATE TABLE IF NOT EXISTS commands (
     event_range TEXT,
     result TEXT,
     error TEXT,
+    lease_owner TEXT,
+    lease_token INTEGER NOT NULL DEFAULT 1,
+    lease_expires_at INTEGER,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
@@ -49,7 +52,33 @@ function initializeSchema(db) {
   if (!db || typeof db.exec !== "function") {
     throw new TypeError("db must be a valid SQLite database instance");
   }
+
+  // Ensure base tables exist
   db.exec(SCHEMA_SQL);
+
+  // Check version and run migrations if necessary
+  const userVerRow = db.prepare("PRAGMA user_version;").get();
+  const currentVersion = userVerRow ? Object.values(userVerRow)[0] : 0;
+
+  if (currentVersion < 2) {
+    const tableInfo = db.prepare("PRAGMA table_info(commands);").all();
+    const cols = new Set(tableInfo.map((c) => c.name));
+
+    if (!cols.has("lease_owner")) {
+      db.exec("ALTER TABLE commands ADD COLUMN lease_owner TEXT;");
+    }
+    if (!cols.has("lease_token")) {
+      db.exec("ALTER TABLE commands ADD COLUMN lease_token INTEGER NOT NULL DEFAULT 1;");
+    }
+    if (!cols.has("lease_expires_at")) {
+      db.exec("ALTER TABLE commands ADD COLUMN lease_expires_at INTEGER;");
+    }
+
+    db.exec("CREATE INDEX IF NOT EXISTS idx_commands_lease ON commands (status, lease_expires_at);");
+    db.exec("PRAGMA user_version = 2;");
+  } else {
+    db.exec("CREATE INDEX IF NOT EXISTS idx_commands_lease ON commands (status, lease_expires_at);");
+  }
 }
 
 module.exports = {

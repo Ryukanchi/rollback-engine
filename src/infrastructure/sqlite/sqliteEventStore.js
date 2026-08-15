@@ -1,4 +1,8 @@
 const { assertDomainEvent } = require("../../domain/events");
+const {
+  createFencingTokenStaleError,
+  createCommandLeaseExpiredError,
+} = require("../../application/errors");
 
 function isIdentifier(value) {
   return (
@@ -73,6 +77,8 @@ class SqliteEventStore {
 
   #upcasterRegistry;
 
+  #now;
+
   #stmtInsertEvent;
 
   #stmtLastEventByAggregate;
@@ -87,13 +93,16 @@ class SqliteEventStore {
 
   #stmtLastSequence;
 
-  constructor({ db, upcasterRegistry } = {}) {
+  #stmtGetCommandLease;
+
+  constructor({ db, upcasterRegistry, now = () => Date.now() } = {}) {
     if (!db || typeof db.prepare !== "function") {
       throw new TypeError("db must be a valid SQLite database instance");
     }
 
     this.#db = db;
     this.#upcasterRegistry = upcasterRegistry;
+    this.#now = typeof now === "function" ? now : () => Date.now();
 
     this.#stmtInsertEvent = this.#db.prepare(`
       INSERT INTO events (
@@ -138,15 +147,73 @@ class SqliteEventStore {
     this.#stmtLastSequence = this.#db.prepare(`
       SELECT max(sequence) as last_seq FROM events WHERE aggregate_id = ?
     `);
+
+    this.#stmtGetCommandLease = this.#db.prepare(`
+      SELECT status, lease_owner, lease_token, lease_expires_at
+      FROM commands
+      WHERE command_id = ?
+    `);
   }
 
-  append(event, { expectedVersion } = {}) {
+  setNow(now) {
+    this.#now = typeof now === "function" ? now : () => Date.now();
+  }
+
+  append(event, { expectedVersion, fencingToken } = {}) {
     assertDomainEvent(event);
     assertExpectedVersion(expectedVersion);
 
     this.#db.exec("BEGIN IMMEDIATE");
 
     try {
+      // Fencing check inside authoritative append transaction
+      if (event.metadata?.commandId) {
+        const cmdRow = this.#stmtGetCommandLease.get(event.metadata.commandId);
+        if (cmdRow) {
+          if (cmdRow.status !== "processing") {
+            throw createFencingTokenStaleError({
+              commandId: event.metadata.commandId,
+              providedToken: fencingToken,
+              currentToken: cmdRow.lease_token !== null ? Number(cmdRow.lease_token) : null,
+              leaseOwner: cmdRow.lease_owner,
+            });
+          }
+
+          if (cmdRow.lease_token !== null && cmdRow.lease_token !== undefined) {
+            const currentToken = Number(cmdRow.lease_token);
+            if (fencingToken === undefined) {
+              throw createFencingTokenStaleError({
+                commandId: event.metadata.commandId,
+                providedToken: undefined,
+                currentToken,
+                leaseOwner: cmdRow.lease_owner,
+              });
+            }
+
+            if (Number(fencingToken) !== currentToken) {
+              throw createFencingTokenStaleError({
+                commandId: event.metadata.commandId,
+                providedToken: Number(fencingToken),
+                currentToken,
+                leaseOwner: cmdRow.lease_owner,
+              });
+            }
+
+            if (cmdRow.lease_expires_at !== null && cmdRow.lease_expires_at !== undefined) {
+              const nowMs = this.#now();
+              if (Number(cmdRow.lease_expires_at) < nowMs) {
+                throw createCommandLeaseExpiredError({
+                  commandId: event.metadata.commandId,
+                  fencingToken: Number(fencingToken),
+                  leaseExpiresAt: Number(cmdRow.lease_expires_at),
+                  now: nowMs,
+                });
+              }
+            }
+          }
+        }
+      }
+
       const lastRow = this.#stmtLastEventByAggregate.get(event.aggregateId);
       const actualVersion = lastRow ? Number(lastRow.sequence) : 0;
 

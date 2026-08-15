@@ -1,4 +1,8 @@
 const { assertDomainEvent } = require("../domain/events");
+const {
+  createFencingTokenStaleError,
+  createCommandLeaseExpiredError,
+} = require("../application/errors");
 
 function isIdentifier(value) {
   return (
@@ -61,13 +65,74 @@ class InMemoryEventStore {
 
   #upcasterRegistry;
 
-  constructor({ upcasterRegistry } = {}) {
+  #commandStore;
+
+  #now;
+
+  constructor({ upcasterRegistry, commandStore = null, now = () => Date.now() } = {}) {
     this.#upcasterRegistry = upcasterRegistry;
+    this.#commandStore = commandStore;
+    this.#now = typeof now === "function" ? now : () => Date.now();
   }
 
-  append(event, { expectedVersion } = {}) {
+  setCommandStore(commandStore) {
+    this.#commandStore = commandStore;
+  }
+
+  setNow(now) {
+    this.#now = typeof now === "function" ? now : () => Date.now();
+  }
+
+  append(event, { expectedVersion, fencingToken } = {}) {
     assertDomainEvent(event);
     assertExpectedVersion(expectedVersion);
+
+    if (this.#commandStore && event.metadata?.commandId) {
+      const cmd = this.#commandStore.get(event.metadata.commandId);
+      if (cmd) {
+        if (cmd.status !== "processing") {
+          throw createFencingTokenStaleError({
+            commandId: event.metadata.commandId,
+            providedToken: fencingToken,
+            currentToken: cmd.leaseToken,
+            leaseOwner: cmd.leaseOwner,
+          });
+        }
+
+        if (cmd.leaseToken !== null && cmd.leaseToken !== undefined) {
+          const currentToken = Number(cmd.leaseToken);
+          if (fencingToken === undefined) {
+            throw createFencingTokenStaleError({
+              commandId: event.metadata.commandId,
+              providedToken: undefined,
+              currentToken,
+              leaseOwner: cmd.leaseOwner,
+            });
+          }
+
+          if (Number(fencingToken) !== currentToken) {
+            throw createFencingTokenStaleError({
+              commandId: event.metadata.commandId,
+              providedToken: Number(fencingToken),
+              currentToken,
+              leaseOwner: cmd.leaseOwner,
+            });
+          }
+
+          if (cmd.leaseExpiresAt !== null && cmd.leaseExpiresAt !== undefined) {
+            const nowMs = this.#now();
+            if (Number(cmd.leaseExpiresAt) < nowMs) {
+              throw createCommandLeaseExpiredError({
+                commandId: event.metadata.commandId,
+                fencingToken: Number(fencingToken),
+                leaseExpiresAt: Number(cmd.leaseExpiresAt),
+                now: nowMs,
+              });
+            }
+          }
+        }
+      }
+    }
 
     const aggregateEvents = this.#eventsByAggregateId.get(event.aggregateId) || [];
     const actualVersion = aggregateEvents.length;

@@ -162,13 +162,20 @@ class RollbackEngine {
     commandStore = new InMemoryCommandStore(),
     eventIdGenerator = randomUUID,
     operationIdGenerator = randomUUID,
+    workerId,
+    leaseTtlMs = 30000,
     clock = () => new Date().toISOString(),
+    now = null,
     diagnosticReporter,
     startingIds = {},
   } = {}) {
     assertFunction(eventIdGenerator, "eventIdGenerator");
     assertFunction(operationIdGenerator, "operationIdGenerator");
     assertFunction(clock, "clock");
+
+    if (eventStore && typeof eventStore.setCommandStore === "function" && commandStore) {
+      eventStore.setCommandStore(commandStore);
+    }
 
     this.#eventStore = assertEventStoreAdapter(eventStore);
     this.#stateRepository = assertStateRepositoryAdapter(stateRepository);
@@ -180,6 +187,10 @@ class RollbackEngine {
       eventStore,
       commandStore,
       operationIdGenerator,
+      workerId,
+      leaseTtlMs,
+      clock,
+      now,
       diagnosticReporter,
       emitDiagnostic: this.#emitDiagnostic,
     });

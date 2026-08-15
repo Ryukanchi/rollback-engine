@@ -1,4 +1,5 @@
 const { isDeepStrictEqual } = require("node:util");
+const { randomUUID } = require("node:crypto");
 
 const {
   COMMAND_STATUSES,
@@ -10,6 +11,20 @@ const {
   DIAGNOSTIC_TYPES,
   createDiagnosticEmitter,
 } = require("./diagnostics");
+const {
+  createIdempotencyConflictError,
+  createCommandInProgressError,
+  createPartiallyCommittedCommandError,
+  createCommandHistoryInconsistentError,
+  createInterruptedCommandError,
+  createCommandStatePersistenceError,
+  createAppendCommitUnknownError,
+  createCommandReconciliationError,
+  createFencingTokenStaleError,
+  createCommandLeaseExpiredError,
+  serializeCommandError,
+  deserializeCommandError,
+} = require("./errors");
 
 function assertIdentifier(value, name) {
   if (
@@ -50,162 +65,6 @@ function normalizeCommandOptions(options = {}) {
   return { commandId, correlationId, causationId };
 }
 
-function createIdempotencyConflictError(commandId) {
-  const error = new Error(
-    "The idempotency key was already used for a different command."
-  );
-  error.code = "IDEMPOTENCY_KEY_CONFLICT";
-  error.commandId = commandId;
-  error.eventCommitted = false;
-  error.retrySafe = false;
-  error.retryAction = "USE_NEW_KEY";
-  return error;
-}
-
-function createCommandInProgressError(record) {
-  const error = new Error("The command is already being processed.");
-  error.code = "COMMAND_IN_PROGRESS";
-  error.commandId = record.commandId;
-  error.eventCommitted = false;
-  error.retrySafe = false;
-  error.retryAction = "WAIT_AND_RETRY_SAME_KEY";
-
-  return error;
-}
-
-function createPartiallyCommittedCommandError(commandId, events, cause) {
-  const error = new Error(
-    "The command committed one or more events but did not complete.",
-    { cause }
-  );
-  error.code = "COMMAND_EXECUTION_PARTIALLY_COMMITTED";
-  error.commandId = commandId;
-  error.aggregateId = events[0].aggregateId;
-  error.eventIds = events.map((event) => event.eventId);
-  error.eventCommitted = true;
-  error.retrySafe = false;
-  error.retryAction = "MANUAL_RESOLUTION_REQUIRED";
-  return error;
-}
-
-function createCommandHistoryInconsistentError(commandId, events = []) {
-  const error = new Error(
-    "The command record does not match the authoritative event history."
-  );
-  error.code = "COMMAND_EVENT_HISTORY_INCONSISTENT";
-  error.commandId = commandId;
-  error.eventCommitted = events.length > 0;
-  error.retrySafe = false;
-  error.retryAction = "MANUAL_RESOLUTION_REQUIRED";
-
-  if (events.length > 0) {
-    error.eventIds = events.map((event) => event.eventId);
-
-    if (events.every((event) => event.aggregateId === events[0].aggregateId)) {
-      error.aggregateId = events[0].aggregateId;
-    }
-  }
-
-  return error;
-}
-
-function createInterruptedCommandError(commandId, events) {
-  const error = new Error(
-    "Committed command events were found without a completed command result."
-  );
-  error.code = "COMMAND_EXECUTION_INTERRUPTED_AFTER_COMMIT";
-  error.commandId = commandId;
-  error.aggregateId = events[0].aggregateId;
-  error.eventIds = events.map((event) => event.eventId);
-  error.eventCommitted = true;
-  error.retrySafe = false;
-  error.retryAction = "MANUAL_RESOLUTION_REQUIRED";
-  return error;
-}
-
-function createCommandStatePersistenceError(
-  commandId,
-  events,
-  cause,
-  eventCommitted
-) {
-  const error = new Error(
-    "The command state could not be persisted after command execution stopped.",
-    { cause }
-  );
-  error.code = "COMMAND_STATE_PERSISTENCE_FAILED";
-  error.commandId = commandId;
-  error.eventCommitted =
-    typeof eventCommitted === "boolean" ? eventCommitted : null;
-  error.retrySafe = false;
-  error.retryAction = "RECONCILE_SAME_KEY";
-
-  if (events.length > 0) {
-    error.aggregateId = events[0].aggregateId;
-    error.eventIds = events.map((event) => event.eventId);
-  }
-
-  return error;
-}
-
-function createAppendCommitUnknownError(event, appendError, lookupError) {
-  const error = new Error(
-    "The event store did not confirm whether the event was committed.",
-    { cause: appendError }
-  );
-  error.code = "EVENT_APPEND_COMMIT_UNKNOWN";
-  error.commandId = event.metadata.commandId;
-  error.aggregateId = event.aggregateId;
-  error.eventId = event.eventId;
-  error.eventCommitted = null;
-  error.retrySafe = false;
-  error.retryAction = "RECONCILE_SAME_KEY";
-  error.reconciliationError = lookupError;
-  return error;
-}
-
-function createCommandReconciliationError(commandId, cause) {
-  const error = new Error(
-    "The command could not be reconciled with the authoritative event history.",
-    { cause }
-  );
-  error.code = "COMMAND_RECONCILIATION_FAILED";
-  error.commandId = commandId;
-  error.eventCommitted = null;
-  error.retrySafe = false;
-  error.retryAction = "RECONCILE_SAME_KEY";
-  return error;
-}
-
-function serializeCommandError(error) {
-  const serialized = {
-    code: error.code,
-    message: error.message,
-    eventCommitted: error.eventCommitted,
-    retrySafe: error.retrySafe,
-    retryAction: error.retryAction,
-  };
-
-  for (const fieldName of [
-    "commandId",
-    "aggregateId",
-    "eventId",
-    "eventIds",
-  ]) {
-    if (error[fieldName] !== undefined) {
-      serialized[fieldName] = error[fieldName];
-    }
-  }
-
-  return serialized;
-}
-
-function deserializeCommandError(serialized) {
-  const error = new Error(serialized.message);
-  Object.assign(error, serialized);
-  return error;
-}
-
 const DETERMINISTIC_COMMAND_REJECTION_CODES = new Set([
   "AGGREGATE_NOT_FOUND",
   "COMPENSATION_REQUIRED",
@@ -223,12 +82,24 @@ class CommandExecutionCoordinator {
 
   #operationIdGenerator;
 
+  #workerId;
+
+  #leaseTtlMs;
+
+  #clock;
+
+  #now;
+
   #emitDiagnostic;
 
   constructor({
     eventStore,
     commandStore,
     operationIdGenerator,
+    workerId = `worker-${process.pid}-${randomUUID().slice(0, 8)}`,
+    leaseTtlMs = 5000,
+    clock = () => new Date().toISOString(),
+    now = null,
     diagnosticReporter,
     emitDiagnostic,
   }) {
@@ -239,19 +110,35 @@ class CommandExecutionCoordinator {
     this.#eventStore = assertEventStoreAdapter(eventStore);
     this.#commandStore = assertCommandStoreAdapter(commandStore);
     this.#operationIdGenerator = operationIdGenerator;
+    this.#workerId = String(workerId);
+    this.#leaseTtlMs = Number.isSafeInteger(leaseTtlMs) && leaseTtlMs > 0 ? leaseTtlMs : 30000;
+    this.#clock = typeof clock === "function" ? clock : () => new Date().toISOString();
+    this.#now = typeof now === "function" ? now : () => Date.now();
     this.#emitDiagnostic =
       emitDiagnostic ?? createDiagnosticEmitter(diagnosticReporter);
+  }
+
+  #getNow() {
+    return this.#now();
   }
 
   execute(commandType, payload, options, executeCommand) {
     const normalizedOptions = normalizeCommandOptions(options);
     const { commandId } = normalizedOptions;
+    const nowMs = this.#getNow();
+    const workerId = this.#workerId;
+    const leaseTtlMs = this.#leaseTtlMs;
+
+    let currentFencingToken = 1;
 
     if (commandId) {
       const reservation = this.#commandStore.reserve({
         commandId,
         commandType,
         payload,
+        workerId,
+        leaseTtlMs,
+        now: nowMs,
       });
 
       if (reservation.conflict) {
@@ -268,6 +155,7 @@ class CommandExecutionCoordinator {
         );
       }
 
+      currentFencingToken = reservation.record.leaseToken || 1;
       this.#reconcileNewCommandReservation(commandId);
     }
 
@@ -277,19 +165,19 @@ class CommandExecutionCoordinator {
     const commandContext = {
       commandId,
       eventCommandId,
-      correlationId:
-        normalizedOptions.correlationId ?? eventCommandId,
-      initialCausationId:
-        normalizedOptions.causationId ?? eventCommandId,
+      correlationId: normalizedOptions.correlationId ?? eventCommandId,
+      initialCausationId: normalizedOptions.causationId ?? eventCommandId,
       lastEventId: null,
       committedEvents: [],
+      workerId,
+      fencingToken: currentFencingToken,
     };
 
     try {
       const result = executeCommand(commandContext);
 
       if (commandId) {
-        this.#commandStore.complete(commandId, result);
+        this.#commandStore.complete(commandId, result, { fencingToken: currentFencingToken });
       }
 
       return result;
@@ -303,6 +191,23 @@ class CommandExecutionCoordinator {
           expectedVersion: caughtError.expectedVersion,
           actualVersion: caughtError.actualVersion,
         });
+      } else if (caughtError?.code === "FENCING_TOKEN_STALE") {
+        this.#emitDiagnostic({
+          type: DIAGNOSTIC_TYPES.FENCING_REJECTION,
+          status: DIAGNOSTIC_STATUSES.FENCING_TOKEN_STALE,
+          commandId,
+          providedToken: caughtError.providedToken,
+          currentToken: caughtError.currentToken,
+          workerId: this.#workerId,
+        });
+      } else if (caughtError?.code === "COMMAND_LEASE_EXPIRED") {
+        this.#emitDiagnostic({
+          type: DIAGNOSTIC_TYPES.COMMAND_LEASE,
+          status: DIAGNOSTIC_STATUSES.LEASE_EXPIRED,
+          commandId,
+          fencingToken: caughtError.fencingToken,
+          workerId: this.#workerId,
+        });
       }
 
       return this.#handleExecutionError(caughtError, commandContext);
@@ -310,20 +215,22 @@ class CommandExecutionCoordinator {
   }
 
   commitEvent(event, commandContext, expectedVersion) {
-    const storedEvent = this.#appendEvent(event, expectedVersion);
+    const storedEvent = this.#appendEvent(event, expectedVersion, commandContext.fencingToken);
 
     commandContext.lastEventId = storedEvent.eventId;
     commandContext.committedEvents.push(storedEvent);
 
     if (commandContext.commandId) {
-      this.#commandStore.recordEvent(commandContext.commandId, storedEvent);
+      this.#commandStore.recordEvent(commandContext.commandId, storedEvent, {
+        fencingToken: commandContext.fencingToken,
+      });
     }
 
     return storedEvent;
   }
 
   #handleExecutionError(caughtError, commandContext) {
-    const { commandId, committedEvents } = commandContext;
+    const { commandId, committedEvents, fencingToken } = commandContext;
 
     if (!commandId) {
       if (committedEvents.length > 0) {
@@ -373,12 +280,15 @@ class CommandExecutionCoordinator {
         caughtError.eventCommitted = null;
         caughtError.retrySafe = false;
         caughtError.retryAction = "RECONCILE_SAME_KEY";
-        this.#persistFailedCommand(commandId, caughtError, []);
+        this.#persistFailedCommand(commandId, caughtError, [], { fencingToken });
+      } else if (caughtError.code === "FENCING_TOKEN_STALE" || caughtError.code === "COMMAND_LEASE_EXPIRED") {
+        // Stale or expired worker must not release the command reservation
+        throw caughtError;
       } else if (DETERMINISTIC_COMMAND_REJECTION_CODES.has(caughtError.code)) {
         caughtError.eventCommitted = false;
         caughtError.retrySafe = false;
         caughtError.retryAction = "REPLAY_SAME_KEY";
-        this.#persistFailedCommand(commandId, caughtError, []);
+        this.#persistFailedCommand(commandId, caughtError, [], { fencingToken });
       } else {
         caughtError.eventCommitted = false;
         caughtError.retrySafe = true;
@@ -405,7 +315,7 @@ class CommandExecutionCoordinator {
       );
     }
 
-    this.#persistFailedCommand(commandId, committedError, committedEvents);
+    this.#persistFailedCommand(commandId, committedError, committedEvents, { fencingToken });
 
     throw committedError;
   }
@@ -486,9 +396,73 @@ class CommandExecutionCoordinator {
           throw createCommandHistoryInconsistentError(record.commandId, events);
         }
 
+        const nowMs = this.#getNow();
+        const expiresAt =
+          record.leaseExpiresAt !== null && record.leaseExpiresAt !== undefined
+            ? Number(record.leaseExpiresAt)
+            : null;
+
+        // If lease is still valid, return command in progress
+        if (expiresAt !== null && expiresAt > nowMs) {
+          throw createCommandInProgressError(record);
+        }
+
+        // If lease is expired and 0 events exist: safe takeover allowed!
+        if (expiresAt !== null && expiresAt <= nowMs) {
+          const takeover = this.#commandStore.takeOverExpired({
+            commandId: record.commandId,
+            workerId: this.#workerId,
+            leaseTtlMs: this.#leaseTtlMs,
+            now: nowMs,
+            expectedToken: record.leaseToken,
+          });
+
+          if (takeover.success) {
+            const newToken = takeover.record.leaseToken;
+            this.#emitDiagnostic({
+              type: DIAGNOSTIC_TYPES.COMMAND_LEASE,
+              status: DIAGNOSTIC_STATUSES.LEASE_TAKEN_OVER,
+              commandId: record.commandId,
+              workerId: this.#workerId,
+              fencingToken: newToken,
+              previousToken: record.leaseToken,
+            });
+
+            const eventCommandId = record.commandId;
+            const commandContext = {
+              commandId: record.commandId,
+              eventCommandId,
+              correlationId: normalizedOptions.correlationId ?? eventCommandId,
+              initialCausationId: normalizedOptions.causationId ?? eventCommandId,
+              lastEventId: null,
+              committedEvents: [],
+              workerId: this.#workerId,
+              fencingToken: newToken,
+            };
+
+            try {
+              const result = executeCommand(commandContext);
+              this.#commandStore.complete(record.commandId, result, { fencingToken: newToken });
+              return result;
+            } catch (caughtError) {
+              return this.#handleExecutionError(caughtError, commandContext);
+            }
+          }
+
+          // If takeover failed due to race, re-evaluate existing command
+          return this.#resolveExistingCommand(
+            this.#commandStore.get(record.commandId),
+            commandType,
+            payload,
+            normalizedOptions,
+            executeCommand
+          );
+        }
+
         throw createCommandInProgressError(record);
       }
 
+      // If events.length >= 1: partial-commit reconciliation. NO TAKEOVER!
       if (!this.#commandEventsFormContiguousRange(record.commandId, events)) {
         const inconsistentError = createCommandHistoryInconsistentError(
           record.commandId,
@@ -506,7 +480,9 @@ class CommandExecutionCoordinator {
         record.commandId,
         events
       );
-      this.#persistFailedCommand(record.commandId, interruptedError, events);
+      this.#persistFailedCommand(record.commandId, interruptedError, events, {
+        fencingToken: record.leaseToken,
+      });
       throw interruptedError;
     }
 
@@ -611,13 +587,13 @@ class CommandExecutionCoordinator {
     );
   }
 
-  #persistFailedCommand(commandId, error, events) {
+  #persistFailedCommand(commandId, error, events, { fencingToken } = {}) {
     try {
       if (events.length > 0) {
         this.#commandStore.reconcileEvents(commandId, events);
       }
 
-      this.#commandStore.fail(commandId, serializeCommandError(error));
+      this.#commandStore.fail(commandId, serializeCommandError(error), { fencingToken });
     } catch (persistenceError) {
       throw createCommandStatePersistenceError(
         commandId,
@@ -641,10 +617,15 @@ class CommandExecutionCoordinator {
     }
   }
 
-  #appendEvent(event, expectedVersion) {
+  #appendEvent(event, expectedVersion, fencingToken) {
     try {
-      return this.#eventStore.append(event, { expectedVersion });
+      return this.#eventStore.append(event, { expectedVersion, fencingToken });
     } catch (appendError) {
+      // If append failed because fencing token was stale or lease expired, rethrow immediately
+      if (appendError?.code === "FENCING_TOKEN_STALE" || appendError?.code === "COMMAND_LEASE_EXPIRED") {
+        throw appendError;
+      }
+
       let commandEvents;
 
       try {
