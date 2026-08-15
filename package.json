@@ -6,8 +6,9 @@
   "scripts": {
     "start": "node src/server.js",
     "lab": "LAB_MODE=1 node src/server.js",
+    "chaos": "node src/chaos/cli.js",
     "test": "node --test",
-    "check": "node --check src/app.js && node --check src/server.js"
+    "check": "node --check src/app.js && node --check src/server.js && node --check src/chaos/cli.js"
   },
   "keywords": [],
   "author": "",

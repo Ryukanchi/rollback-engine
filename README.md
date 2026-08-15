@@ -410,6 +410,67 @@ Open `http://localhost:3000/lab` in your browser.
 6. **`processing + 0 events` Boundary**: Demonstrates the intentional safety boundary refusing automatic takeover of uncompleted commands without events when worker liveness is uncertain.
 7. **Process Restart Durability**: Spawns two real independent OS child processes. Process A commits the event stream to disk and terminates; Process B opens the database file from scratch and reconstructs the exact domain state via replay.
 
+## Deterministic Chaos & Invariant Fuzzing
+
+The repository includes a deterministic chaos and invariant fuzzing harness designed to explore thousands of interleaved operations, fault injections, retries, view drifts, snapshot corruptions, and concurrency attempts against both In-Memory and persistent SQLite storage adapters.
+
+### Design Principles
+
+- **100% Deterministic Seeded PRNG**: Built with a custom 32-bit Mulberry32 PRNG. Zero calls to unseeded `Math.random()`. Every single execution is 100% reproducible by providing the exact seed.
+- **Real Engine & Real Stores**: The harness exercises the actual `RollbackEngine`, `CommandExecutionCoordinator`, projections, sagas, and SQLite/in-memory store contracts without mock semantics.
+- **Granular Single-Iteration Reproduction**: Any discovered failure or invariant violation can be reproduced directly on its specific iteration index:
+  ```bash
+  npm run chaos -- --seed=482971 --iteration=7312 --profile=memory
+  ```
+- **Per-Invariant Coverage Counting**: Aggregates and reports the exact number of times each invariant was evaluated during a campaign.
+
+### Invariant Catalog (19 Checked Invariants)
+
+| Invariant | Description | Verification Method |
+| :--- | :--- | :--- |
+| **Replay Authority** | `replay(agg)` equals authoritative state | Strict JSON deep equality between full event replay and authoritative projection |
+| **Snapshot Equivalence** | Snapshot + suffix equals full replay | Compares `replayFromSnapshot(agg)` against `replay(agg)` |
+| **Event Sequence Contiguity** | $1..N$ contiguous sequence without gaps | Verifies $Sequence_i == i + 1$ for all aggregate streams |
+| **Global Event ID Uniqueness** | Unique event IDs across all aggregates | Tracks global set of event IDs across store |
+| **Timestamp Monotonicity** | Non-decreasing timestamps per stream | Asserts $Timestamp_n \ge Timestamp_{n-1}$ |
+| **Projection Determinism** | Pure state machine behavior | Projects identical event stream multiple times and asserts equality |
+| **Materialized View Consistency** | Synchronized derived read model | Compares `getState('materialized')` with `replay(agg)` (skips intentional unrepaired drift) |
+| **Idempotent Retry Safety** | Re-execution produces $\Delta events = 0$ | Verifies stable outcome without duplicate event appends |
+| **Idempotency Conflict Detection** | Same ID with altered payload rejected | Asserts conflict error without aggregate state mutation |
+| **Post-Commit Retry Safety** | Interrupted commit cannot duplicate side effects | Verifies reconciliation prevents re-execution |
+| **`processing + 0` Boundary** | Uncompleted commands without events not stolen | Confirms `COMMAND_IN_PROGRESS` (`WAIT_AND_RETRY_SAME_KEY`) |
+| **Compensation Ordering** | Correct forward and reverse saga steps | Asserts refund precedes release and rollback in saga history |
+| **No Impossible Final State** | Domain state machine invariants | Prevents invalid states (e.g. `rolled_back` with active charges or `deleted` with reservations) |
+| **Commit Boundary** | Persistence of committed events is final | Derived store errors do not remove committed event log entries |
+| **Command Range Consistency** | Recorded range matches Event Store | Validates `firstSequence` and `lastSequence` against store |
+| **Aggregate Isolation** | Streams do not leak across aggregate IDs | Replay of Aggregate A depends exclusively on Events of Aggregate A |
+| **Time Travel Prefix** | `replayAtSequence(N)` equals prefix projection | Projects $Events[0..N]$ and compares with time-travel query |
+| **Defensive Copies** | External mutations do not corrupt store | Validates immutability / defensive copies on retrieved objects |
+| **Schema Upcasting** | Historical events read compatibly | Verifies `EventUpcasterRegistry` transformation without store mutation |
+
+### Running Chaos Campaigns
+
+```bash
+# Run standard campaign (5,000 in-memory + 250 persistent SQLite iterations)
+npm run chaos
+
+# Run smoke test (100 in-memory + 10 SQLite iterations)
+npm run chaos -- --campaign=smoke
+
+# Run high-volume in-memory campaign with specific seed
+npm run chaos -- --profile=memory --iterations=10000 --seed=482971
+
+# Run persistent SQLite campaign with specific seed
+npm run chaos -- --profile=sqlite --iterations=500 --seed=6006
+
+# Reproduce a specific single iteration
+npm run chaos -- --seed=482971 --iteration=7312 --profile=memory
+```
+
+### Claim Hygiene
+
+The chaos harness provides strong empirical evidence for the system's core invariants under complex local interleaving and single-machine crash/reopen boundaries. It is **not** a formal mathematical proof or a distributed multi-node consensus verification (e.g. Jepsen cluster partition testing).
+
 ## Run and verify
 
 ```bash
@@ -430,7 +491,7 @@ snapshot fallback, time-travel prefixes, commit uncertainty, view repair,
 idempotency reconciliation, optimistic concurrency, store contracts (both In-Memory and SQLite),
 file-backed restart durability across separate Node processes, lost ACK reconciliation,
 multi-process optimistic concurrency, the `LAB_MODE` security boundary, scenario runners,
-the OpenAPI route set, and representative API flows.
+deterministic chaos regression tests, reproduction tests, and representative API flows.
 
 ## Deliberate limits
 
@@ -445,6 +506,6 @@ the OpenAPI route set, and representative API flows.
 
 ## Sensible next steps
 
-1. **Deterministic Chaos Invariant Fuzzing**: Continuous automated fault-injection testing running thousands of interleaved operations against the persistent store.
-2. **Distributed Command Leases & Fencing Tokens**: Solving multi-worker crash recovery for unresolved processing commands.
-3. **Async Storage Adapter Boundary**: Introducing non-blocking async store adapters for high-throughput multi-tenant deployments.
+1. **Distributed Command Leases & Fencing Tokens**: Solving multi-worker crash recovery for unresolved processing commands across distinct nodes.
+2. **Async Storage Adapter Boundary**: Introducing non-blocking async store adapters for high-throughput multi-tenant deployments.
+3. **Multi-Node Cluster Simulation**: Simulating network partitions and raft-like consensus.
