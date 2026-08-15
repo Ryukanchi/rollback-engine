@@ -1,0 +1,1114 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Rollback Engine API",
+    "version": "1.0.0",
+    "description": "Event-sourced checkout, compensation, replay, recovery and debugging API. The Event Store is authoritative; snapshots and materialized views are derived optimizations."
+  },
+  "servers": [
+    {
+      "url": "http://localhost:3000",
+      "description": "Local development server"
+    }
+  ],
+  "tags": [
+    { "name": "Commands" },
+    { "name": "Reads" },
+    { "name": "Recovery" },
+    { "name": "Developer" }
+  ],
+  "paths": {
+    "/": {
+      "get": {
+        "tags": ["Developer"],
+        "operationId": "serviceStatus",
+        "summary": "Service status",
+        "responses": {
+          "200": {
+            "description": "Service is running",
+            "content": {
+              "text/plain": {
+                "schema": { "type": "string" },
+                "example": "Rollback Engine läuft 😈"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "tags": ["Developer"],
+        "operationId": "openApiContract",
+        "summary": "Machine-readable API contract",
+        "responses": {
+          "200": {
+            "description": "OpenAPI 3.1 document",
+            "content": {
+              "application/json": {
+                "schema": { "type": "object" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/orders": {
+      "get": {
+        "tags": ["Reads"],
+        "operationId": "listOrders",
+        "summary": "List orders from the materialized view",
+        "description": "Optimized read. The materialized view can be unavailable or stale after a reported repair failure; replay endpoints remain authoritative.",
+        "responses": {
+          "200": {
+            "description": "Active materialized orders",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/Order" }
+                }
+              }
+            }
+          },
+          "500": { "$ref": "#/components/responses/TechnicalError" }
+        }
+      }
+    },
+    "/order": {
+      "post": {
+        "tags": ["Commands"],
+        "operationId": "createOrder",
+        "summary": "Create an order",
+        "parameters": [
+          { "$ref": "#/components/parameters/IdempotencyKey" },
+          { "$ref": "#/components/parameters/CorrelationId" },
+          { "$ref": "#/components/parameters/CausationId" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateOrderRequest" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Order created, or the original result for the same idempotency key",
+            "headers": {
+              "Idempotency-Key": { "$ref": "#/components/headers/IdempotencyKey" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Order" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ValidationError" },
+          "409": { "$ref": "#/components/responses/ConflictError" },
+          "500": { "$ref": "#/components/responses/TechnicalError" }
+        }
+      }
+    },
+    "/order/{id}": {
+      "delete": {
+        "tags": ["Commands"],
+        "operationId": "deleteOrder",
+        "summary": "Delete a compensated or inactive order",
+        "parameters": [
+          { "$ref": "#/components/parameters/OrderId" },
+          { "$ref": "#/components/parameters/IdempotencyKey" },
+          { "$ref": "#/components/parameters/CorrelationId" },
+          { "$ref": "#/components/parameters/CausationId" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Order deleted, or the original result for the same idempotency key",
+            "headers": {
+              "Idempotency-Key": { "$ref": "#/components/headers/IdempotencyKey" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/DeleteOrderResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ValidationError" },
+          "404": { "$ref": "#/components/responses/NotFoundError" },
+          "409": { "$ref": "#/components/responses/ConflictError" },
+          "500": { "$ref": "#/components/responses/TechnicalError" }
+        }
+      }
+    },
+    "/checkout": {
+      "post": {
+        "tags": ["Commands"],
+        "operationId": "checkout",
+        "summary": "Run checkout and compensate recognized simulated failures",
+        "description": "A successful flow records ORDER_CREATED, INVENTORY_RESERVED and PAYMENT_CHARGED. A recognized simulated failure is compensated in reverse order. Repeating the same Idempotency-Key and normalized payload returns the stored result without new domain events.",
+        "parameters": [
+          { "$ref": "#/components/parameters/IdempotencyKey" },
+          { "$ref": "#/components/parameters/CorrelationId" },
+          { "$ref": "#/components/parameters/CausationId" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CheckoutRequest" },
+              "examples": {
+                "normal": {
+                  "value": { "item": "Pizza", "quantity": 1, "amount": 100 }
+                },
+                "simulateCompensation": {
+                  "value": {
+                    "item": "Pizza",
+                    "quantity": 1,
+                    "amount": 100,
+                    "simulateFailureAt": "after_payment"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Checkout completed, or original completed result replayed",
+            "headers": {
+              "Idempotency-Key": { "$ref": "#/components/headers/IdempotencyKey" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/CheckoutResult" },
+                "examples": {
+                  "completed": {
+                    "summary": "Completed checkout with a persisted snapshot",
+                    "value": {
+                      "aggregateId": 42,
+                      "status": "completed",
+                      "failedAt": null,
+                      "error": null,
+                      "completedSteps": [
+                        "ORDER_CREATED",
+                        "INVENTORY_RESERVED",
+                        "PAYMENT_CHARGED"
+                      ],
+                      "events": [
+                        {
+                          "eventId": "event-1",
+                          "eventType": "ORDER_CREATED",
+                          "aggregateId": 42,
+                          "sequence": 1,
+                          "timestamp": "2026-08-15T10:00:00.000Z",
+                          "payload": { "item": "Pizza", "quantity": 1 },
+                          "metadata": {
+                            "schemaVersion": 1,
+                            "commandId": "checkout-123",
+                            "correlationId": "flow-456",
+                            "causationId": "request-789"
+                          }
+                        },
+                        {
+                          "eventId": "event-2",
+                          "eventType": "INVENTORY_RESERVED",
+                          "aggregateId": 42,
+                          "sequence": 2,
+                          "timestamp": "2026-08-15T10:00:01.000Z",
+                          "payload": {
+                            "reservationId": 91,
+                            "item": "Pizza",
+                            "quantity": 1
+                          },
+                          "metadata": {
+                            "schemaVersion": 1,
+                            "commandId": "checkout-123",
+                            "correlationId": "flow-456",
+                            "causationId": "event-1"
+                          }
+                        },
+                        {
+                          "eventId": "event-3",
+                          "eventType": "PAYMENT_CHARGED",
+                          "aggregateId": 42,
+                          "sequence": 3,
+                          "timestamp": "2026-08-15T10:00:02.000Z",
+                          "payload": { "paymentId": 81, "amount": 100 },
+                          "metadata": {
+                            "schemaVersion": 1,
+                            "commandId": "checkout-123",
+                            "correlationId": "flow-456",
+                            "causationId": "event-2"
+                          }
+                        }
+                      ],
+                      "state": {
+                        "aggregateId": 42,
+                        "version": 3,
+                        "lifecycle": "completed",
+                        "deleted": false,
+                        "tombstone": null,
+                        "order": {
+                          "id": 42,
+                          "item": "Pizza",
+                          "quantity": 1,
+                          "status": "created",
+                          "createdAt": "2026-08-15T10:00:00.000Z"
+                        },
+                        "inventory": {
+                          "id": 91,
+                          "orderId": 42,
+                          "item": "Pizza",
+                          "quantity": 1,
+                          "status": "reserved",
+                          "reservedAt": "2026-08-15T10:00:01.000Z"
+                        },
+                        "payment": {
+                          "id": 81,
+                          "orderId": 42,
+                          "amount": 100,
+                          "status": "charged",
+                          "chargedAt": "2026-08-15T10:00:02.000Z"
+                        }
+                      },
+                      "snapshot": {
+                        "aggregateId": 42,
+                        "version": 3,
+                        "timestamp": "2026-08-15T10:00:03.000Z",
+                        "state": {
+                          "aggregateId": 42,
+                          "version": 3,
+                          "lifecycle": "completed",
+                          "deleted": false,
+                          "tombstone": null,
+                          "order": {
+                            "id": 42,
+                            "item": "Pizza",
+                            "quantity": 1,
+                            "status": "created",
+                            "createdAt": "2026-08-15T10:00:00.000Z"
+                          },
+                          "inventory": {
+                            "id": 91,
+                            "orderId": 42,
+                            "item": "Pizza",
+                            "quantity": 1,
+                            "status": "reserved",
+                            "reservedAt": "2026-08-15T10:00:01.000Z"
+                          },
+                          "payment": {
+                            "id": 81,
+                            "orderId": 42,
+                            "amount": 100,
+                            "status": "charged",
+                            "chargedAt": "2026-08-15T10:00:02.000Z"
+                          }
+                        }
+                      },
+                      "warnings": []
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ValidationError" },
+          "409": { "$ref": "#/components/responses/ConflictError" },
+          "500": {
+            "description": "Compensated simulated checkout result or structured technical failure",
+            "headers": {
+              "Idempotency-Key": { "$ref": "#/components/headers/IdempotencyKey" }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    { "$ref": "#/components/schemas/CheckoutResult" },
+                    { "$ref": "#/components/schemas/ErrorResponse" }
+                  ]
+                },
+                "examples": {
+                  "compensated": {
+                    "summary": "Recognized failure compensated in reverse order",
+                    "value": {
+                      "aggregateId": 42,
+                      "status": "rolled_back",
+                      "failedAt": "after_payment",
+                      "error": "Simulated checkout failure at after_payment",
+                      "completedSteps": [
+                        "ORDER_CREATED",
+                        "INVENTORY_RESERVED",
+                        "PAYMENT_CHARGED"
+                      ],
+                      "events": [
+                        {
+                          "eventId": "event-1",
+                          "eventType": "ORDER_CREATED",
+                          "aggregateId": 42,
+                          "sequence": 1,
+                          "timestamp": "2026-08-15T10:00:00.000Z",
+                          "payload": { "item": "Pizza", "quantity": 1 },
+                          "metadata": {
+                            "schemaVersion": 1,
+                            "commandId": "checkout-123",
+                            "correlationId": "flow-456",
+                            "causationId": "request-789"
+                          }
+                        },
+                        {
+                          "eventId": "event-2",
+                          "eventType": "INVENTORY_RESERVED",
+                          "aggregateId": 42,
+                          "sequence": 2,
+                          "timestamp": "2026-08-15T10:00:01.000Z",
+                          "payload": {
+                            "reservationId": 91,
+                            "item": "Pizza",
+                            "quantity": 1
+                          },
+                          "metadata": {
+                            "schemaVersion": 1,
+                            "commandId": "checkout-123",
+                            "correlationId": "flow-456",
+                            "causationId": "event-1"
+                          }
+                        },
+                        {
+                          "eventId": "event-3",
+                          "eventType": "PAYMENT_CHARGED",
+                          "aggregateId": 42,
+                          "sequence": 3,
+                          "timestamp": "2026-08-15T10:00:02.000Z",
+                          "payload": { "paymentId": 81, "amount": 100 },
+                          "metadata": {
+                            "schemaVersion": 1,
+                            "commandId": "checkout-123",
+                            "correlationId": "flow-456",
+                            "causationId": "event-2"
+                          }
+                        },
+                        {
+                          "eventId": "event-4",
+                          "eventType": "PAYMENT_REFUNDED",
+                          "aggregateId": 42,
+                          "sequence": 4,
+                          "timestamp": "2026-08-15T10:00:03.000Z",
+                          "payload": {
+                            "paymentId": 81,
+                            "reason": "Simulated checkout failure at after_payment"
+                          },
+                          "metadata": {
+                            "schemaVersion": 1,
+                            "commandId": "checkout-123",
+                            "correlationId": "flow-456",
+                            "causationId": "event-3"
+                          }
+                        },
+                        {
+                          "eventId": "event-5",
+                          "eventType": "INVENTORY_RELEASED",
+                          "aggregateId": 42,
+                          "sequence": 5,
+                          "timestamp": "2026-08-15T10:00:04.000Z",
+                          "payload": {
+                            "reservationId": 91,
+                            "reason": "Simulated checkout failure at after_payment"
+                          },
+                          "metadata": {
+                            "schemaVersion": 1,
+                            "commandId": "checkout-123",
+                            "correlationId": "flow-456",
+                            "causationId": "event-4"
+                          }
+                        },
+                        {
+                          "eventId": "event-6",
+                          "eventType": "ORDER_ROLLED_BACK",
+                          "aggregateId": 42,
+                          "sequence": 6,
+                          "timestamp": "2026-08-15T10:00:05.000Z",
+                          "payload": {
+                            "reason": "Simulated checkout failure at after_payment"
+                          },
+                          "metadata": {
+                            "schemaVersion": 1,
+                            "commandId": "checkout-123",
+                            "correlationId": "flow-456",
+                            "causationId": "event-5"
+                          }
+                        }
+                      ],
+                      "state": {
+                        "aggregateId": 42,
+                        "version": 6,
+                        "lifecycle": "rolled_back",
+                        "deleted": false,
+                        "tombstone": null,
+                        "order": {
+                          "id": 42,
+                          "item": "Pizza",
+                          "quantity": 1,
+                          "status": "rolled_back",
+                          "createdAt": "2026-08-15T10:00:00.000Z",
+                          "rolledBackAt": "2026-08-15T10:00:05.000Z",
+                          "rollbackReason": "Simulated checkout failure at after_payment"
+                        },
+                        "inventory": {
+                          "id": 91,
+                          "orderId": 42,
+                          "item": "Pizza",
+                          "quantity": 1,
+                          "status": "released",
+                          "reservedAt": "2026-08-15T10:00:01.000Z",
+                          "releasedAt": "2026-08-15T10:00:04.000Z",
+                          "releaseReason": "Simulated checkout failure at after_payment"
+                        },
+                        "payment": {
+                          "id": 81,
+                          "orderId": 42,
+                          "amount": 100,
+                          "status": "refunded",
+                          "chargedAt": "2026-08-15T10:00:02.000Z",
+                          "refundedAt": "2026-08-15T10:00:03.000Z",
+                          "refundReason": "Simulated checkout failure at after_payment"
+                        }
+                      },
+                      "snapshot": {
+                        "aggregateId": 42,
+                        "version": 6,
+                        "timestamp": "2026-08-15T10:00:06.000Z",
+                        "state": {
+                          "aggregateId": 42,
+                          "version": 6,
+                          "lifecycle": "rolled_back",
+                          "deleted": false,
+                          "tombstone": null,
+                          "order": {
+                            "id": 42,
+                            "item": "Pizza",
+                            "quantity": 1,
+                            "status": "rolled_back",
+                            "createdAt": "2026-08-15T10:00:00.000Z",
+                            "rolledBackAt": "2026-08-15T10:00:05.000Z",
+                            "rollbackReason": "Simulated checkout failure at after_payment"
+                          },
+                          "inventory": {
+                            "id": 91,
+                            "orderId": 42,
+                            "item": "Pizza",
+                            "quantity": 1,
+                            "status": "released",
+                            "reservedAt": "2026-08-15T10:00:01.000Z",
+                            "releasedAt": "2026-08-15T10:00:04.000Z",
+                            "releaseReason": "Simulated checkout failure at after_payment"
+                          },
+                          "payment": {
+                            "id": 81,
+                            "orderId": 42,
+                            "amount": 100,
+                            "status": "refunded",
+                            "chargedAt": "2026-08-15T10:00:02.000Z",
+                            "refundedAt": "2026-08-15T10:00:03.000Z",
+                            "refundReason": "Simulated checkout failure at after_payment"
+                          }
+                        }
+                      },
+                      "warnings": []
+                    }
+                  },
+                  "unknownCommit": {
+                    "value": {
+                      "error": {
+                        "code": "EVENT_APPEND_COMMIT_UNKNOWN",
+                        "category": "technical",
+                        "message": "The event store did not confirm whether the event was committed.",
+                        "eventCommitted": null,
+                        "retrySafe": false,
+                        "retryAction": "RECONCILE_SAME_KEY",
+                        "commandId": "checkout-123",
+                        "aggregateId": 42,
+                        "eventId": "event-123"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/history": {
+      "get": {
+        "tags": ["Reads", "Developer"],
+        "operationId": "completeHistory",
+        "summary": "Read the complete committed event history",
+        "responses": {
+          "200": {
+            "description": "Global append order",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/HistoryResponse" }
+              }
+            }
+          },
+          "500": { "$ref": "#/components/responses/TechnicalError" }
+        }
+      }
+    },
+    "/timeline/{orderId}": {
+      "get": {
+        "tags": ["Developer"],
+        "operationId": "aggregateTimeline",
+        "summary": "Read a compact aggregate trace",
+        "description": "Derived only from committed events. Does not execute domain logic or create events.",
+        "parameters": [
+          { "$ref": "#/components/parameters/OrderIdByName" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Sequence and trace metadata for one aggregate",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/EventTimeline" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ValidationError" },
+          "404": { "$ref": "#/components/responses/NotFoundError" },
+          "500": { "$ref": "#/components/responses/TechnicalError" }
+        }
+      }
+    },
+    "/replay-state/{orderId}": {
+      "get": {
+        "tags": ["Reads"],
+        "operationId": "replayState",
+        "summary": "Authoritatively rebuild aggregate state from events",
+        "parameters": [
+          { "$ref": "#/components/parameters/OrderIdByName" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Full replay state",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ProjectionState" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ValidationError" },
+          "404": { "$ref": "#/components/responses/NotFoundError" },
+          "500": { "$ref": "#/components/responses/TechnicalError" }
+        }
+      }
+    },
+    "/snapshot/{orderId}": {
+      "get": {
+        "tags": ["Reads"],
+        "operationId": "readSnapshot",
+        "summary": "Read the current snapshot optimization",
+        "parameters": [
+          { "$ref": "#/components/parameters/OrderIdByName" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Stored snapshot",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["snapshot"],
+                  "properties": {
+                    "snapshot": { "$ref": "#/components/schemas/Snapshot" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ValidationError" },
+          "404": { "$ref": "#/components/responses/NotFoundError" },
+          "500": { "$ref": "#/components/responses/TechnicalError" }
+        }
+      }
+    },
+    "/replay-restore/{orderId}": {
+      "post": {
+        "tags": ["Recovery"],
+        "operationId": "recoverMaterializedView",
+        "summary": "Repair the materialized view from retained events",
+        "description": "Recovery emits no domain events.",
+        "parameters": [
+          { "$ref": "#/components/parameters/OrderIdByName" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Materialized view restored",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/RecoveryResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ValidationError" },
+          "404": { "$ref": "#/components/responses/NotFoundError" },
+          "500": { "$ref": "#/components/responses/TechnicalError" }
+        }
+      }
+    },
+    "/state-at/{orderId}/{timestamp}": {
+      "get": {
+        "tags": ["Reads", "Developer"],
+        "operationId": "stateAtTime",
+        "summary": "Replay a contiguous event prefix at a timestamp",
+        "parameters": [
+          { "$ref": "#/components/parameters/OrderIdByName" },
+          {
+            "name": "timestamp",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string", "format": "date-time" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "State at the requested time",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ProjectionState" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ValidationError" },
+          "404": { "$ref": "#/components/responses/NotFoundError" },
+          "500": { "$ref": "#/components/responses/TechnicalError" }
+        }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "IdempotencyKey": {
+        "name": "Idempotency-Key",
+        "in": "header",
+        "required": false,
+        "description": "Stable command identity. Reuse only with the same command type and normalized payload.",
+        "schema": { "type": "string", "minLength": 1, "maxLength": 200 }
+      },
+      "CorrelationId": {
+        "name": "X-Correlation-Id",
+        "in": "header",
+        "required": false,
+        "description": "Business-flow trace identifier shared across related commands.",
+        "schema": { "type": "string", "minLength": 1, "maxLength": 200 }
+      },
+      "CausationId": {
+        "name": "X-Causation-Id",
+        "in": "header",
+        "required": false,
+        "description": "Identifier that caused the first event. Following events point to the preceding event.",
+        "schema": { "type": "string", "minLength": 1, "maxLength": 200 }
+      },
+      "OrderId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "schema": { "type": "integer", "minimum": 1 }
+      },
+      "OrderIdByName": {
+        "name": "orderId",
+        "in": "path",
+        "required": true,
+        "schema": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "headers": {
+      "IdempotencyKey": {
+        "description": "Echoes a supplied Idempotency-Key after command context was accepted.",
+        "schema": { "type": "string" }
+      }
+    },
+    "responses": {
+      "ValidationError": {
+        "description": "Request validation failed. Correct the request before retrying.",
+        "headers": {
+          "Idempotency-Key": { "$ref": "#/components/headers/IdempotencyKey" }
+        },
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+          }
+        }
+      },
+      "NotFoundError": {
+        "description": "Aggregate, snapshot or route does not exist.",
+        "headers": {
+          "Idempotency-Key": { "$ref": "#/components/headers/IdempotencyKey" }
+        },
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+          }
+        }
+      },
+      "ConflictError": {
+        "description": "Domain, idempotency or optimistic-concurrency conflict. Inspect retryAction.",
+        "headers": {
+          "Idempotency-Key": { "$ref": "#/components/headers/IdempotencyKey" }
+        },
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+          }
+        }
+      },
+      "TechnicalError": {
+        "description": "Technical failure. Never infer retry safety from HTTP status alone.",
+        "headers": {
+          "Idempotency-Key": { "$ref": "#/components/headers/IdempotencyKey" }
+        },
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "CreateOrderRequest": {
+        "type": "object",
+        "required": ["item"],
+        "properties": {
+          "item": { "type": "string", "minLength": 1 },
+          "quantity": { "type": "integer", "minimum": 1, "default": 1 }
+        }
+      },
+      "CheckoutRequest": {
+        "type": "object",
+        "required": ["item"],
+        "properties": {
+          "item": { "type": "string", "minLength": 1 },
+          "quantity": { "type": "integer", "minimum": 1, "default": 1 },
+          "amount": { "type": "number", "exclusiveMinimum": 0, "default": 100 },
+          "simulateFailureAt": {
+            "type": ["string", "null"],
+            "enum": ["after_order", "after_inventory", "after_payment", null]
+          }
+        }
+      },
+      "Order": {
+        "type": "object",
+        "required": ["id", "item", "quantity", "status", "createdAt"],
+        "properties": {
+          "id": { "type": "integer", "minimum": 1 },
+          "item": { "type": "string" },
+          "quantity": { "type": "integer", "minimum": 1 },
+          "status": { "type": "string", "enum": ["created", "rolled_back"] },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "rolledBackAt": { "type": "string", "format": "date-time" },
+          "rollbackReason": { "type": ["string", "null"] }
+        }
+      },
+      "EventMetadata": {
+        "type": "object",
+        "required": ["schemaVersion", "commandId", "correlationId", "causationId"],
+        "properties": {
+          "schemaVersion": { "type": "integer", "const": 1 },
+          "commandId": { "type": ["string", "integer"] },
+          "correlationId": { "type": ["string", "integer"] },
+          "causationId": { "type": ["string", "integer"] }
+        }
+      },
+      "DomainEvent": {
+        "type": "object",
+        "required": [
+          "eventId",
+          "eventType",
+          "aggregateId",
+          "sequence",
+          "timestamp",
+          "payload",
+          "metadata"
+        ],
+        "properties": {
+          "eventId": { "type": "string" },
+          "eventType": {
+            "type": "string",
+            "enum": [
+              "ORDER_CREATED",
+              "INVENTORY_RESERVED",
+              "PAYMENT_CHARGED",
+              "PAYMENT_REFUNDED",
+              "INVENTORY_RELEASED",
+              "ORDER_ROLLED_BACK",
+              "ORDER_DELETED"
+            ]
+          },
+          "aggregateId": { "type": ["integer", "string"] },
+          "sequence": { "type": "integer", "minimum": 1 },
+          "timestamp": { "type": "string", "format": "date-time" },
+          "payload": { "type": "object" },
+          "metadata": { "$ref": "#/components/schemas/EventMetadata" }
+        }
+      },
+      "ProjectionState": {
+        "type": "object",
+        "required": [
+          "aggregateId",
+          "version",
+          "lifecycle",
+          "deleted",
+          "tombstone",
+          "order",
+          "inventory",
+          "payment"
+        ],
+        "properties": {
+          "aggregateId": { "type": ["integer", "string"] },
+          "version": { "type": "integer", "minimum": 0 },
+          "lifecycle": {
+            "type": "string",
+            "enum": ["empty", "active", "completed", "compensating", "rolled_back", "deleted"]
+          },
+          "deleted": { "type": "boolean" },
+          "tombstone": { "type": ["object", "null"] },
+          "order": {
+            "oneOf": [
+              { "$ref": "#/components/schemas/Order" },
+              { "type": "null" }
+            ]
+          },
+          "inventory": { "type": ["object", "null"] },
+          "payment": { "type": ["object", "null"] }
+        }
+      },
+      "Snapshot": {
+        "type": "object",
+        "required": ["aggregateId", "version", "timestamp", "state"],
+        "properties": {
+          "aggregateId": { "type": ["integer", "string"] },
+          "version": { "type": "integer", "minimum": 1 },
+          "timestamp": { "type": "string", "format": "date-time" },
+          "state": { "$ref": "#/components/schemas/ProjectionState" }
+        }
+      },
+      "SnapshotWarning": {
+        "type": "object",
+        "required": [
+          "code",
+          "category",
+          "message",
+          "eventCommitted",
+          "retrySafe",
+          "retryAction",
+          "aggregateId"
+        ],
+        "properties": {
+          "code": { "type": "string", "const": "SNAPSHOT_SAVE_FAILED" },
+          "category": { "type": "string", "const": "technical" },
+          "message": { "type": "string" },
+          "eventCommitted": { "type": "boolean", "const": true },
+          "retrySafe": { "type": "boolean", "const": false },
+          "retryAction": { "type": "string", "const": "DO_NOT_RETRY_COMMAND" },
+          "aggregateId": { "type": ["integer", "string"] }
+        }
+      },
+      "CheckoutResult": {
+        "type": "object",
+        "required": [
+          "aggregateId",
+          "status",
+          "failedAt",
+          "error",
+          "completedSteps",
+          "events",
+          "state",
+          "snapshot",
+          "warnings"
+        ],
+        "properties": {
+          "aggregateId": { "type": ["integer", "string"] },
+          "status": { "type": "string", "enum": ["completed", "rolled_back", "failed"] },
+          "failedAt": {
+            "type": ["string", "null"],
+            "enum": ["after_order", "after_inventory", "after_payment", null]
+          },
+          "error": { "type": ["string", "null"] },
+          "completedSteps": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "events": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/DomainEvent" }
+          },
+          "state": { "$ref": "#/components/schemas/ProjectionState" },
+          "snapshot": {
+            "oneOf": [
+              { "$ref": "#/components/schemas/Snapshot" },
+              { "type": "null" }
+            ]
+          },
+          "warnings": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/SnapshotWarning" }
+          }
+        }
+      },
+      "DeleteOrderResponse": {
+        "type": "object",
+        "required": ["message", "order", "warnings"],
+        "properties": {
+          "message": { "type": "string" },
+          "order": { "$ref": "#/components/schemas/Order" },
+          "warnings": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/SnapshotWarning" }
+          }
+        }
+      },
+      "HistoryResponse": {
+        "type": "object",
+        "required": ["count", "history"],
+        "properties": {
+          "count": { "type": "integer", "minimum": 0 },
+          "history": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/DomainEvent" }
+          }
+        }
+      },
+      "TimelineEntry": {
+        "type": "object",
+        "required": [
+          "sequence",
+          "eventId",
+          "eventType",
+          "timestamp",
+          "schemaVersion",
+          "commandId",
+          "correlationId",
+          "causationId"
+        ],
+        "properties": {
+          "sequence": { "type": "integer", "minimum": 1 },
+          "eventId": { "type": "string" },
+          "eventType": { "type": "string" },
+          "timestamp": { "type": "string", "format": "date-time" },
+          "schemaVersion": { "type": "integer" },
+          "commandId": { "type": ["string", "integer"] },
+          "correlationId": { "type": ["string", "integer"] },
+          "causationId": { "type": ["string", "integer"] }
+        }
+      },
+      "EventTimeline": {
+        "type": "object",
+        "required": [
+          "aggregateId",
+          "version",
+          "eventCount",
+          "commandIds",
+          "correlationIds",
+          "entries"
+        ],
+        "properties": {
+          "aggregateId": { "type": ["integer", "string"] },
+          "version": { "type": "integer", "minimum": 1 },
+          "eventCount": { "type": "integer", "minimum": 1 },
+          "commandIds": {
+            "type": "array",
+            "items": { "type": ["string", "integer"] }
+          },
+          "correlationIds": {
+            "type": "array",
+            "items": { "type": ["string", "integer"] }
+          },
+          "entries": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/TimelineEntry" }
+          }
+        }
+      },
+      "RecoveryResponse": {
+        "type": "object",
+        "required": ["orderId", "restored", "state"],
+        "properties": {
+          "orderId": { "type": ["integer", "string"] },
+          "restored": { "type": "boolean", "const": true },
+          "state": { "$ref": "#/components/schemas/ProjectionState" }
+        }
+      },
+      "ErrorDetail": {
+        "type": "object",
+        "required": [
+          "code",
+          "category",
+          "message",
+          "eventCommitted",
+          "retrySafe",
+          "retryAction"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "enum": [
+              "VALIDATION_ERROR",
+              "NOT_FOUND",
+              "AGGREGATE_NOT_FOUND",
+              "COMPENSATION_REQUIRED",
+              "EVENT_COMMITTED_VIEW_REPAIR_FAILED",
+              "IDEMPOTENCY_KEY_CONFLICT",
+              "COMMAND_IN_PROGRESS",
+              "COMMAND_EXECUTION_PARTIALLY_COMMITTED",
+              "COMMAND_EXECUTION_INTERRUPTED_AFTER_COMMIT",
+              "COMMAND_EVENT_HISTORY_INCONSISTENT",
+              "COMMAND_STATE_PERSISTENCE_FAILED",
+              "EVENT_APPEND_COMMIT_UNKNOWN",
+              "COMMAND_RECONCILIATION_FAILED",
+              "OPTIMISTIC_CONCURRENCY_CONFLICT",
+              "INTERNAL_ERROR",
+              "REQUEST_REJECTED"
+            ]
+          },
+          "category": {
+            "type": "string",
+            "enum": ["validation", "not_found", "domain", "conflict", "technical", "request"]
+          },
+          "message": { "type": "string" },
+          "eventCommitted": { "type": ["boolean", "null"] },
+          "retrySafe": { "type": ["boolean", "null"] },
+          "retryAction": {
+            "type": "string",
+            "enum": [
+              "FIX_REQUEST",
+              "COMPENSATE_THEN_RETRY",
+              "USE_NEW_KEY",
+              "WAIT_AND_RETRY_SAME_KEY",
+              "RETRY_SAME_KEY",
+              "RETRY_COMMAND",
+              "REPLAY_SAME_KEY",
+              "RECONCILE_SAME_KEY",
+              "DO_NOT_RETRY_COMMAND",
+              "MANUAL_RESOLUTION_REQUIRED"
+            ]
+          },
+          "commandId": { "type": ["string", "integer"] },
+          "aggregateId": { "type": ["string", "integer"] },
+          "eventId": { "type": "string" },
+          "eventIds": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": { "$ref": "#/components/schemas/ErrorDetail" }
+        }
+      }
+    }
+  }
+}
