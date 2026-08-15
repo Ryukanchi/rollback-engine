@@ -108,6 +108,10 @@ test("lab scenario: process restart durability survives across separate OS child
   });
 
   assert.equal(result.status, "completed");
+  assert.equal(typeof result.restart.processA.pid, "number");
+  assert.equal(result.restart.processA.pid > 0, true);
+  assert.equal(typeof result.restart.processB.pid, "number");
+  assert.equal(result.restart.processB.pid > 0, true);
   assert.equal(result.restart.processA.exitCode, 0);
   assert.equal(result.restart.processB.exitCode, 0);
   assert.equal(result.restart.stateMatch, true);

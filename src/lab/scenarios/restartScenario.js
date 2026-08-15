@@ -32,6 +32,7 @@ function runRestartScenario(session, { mode = "standard" } = {}) {
     adapters.close();
 
     process.stdout.write(JSON.stringify({
+      pid: process.pid,
       aggregateId: result.aggregateId,
       status: result.status,
       eventsCount: events.length,
@@ -66,11 +67,12 @@ function runRestartScenario(session, { mode = "standard" } = {}) {
 
     const events = engine.getEvents(${JSON.stringify(aggregateId)});
     const replayedState = engine.replay(${JSON.stringify(aggregateId)});
-    const materializedState = engine.getOrder(${JSON.stringify(aggregateId)}, { consistency: 'materialized' });
+    const materializedState = engine.getState(${JSON.stringify(aggregateId)}, { consistency: 'materialized' });
 
     adapters.close();
 
     process.stdout.write(JSON.stringify({
+      pid: process.pid,
       aggregateId: ${JSON.stringify(aggregateId)},
       eventsCount: events.length,
       replayedState,
@@ -92,7 +94,7 @@ function runRestartScenario(session, { mode = "standard" } = {}) {
   // Read events and diagnostics via session engine for timeline rendering
   const events = session.engine.getEvents(aggregateId);
   const authoritativeState = session.engine.replay(aggregateId);
-  const materializedState = session.engine.getOrder(aggregateId, { consistency: "materialized" });
+  const materializedState = session.engine.getState(aggregateId, { consistency: "materialized" });
   const snapshot = session.engine.getSnapshot(aggregateId);
   const diagnostics = session.engine.getDiagnostics({ aggregateId });
 
@@ -124,12 +126,14 @@ function runRestartScenario(session, { mode = "standard" } = {}) {
     invariants,
     restart: {
       processA: {
+        pid: resultA.pid,
         action: isCompensated ? "Committed 6-event compensated checkout" : "Committed 3-event checkout",
         exitCode: childA.status,
         eventsCount: resultA.eventsCount,
         finalStateLifecycle: resultA.finalState.lifecycle,
       },
       processB: {
+        pid: resultB.pid,
         action: "Opened database file from scratch & replayed event log",
         exitCode: childB.status,
         eventsCount: resultB.eventsCount,

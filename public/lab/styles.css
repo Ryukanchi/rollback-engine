@@ -211,6 +211,16 @@ code, pre {
   color: var(--color-emerald);
 }
 
+.btn:focus-visible,
+.btn-sm:focus-visible,
+.tab-btn:focus-visible,
+.timeline-item:focus-visible,
+.sequence-slider:focus-visible,
+.alert-action-btn:focus-visible {
+  outline: 2px solid var(--color-cyan);
+  outline-offset: 2px;
+}
+
 .btn-sm {
   padding: 4px 8px;
   font-size: 11px;

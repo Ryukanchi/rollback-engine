@@ -171,6 +171,9 @@
       const item = document.createElement("div");
       item.className = `timeline-item ${isCompensation ? "compensation" : "forward"}`;
       item.dataset.sequence = evt.sequence;
+      item.tabIndex = 0;
+      item.setAttribute("role", "button");
+      item.setAttribute("aria-label", `Sequence ${evt.sequence}: ${evt.eventType}`);
 
       if (evt.sequence === currentSequence) {
         item.classList.add("active");
@@ -195,8 +198,20 @@
         </details>
       `;
 
-      item.addEventListener("click", () => {
+      const selectEvent = (e) => {
+        // Avoid triggering sequence scrubber if clicking inside the expandable details summary/json
+        if (e.target.tagName === "SUMMARY" || e.target.tagName === "PRE" || e.target.closest("details")?.contains(e.target)) {
+          return;
+        }
         setSequence(evt.sequence);
+      };
+
+      item.addEventListener("click", selectEvent);
+      item.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          setSequence(evt.sequence);
+        }
       });
 
       timelineContainer.appendChild(item);
@@ -399,12 +414,14 @@
     // 2. Restart Scenario Context
     if (data.scenarioType === "process_restart_durability" && data.restart) {
       dynamicContextBox.style.display = "block";
+      const pidA = data.restart.processA.pid ? ` (PID: ${data.restart.processA.pid})` : "";
+      const pidB = data.restart.processB.pid ? ` (PID: ${data.restart.processB.pid})` : "";
       dynamicContextBox.innerHTML = `
         <div class="alert-box alert-emerald">
           <div class="alert-title">✓ Process Restart Durability Verified Across OS Boundary</div>
           <div style="margin-top: 4px;">
-            <strong>Process A:</strong> ${data.restart.processA.action} (Exit Code: ${data.restart.processA.exitCode})<br>
-            <strong>Process B:</strong> ${data.restart.processB.action} (Exit Code: ${data.restart.processB.exitCode})<br>
+            <strong>Process A${pidA}:</strong> ${data.restart.processA.action} (Exit Code: ${data.restart.processA.exitCode})<br>
+            <strong>Process B${pidB}:</strong> ${data.restart.processB.action} (Exit Code: ${data.restart.processB.exitCode})<br>
             <strong>State Equality:</strong> Replayed state from Process B matches Process A perfectly.
           </div>
         </div>
