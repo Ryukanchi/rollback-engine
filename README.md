@@ -379,6 +379,37 @@ STORAGE=memory npm start
 STORAGE=sqlite DB_PATH=./data/rollback.db npm start
 ```
 
+## Interactive Reliability Lab
+
+The project includes an interactive engineering cockpit to inspect real event streams, replay historical sequences, inject faults, test self-healing, and verify post-crash reconciliation.
+
+### Starting the Lab
+
+```bash
+# Start server with Lab Mode enabled
+npm run lab
+
+# Alternatively:
+LAB_MODE=1 npm start
+```
+
+Open `http://localhost:3000/lab` in your browser.
+
+### Safety & Isolation Boundary
+
+- **`LAB_MODE` Guard**: When `LAB_MODE` is disabled (default in production), `/lab` and destructive scenario APIs are completely disabled (HTTP 404), ensuring standard API endpoints are never exposed to test faults.
+- **Disposable SQLite Databases**: Every scenario run operates in a dedicated, isolated temporary SQLite database file (e.g. `rollback-lab-<id>.db`). The primary application database is never touched.
+
+### Demonstrable Scenarios
+
+1. **Successful Checkout Saga**: Executes standard 3-step forward saga (`ORDER_CREATED`, `INVENTORY_RESERVED`, `PAYMENT_CHARGED`), committing contiguous sequences and verifying state projection.
+2. **Compensation After Payment**: Injects fault at `simulateFailureAt: 'after_payment'`, demonstrating automatic reverse compensation (`PAYMENT_REFUNDED`, `INVENTORY_RELEASED`, `ORDER_ROLLED_BACK`) to safely roll back state.
+3. **Sequence Time Travel & State Diff**: Interactive sequence scrubber allowing deterministic state inspection at any point in history (`replayAtSequence()`) with highlighted delta diffs ($\Delta$ from $N-1$).
+4. **Logical Read-Model Drift & Self-Healing**: Deliberately mutates the SQLite materialized cache row. The UI displays the drift against the authoritative event log and provides a button to trigger authoritative self-healing.
+5. **Post-Commit Reconciliation**: Simulates a process crash after Event Store append but before completion ACK. On retry with the same `Idempotency-Key`, existing events are reconciled via indexed `command_id` without executing duplicate side-effects.
+6. **`processing + 0 events` Boundary**: Demonstrates the intentional safety boundary refusing automatic takeover of uncompleted commands without events when worker liveness is uncertain.
+7. **Process Restart Durability**: Spawns two real independent OS child processes. Process A commits the event stream to disk and terminates; Process B opens the database file from scratch and reconstructs the exact domain state via replay.
+
 ## Run and verify
 
 ```bash
@@ -398,7 +429,8 @@ The tests cover domain transitions, compensation order, replay equivalence,
 snapshot fallback, time-travel prefixes, commit uncertainty, view repair,
 idempotency reconciliation, optimistic concurrency, store contracts (both In-Memory and SQLite),
 file-backed restart durability across separate Node processes, lost ACK reconciliation,
-multi-process optimistic concurrency, the OpenAPI route set, and representative API flows.
+multi-process optimistic concurrency, the `LAB_MODE` security boundary, scenario runners,
+the OpenAPI route set, and representative API flows.
 
 ## Deliberate limits
 
@@ -413,6 +445,6 @@ multi-process optimistic concurrency, the OpenAPI route set, and representative 
 
 ## Sensible next steps
 
-1. **Interactive Chaos & Time-Travel Cockpit**: A lightweight dashboard visualizing the persistent event log, saga compensations, and live fault injection.
-2. **Deterministic Chaos Invariant Fuzzing**: Continuous fault-injection testing running thousands of interleaved operations against the persistent store.
-3. **Distributed Command Leases & Fencing Tokens**: Solving multi-worker crash recovery for unresolved processing commands.
+1. **Deterministic Chaos Invariant Fuzzing**: Continuous automated fault-injection testing running thousands of interleaved operations against the persistent store.
+2. **Distributed Command Leases & Fencing Tokens**: Solving multi-worker crash recovery for unresolved processing commands.
+3. **Async Storage Adapter Boundary**: Introducing non-blocking async store adapters for high-throughput multi-tenant deployments.

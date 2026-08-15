@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Rollback Engine Lab — Reliability &amp; Time-Travel Cockpit</title>
+  <link rel="stylesheet" href="/lab/styles.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div class="app-layout">
+    <!-- Top Header -->
+    <header class="app-header">
+      <div class="header-left">
+        <div class="logo-group">
+          <span class="logo-badge">LAB</span>
+          <h1 class="logo-title">ROLLBACK ENGINE</h1>
+        </div>
+        <span class="header-tagline">Interactive Chaos, Reliability &amp; Time-Travel Cockpit</span>
+      </div>
+
+      <div class="header-right">
+        <div class="status-chip chip-success">
+          <span class="chip-dot"></span>
+          <span class="chip-label">LAB_MODE ACTIVE</span>
+        </div>
+        <div class="status-chip chip-storage" id="storageBadge">
+          <span class="chip-label">STORAGE: SQLite WAL</span>
+        </div>
+        <div class="status-chip chip-session" id="sessionBadge">
+          <span class="chip-label">SESSION: None</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Scenario Toolbar -->
+    <nav class="scenario-toolbar">
+      <div class="toolbar-label">ENGINEERING SCENARIOS:</div>
+      <div class="scenario-buttons">
+        <button class="btn btn-scenario" data-scenario="successful_checkout">
+          <span class="btn-icon">✓</span>
+          <span class="btn-text">Successful Checkout</span>
+        </button>
+        <button class="btn btn-scenario btn-warning" data-scenario="compensation_after_payment">
+          <span class="btn-icon">↺</span>
+          <span class="btn-text">Inject Fault (Compensation)</span>
+        </button>
+        <button class="btn btn-scenario btn-purple" data-scenario="read_model_drift">
+          <span class="btn-icon">⚡</span>
+          <span class="btn-text">Read-Model Drift &amp; Self-Healing</span>
+        </button>
+        <button class="btn btn-scenario btn-cyan" data-scenario="post_commit_reconciliation">
+          <span class="btn-icon">🛡</span>
+          <span class="btn-text">Post-Commit Reconciliation</span>
+        </button>
+        <button class="btn btn-scenario btn-boundary" data-scenario="processing_zero_events_boundary">
+          <span class="btn-icon">⚠</span>
+          <span class="btn-text">processing + 0 Boundary</span>
+        </button>
+        <button class="btn btn-scenario btn-emerald" data-scenario="process_restart_durability" data-options='{"mode":"standard"}'>
+          <span class="btn-icon">⇋</span>
+          <span class="btn-text">Process Restart Durability</span>
+        </button>
+        <button class="btn btn-scenario btn-emerald" data-scenario="process_restart_durability" data-options='{"mode":"compensated"}'>
+          <span class="btn-icon">⇋</span>
+          <span class="btn-text">Compensated Saga Restart</span>
+        </button>
+      </div>
+    </nav>
+
+    <!-- Scenario Summary Banner -->
+    <section class="summary-banner" id="summaryBanner">
+      <div class="summary-header">
+        <div class="summary-title-group">
+          <span class="scenario-status-pill" id="scenarioStatusPill">READY</span>
+          <h2 class="summary-title" id="summaryTitle">Select a Scenario Above to Begin</h2>
+        </div>
+        <div class="summary-meta" id="summaryMeta"></div>
+      </div>
+      <p class="summary-desc" id="summaryDesc">
+        Execute real engine sagas, inspect atomic event persistence, scrub historical sequences with time-travel replay, test logical drift repair, and verify post-crash reconciliation.
+      </p>
+    </section>
+
+    <!-- Main Grid -->
+    <main class="dashboard-grid">
+      <!-- Left Column: Event Stream Timeline -->
+      <section class="panel timeline-panel">
+        <div class="panel-header">
+          <div class="panel-title-group">
+            <h3 class="panel-title">EVENT STORE TIMELINE</h3>
+            <span class="badge" id="eventCountBadge">0 events</span>
+          </div>
+          <span class="panel-subtitle">Append-only authoritative source of truth</span>
+        </div>
+
+        <div class="timeline-container" id="timelineContainer">
+          <div class="empty-placeholder">No active event stream. Run a scenario to view events.</div>
+        </div>
+      </section>
+
+      <!-- Center Column: Sequence Time Travel & State Inspector -->
+      <section class="panel center-panel">
+        <!-- Sequence Scrubber Card -->
+        <div class="scrubber-card">
+          <div class="scrubber-header">
+            <div>
+              <span class="scrubber-title">SEQUENCE TIME TRAVEL</span>
+              <span class="scrubber-subtitle">Deterministic state reconstruction via <code>replayAtSequence()</code></span>
+            </div>
+            <div class="scrubber-controls">
+              <button class="btn-sm" id="btnPrevSeq" title="Step Back">◀ Prev</button>
+              <span class="seq-indicator" id="seqIndicator">Seq 0 / 0</span>
+              <button class="btn-sm" id="btnNextSeq" title="Step Forward">Next ▶</button>
+            </div>
+          </div>
+
+          <div class="slider-wrapper">
+            <input type="range" min="0" max="0" value="0" id="sequenceSlider" class="sequence-slider" disabled>
+            <div class="slider-ticks" id="sliderTicks"></div>
+          </div>
+        </div>
+
+        <!-- Dynamic Context Box (Drift Repair / Restart / Boundary Alerts) -->
+        <div class="dynamic-context-box" id="dynamicContextBox" style="display: none;"></div>
+
+        <!-- State Inspector Cards: Side-by-side or Tabbed -->
+        <div class="state-inspector-card">
+          <div class="state-tabs">
+            <button class="tab-btn active" data-tab="liveState">Replayed State (at Seq)</button>
+            <button class="tab-btn" data-tab="stateDiff">State Diff (Δ from Seq - 1)</button>
+            <button class="tab-btn" data-tab="materializedView">Materialized View (Cache)</button>
+          </div>
+
+          <div class="tab-content" id="tabContentLiveState">
+            <pre class="json-viewer" id="liveStateViewer"><code>{\n  "status": "awaiting_scenario"\n}</code></pre>
+          </div>
+
+          <div class="tab-content" id="tabContentStateDiff" style="display: none;">
+            <div class="diff-viewer" id="stateDiffViewer">No difference to show.</div>
+          </div>
+
+          <div class="tab-content" id="tabContentMaterializedView" style="display: none;">
+            <pre class="json-viewer" id="materializedViewViewer"><code>{\n  "view": "unpopulated"\n}</code></pre>
+          </div>
+        </div>
+      </section>
+
+      <!-- Right Column: Reliability Invariants & Diagnostics -->
+      <section class="panel right-panel">
+        <!-- Reliability Invariants -->
+        <div class="sub-panel invariants-subpanel">
+          <div class="panel-header">
+            <h3 class="panel-title">RELIABILITY INVARIANTS</h3>
+            <span class="panel-subtitle">Real mathematically verified guarantees</span>
+          </div>
+
+          <div class="invariants-list" id="invariantsList">
+            <div class="empty-placeholder">Run a scenario to calculate invariants.</div>
+          </div>
+        </div>
+
+        <!-- Diagnostics Ring Buffer -->
+        <div class="sub-panel diagnostics-subpanel">
+          <div class="panel-header">
+            <div class="panel-title-group">
+              <h3 class="panel-title">DIAGNOSTICS LOG</h3>
+              <span class="badge badge-subtle" id="diagCountBadge">0 signals</span>
+            </div>
+            <span class="panel-subtitle">Process-local structured observability buffer</span>
+          </div>
+
+          <div class="diagnostics-list" id="diagnosticsList">
+            <div class="empty-placeholder">No diagnostic entries recorded.</div>
+          </div>
+        </div>
+
+        <!-- Storage Info Card -->
+        <div class="storage-info-card">
+          <div class="storage-row">
+            <span class="storage-label">Engine Adapter:</span>
+            <span class="storage-val" id="storageAdapterVal">SQLite WAL</span>
+          </div>
+          <div class="storage-row">
+            <span class="storage-label">Scenario DB:</span>
+            <span class="storage-val" id="storageDbFileVal">-</span>
+          </div>
+          <div class="storage-row">
+            <span class="storage-label">Aggregate ID:</span>
+            <span class="storage-val" id="aggregateIdVal">-</span>
+          </div>
+          <div class="storage-row">
+            <span class="storage-label">Command ID:</span>
+            <span class="storage-val" id="commandIdVal">-</span>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Footer -->
+    <footer class="app-footer">
+      <span>Rollback Engine Lab &bull; Architecture &amp; Reliability Cockpit</span>
+      <span>Storage: Native <code>node:sqlite DatabaseSync</code> (WAL mode)</span>
+    </footer>
+  </div>
+
+  <script src="/lab/app.js"></script>
+</body>
+</html>

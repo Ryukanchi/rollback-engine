@@ -3,6 +3,7 @@ const openApiDocument = require("../openapi.json");
 
 const { RollbackEngine } = require("./application/rollbackEngine");
 const { createStorageAdapters } = require("./infrastructure/storageFactory");
+const { createLabRouter } = require("./lab/labRouter");
 const {
   errorHandler,
   notFoundHandler,
@@ -28,7 +29,8 @@ function createDefaultEngine() {
   return new RollbackEngine();
 }
 
-function createApp({ rollbackEngine } = {}) {
+function createApp({ rollbackEngine, labMode } = {}) {
+  const isLabMode = labMode ?? (process.env.LAB_MODE === "1" || process.env.LAB_MODE === "true");
   const effectiveEngine = rollbackEngine ?? createDefaultEngine();
   const app = express();
 
@@ -41,6 +43,10 @@ function createApp({ rollbackEngine } = {}) {
   app.get("/openapi.json", (req, res) => {
     res.json(openApiDocument);
   });
+
+  if (isLabMode) {
+    app.use("/lab", createLabRouter());
+  }
 
   app.use(createOrdersRouter({ rollbackEngine: effectiveEngine }));
   app.use(createCheckoutRouter({ rollbackEngine: effectiveEngine }));
