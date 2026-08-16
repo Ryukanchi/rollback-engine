@@ -261,15 +261,24 @@ class SqliteCommandStore {
         return { success: false, reason: "NOT_PROCESSING" };
       }
 
-      if (row.event_range) {
-        this.#db.exec("ROLLBACK;");
-        return { success: false, reason: "HAS_EVENTS" };
-      }
-
+      // Authoritative Event Check: check events table directly inside the BEGIN IMMEDIATE write transaction
       const eventCountRow = this.#stmtCountEvents.get(commandId);
       if (eventCountRow && Number(eventCountRow.cnt) > 0) {
         this.#db.exec("ROLLBACK;");
         return { success: false, reason: "HAS_EVENTS" };
+      }
+
+      if (row.event_range) {
+        try {
+          const range = JSON.parse(row.event_range);
+          if (range && (range.count > 0 || (Array.isArray(range.eventIds) && range.eventIds.length > 0))) {
+            this.#db.exec("ROLLBACK;");
+            return { success: false, reason: "HAS_EVENTS" };
+          }
+        } catch {
+          this.#db.exec("ROLLBACK;");
+          return { success: false, reason: "HAS_EVENTS" };
+        }
       }
 
       const expiresAt = row.lease_expires_at !== null ? Number(row.lease_expires_at) : null;

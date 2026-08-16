@@ -65,6 +65,11 @@ function buildEventRange(events, commandId) {
 
 class InMemoryCommandStore {
   #commands = new Map();
+  #eventStore = null;
+
+  setEventStore(eventStore) {
+    this.#eventStore = eventStore;
+  }
 
   reserve({
     commandId,
@@ -139,7 +144,15 @@ class InMemoryCommandStore {
       return { success: false, reason: "NOT_PROCESSING" };
     }
 
-    if (record.eventRange && record.eventRange.eventIds.length > 0) {
+    // Authoritative Event Check: check event store directly
+    if (this.#eventStore) {
+      const events = this.#eventStore.getByCommandId(commandId);
+      if (events && events.length > 0) {
+        return { success: false, reason: "HAS_EVENTS" };
+      }
+    }
+
+    if (record.eventRange && (record.eventRange.count > 0 || (Array.isArray(record.eventRange.eventIds) && record.eventRange.eventIds.length > 0))) {
       return { success: false, reason: "HAS_EVENTS" };
     }
 

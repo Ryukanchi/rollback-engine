@@ -443,6 +443,75 @@ function executeSqliteOperation({ op, engine, adapters, context, stats, invarian
       }
     }
 
+    case "MISSING_TOKEN_SIMULATION": {
+      if (invariantSuite) invariantSuite.recordMissingFencingTokenCheck();
+      const { commandId } = op.params;
+      const rawPayload = { item: "MissingTokenSqliteItem", quantity: 1, amount: 200 };
+      adapters.commandStore.reserve({
+        commandId,
+        commandType: "CHECKOUT",
+        payload: { ...rawPayload, simulateFailureAt: null },
+        workerId: "chaos-sqlite-worker-1",
+        leaseTtlMs: 5000,
+        now: 1000,
+      });
+      try {
+        const { createDomainEvent, EVENT_TYPES } = require("../../domain/events");
+        const noTokenEvent = createDomainEvent({
+          eventId: `no-token-sqlite-evt-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          eventType: EVENT_TYPES.ORDER_CREATED,
+          aggregateId: 888,
+          sequence: 1,
+          timestamp: new Date().toISOString(),
+          payload: { item: "MissingTokenSqliteItem", quantity: 1 },
+          metadata: { schemaVersion: 1, commandId, correlationId: commandId, causationId: commandId },
+        });
+        adapters.eventStore.append(noTokenEvent, { expectedVersion: 0 });
+        return { success: false, error: new Error("Append without fencingToken should have been rejected!") };
+      } catch (err) {
+        if (err.code === "FENCING_TOKEN_REQUIRED") {
+          return { success: true, result: { requiredTokenEnforced: true } };
+        }
+        return { success: false, error: err };
+      }
+    }
+
+    case "UNRECORDED_EVENT_TAKEOVER_SIMULATION": {
+      if (invariantSuite) invariantSuite.recordAuthoritativeEventBlocksTakeoverCheck();
+      const { commandId } = op.params;
+      const rawPayload = { item: "UnrecordedSqliteItem", quantity: 1, amount: 200 };
+      adapters.commandStore.reserve({
+        commandId,
+        commandType: "CHECKOUT",
+        payload: { ...rawPayload, simulateFailureAt: null },
+        workerId: "chaos-sqlite-worker-1",
+        leaseTtlMs: 10,
+        now: 1000,
+      });
+      const { createDomainEvent, EVENT_TYPES } = require("../../domain/events");
+      const unrecordedEvent = createDomainEvent({
+        eventId: `unrecorded-sqlite-evt-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        eventType: EVENT_TYPES.ORDER_CREATED,
+        aggregateId: 777,
+        sequence: 1,
+        timestamp: new Date().toISOString(),
+        payload: { item: "UnrecordedSqliteItem", quantity: 1 },
+        metadata: { schemaVersion: 1, commandId, correlationId: commandId, causationId: commandId },
+      });
+      adapters.eventStore.append(unrecordedEvent, { expectedVersion: 0, fencingToken: 1 });
+      if (!context.knownAggregates.includes(777)) {
+        context.knownAggregates.push(777);
+      }
+      const takeover = adapters.commandStore.takeOverExpired({
+        commandId,
+        workerId: "chaos-sqlite-worker-2",
+        leaseTtlMs: 5000,
+        now: 2000,
+      });
+      const blocked = takeover.success === false && takeover.reason === "HAS_EVENTS";
+      return { success: blocked, result: { takeoverBlocked: blocked } };
+    }
+
     default:
       return { success: false, error: new Error(`Unknown operation ${op.type}`) };
   }

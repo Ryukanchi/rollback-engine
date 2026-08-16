@@ -31,6 +31,8 @@ class InvariantSuite {
       InvalidFailurePointRejected: 0,
       LeaseOwnershipConsistency: 0,
       FencingSafety: 0,
+      AuthoritativeEventBlocksTakeover: 0,
+      MissingFencingTokenRejected: 0,
     };
   }
 
@@ -549,6 +551,14 @@ class InvariantSuite {
 
   recordLeaseTakeoverCheck() {
     this.#counters.LeaseOwnershipConsistency++;
+  }
+
+  recordAuthoritativeEventBlocksTakeoverCheck() {
+    this.#counters.AuthoritativeEventBlocksTakeover++;
+  }
+
+  recordMissingFencingTokenCheck() {
+    this.#counters.MissingFencingTokenRejected++;
   }
 
   recordSagaFailure(failurePoint) {

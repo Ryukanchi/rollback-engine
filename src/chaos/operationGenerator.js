@@ -79,13 +79,15 @@ class OperationGenerator {
     }
 
     // Occasionally test boundaries & leases
-    if (this.#random.nextBoolean(0.2)) {
+    if (this.#random.nextBoolean(0.25)) {
       candidates.push(
         "INTERRUPTED_COMMIT_SIMULATION",
         "PROCESSING_ZERO_SIMULATION",
         "SCHEMA_UPCAST_TEST",
         "LEASE_TAKEOVER_SIMULATION",
-        "ZOMBIE_FENCING_SIMULATION"
+        "ZOMBIE_FENCING_SIMULATION",
+        "MISSING_TOKEN_SIMULATION",
+        "UNRECORDED_EVENT_TAKEOVER_SIMULATION"
       );
     }
 
@@ -256,6 +258,22 @@ class OperationGenerator {
           type: "ZOMBIE_FENCING_SIMULATION",
           params: {
             commandId: `cmd-fencing-${this.#random.nextInt(1000, 99999)}`,
+          },
+        };
+
+      case "MISSING_TOKEN_SIMULATION":
+        return {
+          type: "MISSING_TOKEN_SIMULATION",
+          params: {
+            commandId: `cmd-missing-token-${this.#random.nextInt(1000, 99999)}`,
+          },
+        };
+
+      case "UNRECORDED_EVENT_TAKEOVER_SIMULATION":
+        return {
+          type: "UNRECORDED_EVENT_TAKEOVER_SIMULATION",
+          params: {
+            commandId: `cmd-unrecorded-takeover-${this.#random.nextInt(1000, 99999)}`,
           },
         };
 

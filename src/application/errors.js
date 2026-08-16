@@ -168,6 +168,25 @@ function createCommandLeaseExpiredError({
   return error;
 }
 
+function createFencingTokenRequiredError({
+  commandId,
+  workerId,
+  leaseOwner,
+  message,
+} = {}) {
+  const error = new Error(
+    message || `Command ${commandId} is leased and requires a fencing token to append events.`
+  );
+  error.code = "FENCING_TOKEN_REQUIRED";
+  error.commandId = commandId;
+  if (workerId !== undefined) error.workerId = workerId;
+  if (leaseOwner !== undefined) error.leaseOwner = leaseOwner;
+  error.eventCommitted = false;
+  error.retrySafe = false;
+  error.retryAction = "ACQUIRE_NEW_LEASE";
+  return error;
+}
+
 function serializeCommandError(error) {
   const serialized = {
     code: error.code,
@@ -214,6 +233,7 @@ module.exports = {
   createAppendCommitUnknownError,
   createCommandReconciliationError,
   createFencingTokenStaleError,
+  createFencingTokenRequiredError,
   createCommandLeaseExpiredError,
   serializeCommandError,
   deserializeCommandError,

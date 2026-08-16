@@ -1,6 +1,7 @@
 const { assertDomainEvent } = require("../domain/events");
 const {
   createFencingTokenStaleError,
+  createFencingTokenRequiredError,
   createCommandLeaseExpiredError,
 } = require("../application/errors");
 
@@ -101,11 +102,9 @@ class InMemoryEventStore {
 
         if (cmd.leaseToken !== null && cmd.leaseToken !== undefined) {
           const currentToken = Number(cmd.leaseToken);
-          if (fencingToken === undefined) {
-            throw createFencingTokenStaleError({
+          if (fencingToken === undefined || fencingToken === null) {
+            throw createFencingTokenRequiredError({
               commandId: event.metadata.commandId,
-              providedToken: undefined,
-              currentToken,
               leaseOwner: cmd.leaseOwner,
             });
           }

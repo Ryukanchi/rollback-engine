@@ -56,6 +56,7 @@ function createStorageAdapters({
   if (type === "memory") {
     const commandStore = new InMemoryCommandStore();
     const eventStore = new InMemoryEventStore({ upcasterRegistry, commandStore, now });
+    commandStore.setEventStore(eventStore);
     const snapshotStore = new InMemorySnapshotStore();
     const stateRepository = new InMemoryStateRepository();
 

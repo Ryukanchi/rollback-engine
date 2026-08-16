@@ -3,6 +3,7 @@ const assert = require("node:assert/strict");
 const { tmpdir } = require("node:os");
 const { join } = require("node:path");
 const { randomUUID } = require("node:crypto");
+const { DatabaseSync } = require("node:sqlite");
 
 const { RollbackEngine } = require("../src/application/rollbackEngine");
 const { createStorageAdapters } = require("../src/infrastructure/storageFactory");
@@ -321,6 +322,7 @@ test("partial commit protection: command with >=1 committed events CANNOT be tak
   let currentTime = 1000;
   const commandStore = new InMemoryCommandStore();
   const eventStore = new InMemoryEventStore({ commandStore, now: () => currentTime });
+  commandStore.setEventStore(eventStore);
   const commandId = "partial-commit-expired-lease";
 
   // Worker 1 reserves at t=1000 (token 1, expires at 2000)
@@ -386,4 +388,404 @@ test("partial commit protection: command with >=1 committed events CANNOT be tak
       return true;
     }
   );
+});
+
+test("authoritative event in events table + stale/empty command event_range blocks takeover", () => {
+  const dbPath = join(tmpdir(), `rollback-authoritative-takeover-${randomUUID()}.db`);
+  const db = createSqliteDatabase({ path: dbPath });
+
+  try {
+    let currentTime = 1000;
+    const commandStore = new SqliteCommandStore({ db });
+    const eventStore = new SqliteEventStore({ db, now: () => currentTime });
+    const commandId = "unrecorded-event-cmd";
+
+    // Worker 1 reserves at t=1000 (expires at 2000)
+    commandStore.reserve({
+      commandId,
+      commandType: "CHECKOUT",
+      payload: { item: "Camera", quantity: 1, amount: 500 },
+      workerId: "worker-1",
+      leaseTtlMs: 1000,
+      now: currentTime,
+    });
+
+    // Worker 1 commits event directly to eventStore at t=1500, but crashes BEFORE commandStore.recordEvent()
+    currentTime = 1500;
+    const committedEvent = createDomainEvent({
+      eventId: "camera-evt-1",
+      eventType: EVENT_TYPES.ORDER_CREATED,
+      aggregateId: 44,
+      sequence: 1,
+      timestamp: "2026-08-15T12:00:00.000Z",
+      payload: { item: "Camera", quantity: 1 },
+      metadata: {
+        schemaVersion: 1,
+        commandId,
+        correlationId: commandId,
+        causationId: commandId,
+      },
+    });
+    eventStore.append(committedEvent, { expectedVersion: 0, fencingToken: 1 });
+
+    // Verify command store record still has event_range == null
+    const cmdBefore = commandStore.get(commandId);
+    assert.equal(cmdBefore.eventRange, null);
+    assert.equal(cmdBefore.leaseToken, 1);
+
+    // At t=3000 (lease expired), Worker 2 attempts takeover
+    currentTime = 3000;
+    const takeover = commandStore.takeOverExpired({
+      commandId,
+      workerId: "worker-2",
+      leaseTtlMs: 2000,
+      now: currentTime,
+    });
+
+    // Takeover MUST be rejected because authoritative events table contains an event
+    assert.equal(takeover.success, false);
+    assert.equal(takeover.reason, "HAS_EVENTS");
+
+    // Command ownership and token must remain unchanged
+    const cmdAfter = commandStore.get(commandId);
+    assert.equal(cmdAfter.status, "processing");
+    assert.equal(cmdAfter.leaseToken, 1);
+    assert.equal(cmdAfter.leaseOwner, "worker-1");
+  } finally {
+    db.close();
+  }
+});
+
+test("missing fencing token cannot append for leased command (FENCING_TOKEN_REQUIRED)", () => {
+  // Test SQLite store
+  const dbPath = join(tmpdir(), `rollback-missing-token-${randomUUID()}.db`);
+  const db = createSqliteDatabase({ path: dbPath });
+
+  try {
+    const commandStore = new SqliteCommandStore({ db });
+    const eventStore = new SqliteEventStore({ db });
+    const commandId = "leased-no-token-cmd";
+
+    commandStore.reserve({
+      commandId,
+      commandType: "CHECKOUT",
+      payload: { item: "Speaker", quantity: 1, amount: 200 },
+      workerId: "worker-1",
+      leaseTtlMs: 5000,
+      now: 1000,
+    });
+
+    const event = createDomainEvent({
+      eventId: "speaker-evt-1",
+      eventType: EVENT_TYPES.ORDER_CREATED,
+      aggregateId: 90,
+      sequence: 1,
+      timestamp: "2026-08-15T12:00:00.000Z",
+      payload: { item: "Speaker", quantity: 1 },
+      metadata: {
+        schemaVersion: 1,
+        commandId,
+        correlationId: commandId,
+        causationId: commandId,
+      },
+    });
+
+    // Append without fencingToken option
+    assert.throws(
+      () => eventStore.append(event, { expectedVersion: 0 }),
+      (err) => {
+        assert.equal(err.code, "FENCING_TOKEN_REQUIRED");
+        assert.equal(err.commandId, commandId);
+        assert.equal(err.eventCommitted, false);
+        assert.equal(err.retrySafe, false);
+        return true;
+      }
+    );
+
+    // Append with fencingToken: undefined explicitly
+    assert.throws(
+      () => eventStore.append(event, { expectedVersion: 0, fencingToken: undefined }),
+      (err) => {
+        assert.equal(err.code, "FENCING_TOKEN_REQUIRED");
+        return true;
+      }
+    );
+
+    // Verify 0 events in store
+    assert.equal(eventStore.getAll().length, 0);
+  } finally {
+    db.close();
+  }
+
+  // Test In-Memory store parity
+  const memCommandStore = new InMemoryCommandStore();
+  const memEventStore = new InMemoryEventStore({ commandStore: memCommandStore });
+  memCommandStore.reserve({
+    commandId: "mem-no-token-cmd",
+    commandType: "CHECKOUT",
+    payload: { item: "Speaker", quantity: 1, amount: 200 },
+    workerId: "worker-1",
+    leaseTtlMs: 5000,
+    now: 1000,
+  });
+
+  const memEvent = createDomainEvent({
+    eventId: "mem-speaker-evt-1",
+    eventType: EVENT_TYPES.ORDER_CREATED,
+    aggregateId: 91,
+    sequence: 1,
+    timestamp: "2026-08-15T12:00:00.000Z",
+    payload: { item: "Speaker", quantity: 1 },
+    metadata: {
+      schemaVersion: 1,
+      commandId: "mem-no-token-cmd",
+      correlationId: "mem-no-token-cmd",
+      causationId: "mem-no-token-cmd",
+    },
+  });
+
+  assert.throws(
+    () => memEventStore.append(memEvent, { expectedVersion: 0 }),
+    (err) => {
+      assert.equal(err.code, "FENCING_TOKEN_REQUIRED");
+      assert.equal(err.eventCommitted, false);
+      return true;
+    }
+  );
+  assert.equal(memEventStore.getAll().length, 0);
+});
+
+test("stale token rejected while command is STILL processing under new owner", () => {
+  const dbPath = join(tmpdir(), `rollback-still-processing-${randomUUID()}.db`);
+  const db = createSqliteDatabase({ path: dbPath });
+
+  try {
+    const commandStore = new SqliteCommandStore({ db });
+    const eventStore = new SqliteEventStore({ db, now: () => 2500 });
+    const commandId = "still-proc-cmd";
+
+    // Worker 1 reserves at t=1000 (token 1, expires at 2000)
+    commandStore.reserve({
+      commandId,
+      commandType: "CHECKOUT",
+      payload: { item: "Headphones", quantity: 1, amount: 150 },
+      workerId: "worker-1",
+      leaseTtlMs: 1000,
+      now: 1000,
+    });
+
+    // Worker 2 takes over at t=2500 -> token becomes 2, status remains PROCESSING
+    const takeover = commandStore.takeOverExpired({
+      commandId,
+      workerId: "worker-2",
+      leaseTtlMs: 3000,
+      now: 2500,
+    });
+    assert.equal(takeover.success, true);
+    assert.equal(takeover.record.leaseToken, 2);
+    assert.equal(takeover.record.status, "processing");
+
+    // Worker 1 attempts append with stale token 1 while status is STILL processing
+    const staleEvent = createDomainEvent({
+      eventId: "hp-stale-evt-1",
+      eventType: EVENT_TYPES.ORDER_CREATED,
+      aggregateId: 33,
+      sequence: 1,
+      timestamp: "2026-08-15T12:00:00.000Z",
+      payload: { item: "Headphones", quantity: 1 },
+      metadata: {
+        schemaVersion: 1,
+        commandId,
+        correlationId: commandId,
+        causationId: commandId,
+      },
+    });
+
+    assert.throws(
+      () => eventStore.append(staleEvent, { expectedVersion: 0, fencingToken: 1 }),
+      (err) => {
+        assert.equal(err.code, "FENCING_TOKEN_STALE");
+        assert.equal(err.providedToken, 1);
+        assert.equal(err.currentToken, 2);
+        return true;
+      }
+    );
+
+    // Verify database state: status is STILL processing, events = 0
+    const cmdMid = commandStore.get(commandId);
+    assert.equal(cmdMid.status, "processing");
+    assert.equal(cmdMid.leaseToken, 2);
+    assert.equal(eventStore.getAll().length, 0);
+
+    // Worker 2 appends with valid current token 2
+    const validEvent = createDomainEvent({
+      eventId: "hp-valid-evt-1",
+      eventType: EVENT_TYPES.ORDER_CREATED,
+      aggregateId: 33,
+      sequence: 1,
+      timestamp: "2026-08-15T12:00:00.000Z",
+      payload: { item: "Headphones", quantity: 1 },
+      metadata: {
+        schemaVersion: 1,
+        commandId,
+        correlationId: commandId,
+        causationId: commandId,
+      },
+    });
+
+    const appended = eventStore.append(validEvent, { expectedVersion: 0, fencingToken: 2 });
+    assert.equal(appended.eventId, "hp-valid-evt-1");
+    assert.equal(eventStore.getAll().length, 1);
+  } finally {
+    db.close();
+  }
+});
+
+test("separation of protection layers: status check vs token check tested separately", () => {
+  const dbPath = join(tmpdir(), `rollback-layer-sep-${randomUUID()}.db`);
+  const db = createSqliteDatabase({ path: dbPath });
+
+  try {
+    const commandStore = new SqliteCommandStore({ db });
+    const eventStore = new SqliteEventStore({ db });
+    const cmdProcessing = "cmd-layer-processing";
+    const cmdCompleted = "cmd-layer-completed";
+
+    // Layer 1: Token mismatch while status is 'processing'
+    commandStore.reserve({
+      commandId: cmdProcessing,
+      commandType: "CHECKOUT",
+      payload: { item: "Item1", quantity: 1, amount: 100 },
+      workerId: "worker-1",
+      leaseTtlMs: 1000,
+      now: 1000,
+    });
+    commandStore.takeOverExpired({
+      commandId: cmdProcessing,
+      workerId: "worker-2",
+      leaseTtlMs: 2000,
+      now: 2500,
+    });
+
+    const evtForProcessing = createDomainEvent({
+      eventId: "evt-proc-1",
+      eventType: EVENT_TYPES.ORDER_CREATED,
+      aggregateId: 101,
+      sequence: 1,
+      timestamp: "2026-08-15T12:00:00.000Z",
+      payload: { item: "Item1", quantity: 1 },
+      metadata: { schemaVersion: 1, commandId: cmdProcessing, correlationId: cmdProcessing, causationId: cmdProcessing },
+    });
+
+    // Rejection is strictly due to token mismatch (1 !== 2), not status
+    assert.throws(
+      () => eventStore.append(evtForProcessing, { expectedVersion: 0, fencingToken: 1 }),
+      (err) => {
+        assert.equal(err.code, "FENCING_TOKEN_STALE");
+        assert.equal(err.providedToken, 1);
+        assert.equal(err.currentToken, 2);
+        return true;
+      }
+    );
+
+    // Layer 2: Status check rejection when status is 'completed' (even if presenting historical token 1)
+    commandStore.reserve({
+      commandId: cmdCompleted,
+      commandType: "CHECKOUT",
+      payload: { item: "Item2", quantity: 1, amount: 100 },
+      workerId: "worker-1",
+      leaseTtlMs: 5000,
+      now: 1000,
+    });
+    commandStore.complete(cmdCompleted, { aggregateId: 102, status: "completed" }, { fencingToken: 1 });
+
+    const evtForCompleted = createDomainEvent({
+      eventId: "evt-comp-1",
+      eventType: EVENT_TYPES.ORDER_CREATED,
+      aggregateId: 102,
+      sequence: 1,
+      timestamp: "2026-08-15T12:00:00.000Z",
+      payload: { item: "Item2", quantity: 1 },
+      metadata: { schemaVersion: 1, commandId: cmdCompleted, correlationId: cmdCompleted, causationId: cmdCompleted },
+    });
+
+    // Rejection is due to status === 'completed', refusing any mutation
+    assert.throws(
+      () => eventStore.append(evtForCompleted, { expectedVersion: 0, fencingToken: 1 }),
+      (err) => {
+        assert.equal(err.code, "FENCING_TOKEN_STALE");
+        return true;
+      }
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("migrated legacy SQLite partial commit cannot be taken over", () => {
+  const dbPath = join(tmpdir(), `rollback-migrated-partial-${randomUUID()}.db`);
+  const rawDb = new DatabaseSync(dbPath);
+
+  // Manually create legacy v1 schema
+  rawDb.exec(`
+    CREATE TABLE events (
+      event_id TEXT PRIMARY KEY NOT NULL,
+      aggregate_id ANY NOT NULL,
+      sequence INTEGER NOT NULL,
+      command_id TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      timestamp TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      metadata TEXT NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (aggregate_id, sequence)
+    );
+    CREATE TABLE commands (
+      command_id TEXT PRIMARY KEY NOT NULL,
+      command_type TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      status TEXT NOT NULL,
+      aggregate_id ANY,
+      event_range TEXT,
+      result TEXT,
+      error TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    PRAGMA user_version = 1;
+  `);
+
+  const legacyCmdId = "legacy-partial-cmd-1";
+  rawDb.prepare(`
+    INSERT INTO commands (command_id, command_type, payload, status)
+    VALUES (?, 'CHECKOUT', '{"item":"LegacyItem","quantity":1,"amount":100}', 'processing')
+  `).run(legacyCmdId);
+
+  rawDb.prepare(`
+    INSERT INTO events (event_id, aggregate_id, sequence, command_id, event_type, timestamp, payload, metadata)
+    VALUES ('legacy-evt-1', 501, 1, ?, 'ORDER_CREATED', '2026-08-15T12:00:00.000Z', '{"item":"LegacyItem"}', '{"commandId":"${legacyCmdId}"}')
+  `).run(legacyCmdId);
+
+  rawDb.close();
+
+  // Open with storage adapters -> triggers v1 to v2 migration
+  const adapters = createStorageAdapters({ type: "sqlite", dbPath });
+  try {
+    const takeover = adapters.commandStore.takeOverExpired({
+      commandId: legacyCmdId,
+      workerId: "worker-new",
+      leaseTtlMs: 2000,
+      now: Date.now() + 10000,
+    });
+
+    // Authoritative event in events table prevents takeover even on migrated legacy databases
+    assert.equal(takeover.success, false);
+    assert.equal(takeover.reason, "HAS_EVENTS");
+
+    const cmd = adapters.commandStore.get(legacyCmdId);
+    assert.equal(cmd.status, "processing");
+    assert.equal(cmd.leaseToken, 1);
+  } finally {
+    adapters.close();
+  }
 });

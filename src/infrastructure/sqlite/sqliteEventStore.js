@@ -1,6 +1,7 @@
 const { assertDomainEvent } = require("../../domain/events");
 const {
   createFencingTokenStaleError,
+  createFencingTokenRequiredError,
   createCommandLeaseExpiredError,
 } = require("../../application/errors");
 
@@ -181,11 +182,9 @@ class SqliteEventStore {
 
           if (cmdRow.lease_token !== null && cmdRow.lease_token !== undefined) {
             const currentToken = Number(cmdRow.lease_token);
-            if (fencingToken === undefined) {
-              throw createFencingTokenStaleError({
+            if (fencingToken === undefined || fencingToken === null) {
+              throw createFencingTokenRequiredError({
                 commandId: event.metadata.commandId,
-                providedToken: undefined,
-                currentToken,
                 leaseOwner: cmdRow.lease_owner,
               });
             }

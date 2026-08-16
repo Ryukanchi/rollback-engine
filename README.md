@@ -362,9 +362,14 @@ Authoritative Event Store remains 100% pure — Zombie Worker cannot commit stal
 
 1. **Monotonic Fencing Tokens**: Initial command reservation allocates `lease_token = 1`. Each successful takeover strictly increments the token ($Token_{new} = Token_{old} + 1$).
 2. **Atomic In-Transaction Fencing Enforcement**: In `SqliteEventStore.append()`, the fencing check, expectedVersion check, and event insertion occur atomically within the **same `BEGIN IMMEDIATE ... COMMIT` transaction**. TOCTOU races between application-level lease validation and SQLite database commit are technically impossible.
-3. **Partial Commit Invariant Protection**: If a command has $\ge 1$ committed events in the Event Store, `takeOverExpired()` strictly refuses takeover (`HAS_EVENTS`). Partial commits must be reconciled, never re-executed under a new worker.
-4. **Defensive Mutation Guards**: `recordEvent()`, `complete()`, and `fail()` require and validate the worker's active `fencingToken`, preventing stale workers from modifying command status or releasing reservations.
-5. **Schema Migration via `PRAGMA user_version`**: Seamlessly migrates existing SQLite databases from v1 to v2 by adding `lease_owner`, `lease_token`, and `lease_expires_at` columns with automatic indexing.
+3. **Mandatory Fencing Token for Leased Commands**: When a command record exists in `status === 'processing'`, `EventStore.append()` requires a valid `fencingToken`. Omitting or passing `null`/`undefined` fencingToken is strictly rejected with `FENCING_TOKEN_REQUIRED` without committing events.
+4. **Authoritative Event Store Boundary for Takeover**: `takeOverExpired()` directly queries the authoritative `events` table inside its `BEGIN IMMEDIATE` write transaction. Even if command bookkeeping lags behind (`commands.event_range` not yet recorded), takeover is strictly blocked with `HAS_EVENTS`.
+5. **Deterministic Race Safety Outcomes**:
+   - **Append Wins**: Event committed in `events` table. Subsequent takeover attempts see $\ge 1$ committed events and abort with `HAS_EVENTS`.
+   - **Takeover Wins**: Lease token incremented to $N+1$. Stale worker's subsequent append presents token $N$ and is rejected with `FENCING_TOKEN_STALE` while the command is still `processing`.
+6. **Clock Semantics & Hygiene**: Lease expiration uses `Date.now()` representing **wall-clock epoch milliseconds** (NOT a monotonic hardware clock). It is subject to operating system NTP adjustments and host clock steps. Systems relying on leases must configure lease TTLs with appropriate safety margins against anticipated clock skew.
+7. **Defensive Mutation Guards**: `recordEvent()`, `complete()`, and `fail()` require and validate the worker's active `fencingToken`, preventing stale workers from modifying command status or releasing reservations.
+8. **Schema Migration via `PRAGMA user_version`**: Seamlessly migrates existing SQLite databases from v1 to v2 by adding `lease_owner`, `lease_token`, and `lease_expires_at` columns with automatic indexing.
 
 ## Snapshots, recovery and time travel
 

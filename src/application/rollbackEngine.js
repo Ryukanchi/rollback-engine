@@ -176,6 +176,9 @@ class RollbackEngine {
     if (eventStore && typeof eventStore.setCommandStore === "function" && commandStore) {
       eventStore.setCommandStore(commandStore);
     }
+    if (commandStore && typeof commandStore.setEventStore === "function" && eventStore) {
+      commandStore.setEventStore(eventStore);
+    }
 
     this.#eventStore = assertEventStoreAdapter(eventStore);
     this.#stateRepository = assertStateRepositoryAdapter(stateRepository);
