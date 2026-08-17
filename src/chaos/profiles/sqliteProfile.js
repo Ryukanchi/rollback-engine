@@ -373,8 +373,8 @@ function executeSqliteOperation({ op, engine, adapters, context, stats, invarian
     }
 
     case "LEASE_TAKEOVER_SIMULATION": {
-      if (invariantSuite) invariantSuite.recordLeaseTakeoverCheck();
       const { commandId } = op.params;
+      const leaseBase = Date.now();
       const rawPayload = { item: "LeaseSqliteItem", quantity: 1, amount: 250 };
       adapters.commandStore.reserve({
         commandId,
@@ -382,7 +382,7 @@ function executeSqliteOperation({ op, engine, adapters, context, stats, invarian
         payload: { ...rawPayload, simulateFailureAt: null },
         workerId: "chaos-sqlite-worker-1",
         leaseTtlMs: 10,
-        now: 1000,
+        now: leaseBase,
       });
       const engineWorker2 = new RollbackEngine({
         eventStore: adapters.eventStore,
@@ -390,11 +390,12 @@ function executeSqliteOperation({ op, engine, adapters, context, stats, invarian
         snapshotStore: adapters.snapshotStore,
         stateRepository: adapters.stateRepository,
         workerId: "chaos-sqlite-worker-2",
-        leaseTtlMs: 5000,
-        now: () => 2000,
+        leaseTtlMs: 60000,
+        now: () => leaseBase + 1000,
       });
       try {
         const res = engineWorker2.checkout(rawPayload, { commandId });
+        if (invariantSuite) invariantSuite.recordLeaseTakeoverCheck();
         if (res.aggregateId && !context.knownAggregates.includes(res.aggregateId)) {
           context.knownAggregates.push(res.aggregateId);
         }
@@ -405,8 +406,8 @@ function executeSqliteOperation({ op, engine, adapters, context, stats, invarian
     }
 
     case "ZOMBIE_FENCING_SIMULATION": {
-      if (invariantSuite) invariantSuite.recordFencingSafetyCheck();
       const { commandId } = op.params;
+      const leaseBase = Date.now();
       const rawPayload = { item: "ZombieSqliteItem", quantity: 1, amount: 300 };
       adapters.commandStore.reserve({
         commandId,
@@ -414,13 +415,13 @@ function executeSqliteOperation({ op, engine, adapters, context, stats, invarian
         payload: { ...rawPayload, simulateFailureAt: null },
         workerId: "chaos-sqlite-worker-1",
         leaseTtlMs: 10,
-        now: 1000,
+        now: leaseBase,
       });
       adapters.commandStore.takeOverExpired({
         commandId,
         workerId: "chaos-sqlite-worker-2",
-        leaseTtlMs: 5000,
-        now: 2000,
+        leaseTtlMs: 60000,
+        now: leaseBase + 1000,
       });
       try {
         const { createDomainEvent, EVENT_TYPES } = require("../../domain/events");
@@ -437,6 +438,7 @@ function executeSqliteOperation({ op, engine, adapters, context, stats, invarian
         return { success: false, error: new Error("Zombie append should have been fenced!") };
       } catch (err) {
         if (err.code === "FENCING_TOKEN_STALE") {
+          if (invariantSuite) invariantSuite.recordFencingSafetyCheck();
           return { success: true, result: { fenced: true } };
         }
         return { success: false, error: err };
@@ -444,16 +446,16 @@ function executeSqliteOperation({ op, engine, adapters, context, stats, invarian
     }
 
     case "MISSING_TOKEN_SIMULATION": {
-      if (invariantSuite) invariantSuite.recordMissingFencingTokenCheck();
       const { commandId } = op.params;
+      const leaseBase = Date.now();
       const rawPayload = { item: "MissingTokenSqliteItem", quantity: 1, amount: 200 };
       adapters.commandStore.reserve({
         commandId,
         commandType: "CHECKOUT",
         payload: { ...rawPayload, simulateFailureAt: null },
         workerId: "chaos-sqlite-worker-1",
-        leaseTtlMs: 5000,
-        now: 1000,
+        leaseTtlMs: 60000,
+        now: leaseBase,
       });
       try {
         const { createDomainEvent, EVENT_TYPES } = require("../../domain/events");
@@ -470,6 +472,7 @@ function executeSqliteOperation({ op, engine, adapters, context, stats, invarian
         return { success: false, error: new Error("Append without fencingToken should have been rejected!") };
       } catch (err) {
         if (err.code === "FENCING_TOKEN_REQUIRED") {
+          if (invariantSuite) invariantSuite.recordMissingFencingTokenCheck();
           return { success: true, result: { requiredTokenEnforced: true } };
         }
         return { success: false, error: err };
@@ -477,16 +480,16 @@ function executeSqliteOperation({ op, engine, adapters, context, stats, invarian
     }
 
     case "UNRECORDED_EVENT_TAKEOVER_SIMULATION": {
-      if (invariantSuite) invariantSuite.recordAuthoritativeEventBlocksTakeoverCheck();
       const { commandId } = op.params;
+      const leaseBase = Date.now();
       const rawPayload = { item: "UnrecordedSqliteItem", quantity: 1, amount: 200 };
       adapters.commandStore.reserve({
         commandId,
         commandType: "CHECKOUT",
         payload: { ...rawPayload, simulateFailureAt: null },
         workerId: "chaos-sqlite-worker-1",
-        leaseTtlMs: 10,
-        now: 1000,
+        leaseTtlMs: 60000,
+        now: leaseBase,
       });
       const { createDomainEvent, EVENT_TYPES } = require("../../domain/events");
       const unrecordedEvent = createDomainEvent({
@@ -505,10 +508,14 @@ function executeSqliteOperation({ op, engine, adapters, context, stats, invarian
       const takeover = adapters.commandStore.takeOverExpired({
         commandId,
         workerId: "chaos-sqlite-worker-2",
-        leaseTtlMs: 5000,
-        now: 2000,
+        leaseTtlMs: 60000,
+        now: leaseBase + 3600000,
       });
       const blocked = takeover.success === false && takeover.reason === "HAS_EVENTS";
+      // The counter is only raised once the assertion has actually been evaluated.
+      if (blocked && invariantSuite) {
+        invariantSuite.recordAuthoritativeEventBlocksTakeoverCheck();
+      }
       return { success: blocked, result: { takeoverBlocked: blocked } };
     }
 

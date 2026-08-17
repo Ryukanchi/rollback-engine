@@ -32,11 +32,12 @@ test("reserves, tracks and completes an idempotent command", () => {
   };
 
   const reservation = store.reserve(descriptor);
-  store.recordEvent(descriptor.commandId, createEvent());
-  store.complete(descriptor.commandId, {
-    aggregateId: 7,
-    status: "completed",
-  });
+  store.recordEvent(descriptor.commandId, createEvent(), { fencingToken: 1 });
+  store.complete(
+    descriptor.commandId,
+    { aggregateId: 7, status: "completed" },
+    { fencingToken: 1 }
+  );
 
   const stored = store.get(descriptor.commandId);
 
@@ -97,7 +98,7 @@ test("command records are isolated from caller mutation", () => {
     commandType: "CHECKOUT",
     payload,
   });
-  store.complete("checkout-command-1", result);
+  store.complete("checkout-command-1", result, { fencingToken: 1 });
 
   payload.item = "Changed";
   result.state.lifecycle = "Changed";
@@ -127,16 +128,20 @@ test("failed defensive copies leave command transitions untouched", () => {
 
   assert.throws(
     () =>
-      store.complete("complete-clone-failure", {
-        uncloneable: () => {},
-      }),
+      store.complete(
+        "complete-clone-failure",
+        { uncloneable: () => {} },
+        { fencingToken: 1 }
+      ),
     { name: "DataCloneError" }
   );
   assert.throws(
     () =>
-      store.fail("fail-clone-failure", {
-        uncloneable: () => {},
-      }),
+      store.fail(
+        "fail-clone-failure",
+        { uncloneable: () => {} },
+        { fencingToken: 1 }
+      ),
     { name: "DataCloneError" }
   );
   assert.equal(store.get("complete-clone-failure").status, "processing");
@@ -153,7 +158,7 @@ test("rejects events that identify a different command", () => {
   });
 
   assert.throws(
-    () => store.recordEvent("another-command", createEvent()),
+    () => store.recordEvent("another-command", createEvent(), { fencingToken: 1 }),
     /does not belong to command another-command/
   );
   assert.equal(store.get("another-command").status, "processing");

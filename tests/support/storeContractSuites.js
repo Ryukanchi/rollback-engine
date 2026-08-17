@@ -233,8 +233,8 @@ function registerCommandStoreContract({ adapterName, createStore }) {
       const second = createEvent({ sequence: 2 });
 
       store.reserve(descriptor);
-      store.recordEvent(descriptor.commandId, first);
-      store.recordEvent(descriptor.commandId, second);
+      store.recordEvent(descriptor.commandId, first, { fencingToken: 1 });
+      store.recordEvent(descriptor.commandId, second, { fencingToken: 1 });
 
       assert.deepEqual(store.get(descriptor.commandId).eventRange, {
         aggregateId: 1,
@@ -245,7 +245,8 @@ function registerCommandStoreContract({ adapterName, createStore }) {
       assert.throws(() =>
         store.recordEvent(
           descriptor.commandId,
-          createEvent({ aggregateId: 2, sequence: 3 })
+          createEvent({ aggregateId: 2, sequence: 3 }),
+          { fencingToken: 1 }
         )
       );
       assert.equal(store.get(descriptor.commandId).eventRange.lastSequence, 2);
@@ -259,8 +260,8 @@ function registerCommandStoreContract({ adapterName, createStore }) {
 
       completedStore.reserve(commandDescriptor("completed-command"));
       failedStore.reserve(commandDescriptor("failed-command"));
-      completedStore.complete("completed-command", result);
-      failedStore.fail("failed-command", failure);
+      completedStore.complete("completed-command", result, { fencingToken: 1 });
+      failedStore.fail("failed-command", failure, { fencingToken: 1 });
       result.state.lifecycle = "Changed input";
       failure.code = "Changed input";
 
@@ -270,10 +271,10 @@ function registerCommandStoreContract({ adapterName, createStore }) {
       );
       assert.equal(failedStore.get("failed-command").error.code, "DOMAIN_REJECTION");
       assert.throws(() =>
-        completedStore.fail("completed-command", { code: "TOO_LATE" })
+        completedStore.fail("completed-command", { code: "TOO_LATE" }, { fencingToken: 1 })
       );
       assert.throws(() =>
-        failedStore.complete("failed-command", { status: "too-late" })
+        failedStore.complete("failed-command", { status: "too-late" }, { fencingToken: 1 })
       );
     });
 
@@ -283,9 +284,11 @@ function registerCommandStoreContract({ adapterName, createStore }) {
       store.reserve(commandDescriptor());
 
       assert.throws(() =>
-        store.complete("command-1", {
-          uncloneable: () => {},
-        })
+        store.complete(
+          "command-1",
+          { uncloneable: () => {} },
+          { fencingToken: 1 }
+        )
       );
       assert.equal(store.get("command-1").status, "processing");
       assert.equal(store.get("command-1").result, null);
@@ -295,7 +298,7 @@ function registerCommandStoreContract({ adapterName, createStore }) {
       const store = createStore();
 
       store.reserve(commandDescriptor("retryable-command"));
-      assert.equal(store.release("retryable-command"), true);
+      assert.equal(store.release("retryable-command", { fencingToken: 1 }), true);
       const released = store.get("retryable-command");
       assert.equal(released.status, "released");
       assert.equal(released.leaseOwner, null);
@@ -304,9 +307,10 @@ function registerCommandStoreContract({ adapterName, createStore }) {
       store.reserve(commandDescriptor("committed-command"));
       store.recordEvent(
         "committed-command",
-        createEvent({ commandId: "committed-command" })
+        createEvent({ commandId: "committed-command" }),
+        { fencingToken: 1 }
       );
-      assert.throws(() => store.release("committed-command"));
+      assert.throws(() => store.release("committed-command", { fencingToken: 1 }));
       assert.notEqual(store.get("committed-command"), null);
     });
 
@@ -316,7 +320,9 @@ function registerCommandStoreContract({ adapterName, createStore }) {
       const events = [createEvent({ sequence: 1 }), createEvent({ sequence: 2 })];
 
       store.reserve(descriptor);
-      const reconciled = store.reconcileEvents(descriptor.commandId, events);
+      const reconciled = store.reconcileEvents(descriptor.commandId, events, {
+        fencingToken: 1,
+      });
       reconciled.eventRange.eventIds.length = 0;
 
       assert.deepEqual(store.get(descriptor.commandId).eventRange.eventIds, [
@@ -330,32 +336,39 @@ function registerCommandStoreContract({ adapterName, createStore }) {
       const committedStore = createStore();
 
       releasableStore.reserve(commandDescriptor("releasable-command"));
-      releasableStore.fail("releasable-command", {
-        code: "COMMAND_RECONCILIATION_FAILED",
-      });
+      releasableStore.fail(
+        "releasable-command",
+        { code: "COMMAND_RECONCILIATION_FAILED" },
+        { fencingToken: 1 }
+      );
 
       assert.throws(() =>
         releasableStore.releaseFailed(
           "releasable-command",
-          "EVENT_APPEND_COMMIT_UNKNOWN"
+          "EVENT_APPEND_COMMIT_UNKNOWN",
+          { fencingToken: 1 }
         )
       );
       assert.equal(
         releasableStore.releaseFailed(
           "releasable-command",
-          "COMMAND_RECONCILIATION_FAILED"
+          "COMMAND_RECONCILIATION_FAILED",
+          { fencingToken: 1 }
         ),
         true
       );
 
       committedStore.reserve(commandDescriptor("committed-command"));
-      committedStore.fail("committed-command", {
-        code: "EVENT_APPEND_COMMIT_UNKNOWN",
-      });
+      committedStore.fail(
+        "committed-command",
+        { code: "EVENT_APPEND_COMMIT_UNKNOWN" },
+        { fencingToken: 1 }
+      );
       committedStore.reconcileFailure(
         "committed-command",
         [createEvent({ commandId: "committed-command" })],
-        { code: "COMMAND_EXECUTION_INTERRUPTED_AFTER_COMMIT" }
+        { code: "COMMAND_EXECUTION_INTERRUPTED_AFTER_COMMIT" },
+        { fencingToken: 1 }
       );
 
       const reconciled = committedStore.get("committed-command");
@@ -369,7 +382,8 @@ function registerCommandStoreContract({ adapterName, createStore }) {
       assert.throws(() =>
         committedStore.releaseFailed(
           "committed-command",
-          "COMMAND_EXECUTION_INTERRUPTED_AFTER_COMMIT"
+          "COMMAND_EXECUTION_INTERRUPTED_AFTER_COMMIT",
+          { fencingToken: 1 }
         )
       );
     });

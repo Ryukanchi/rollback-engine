@@ -128,28 +128,61 @@ test("Z-1: stale token cannot releaseFailed current owner's command", () => {
 
 // === Scenario C: FENCING_TOKEN_REQUIRED/FENCING_CONTEXT_INVALID never triggers unsafe release ===
 
-test("Z-2: FENCING_TOKEN_REQUIRED error code does not trigger coordinator release", () => {
-  // This tests that the coordinator's error handler re-throws these errors
-  // without calling release(), preventing state corruption.
-  let currentTime = 1000;
-  const { engine, commandStore } = createEngineWithClock({
-    workerId: "worker-1",
-    leaseTtlMs: 5000,
-    getNow: () => currentTime,
+// Each of these codes means "this worker has lost the right to act". The
+// coordinator must re-throw them untouched: releasing or failing the
+// reservation would let the fenced worker finalize a row it no longer owns.
+for (const fencingCode of [
+  "FENCING_TOKEN_REQUIRED",
+  "FENCING_CONTEXT_INVALID",
+  "FENCING_TOKEN_STALE",
+  "COMMAND_LEASE_EXPIRED",
+]) {
+  test(`Z-2: ${fencingCode} from the event store leaves the reservation untouched`, () => {
+    let currentTime = 1000;
+    const commandStore = new InMemoryCommandStore();
+    const eventStore = new InMemoryEventStore({ now: () => currentTime });
+    commandStore.setEventStore(eventStore);
+    eventStore.setCommandStore(commandStore);
+
+    // The append is rejected by the fencing layer before anything is committed.
+    eventStore.append = () => {
+      throw Object.assign(new Error(`${fencingCode} raised by the event store`), {
+        code: fencingCode,
+        eventCommitted: false,
+      });
+    };
+
+    const engine = new RollbackEngine({
+      eventStore,
+      commandStore,
+      snapshotStore: new InMemorySnapshotStore(),
+      stateRepository: new InMemoryStateRepository(),
+      workerId: "worker-1",
+      leaseTtlMs: 5000,
+      now: () => currentTime,
+    });
+
+    const commandId = `fencing-nocleanup-${fencingCode}`;
+
+    assert.throws(
+      () => engine.checkout({ item: "Laptop", quantity: 1, amount: 500 }, { commandId }),
+      (error) => {
+        assert.equal(error.code, fencingCode);
+        return true;
+      }
+    );
+
+    // The reservation must survive exactly as it was: not released, not failed,
+    // and still owned by the generation that holds it.
+    const stored = commandStore.get(commandId);
+    assert.equal(stored.status, COMMAND_STATUSES.PROCESSING);
+    assert.equal(stored.leaseOwner, "worker-1");
+    assert.equal(stored.leaseToken, 1);
+    assert.equal(stored.eventRange, null);
+    assert.equal(stored.error, null);
+    assert.equal(eventStore.getAll().length, 0);
   });
-
-  // Execute a successful checkout to establish baseline
-  const commandId = "fencing-required-test";
-  const result = engine.checkout(
-    { item: "Laptop", quantity: 1, amount: 500 },
-    { commandId }
-  );
-  assert.equal(result.status, "completed");
-
-  // The command should be completed (not released/deleted)
-  const stored = commandStore.get(commandId);
-  assert.equal(stored.status, "completed");
-});
+}
 
 // === Scenario D: releasing command preserves fencing (no ABA) ===
 
@@ -484,9 +517,9 @@ test("double takeover produces monotonically increasing fencing tokens", () => {
   );
 });
 
-// === Release without fencing token (backward compat — no check when undefined) ===
+// === G2: naming a generation is mandatory, not opt-in ===
 
-test("release without fencing token succeeds for backward compatibility", () => {
+test("mutating a command without a fencing token is rejected, not treated as unfenced", () => {
   const { commandStore } = createLeaseStores();
   const commandId = "cmd-compat";
 
@@ -499,11 +532,18 @@ test("release without fencing token succeeds for backward compatibility", () => 
     now: 1000,
   });
 
-  // Release without fencing token — still allowed (opt-in check)
-  assert.equal(commandStore.release(commandId), true);
+  // The command is otherwise perfectly releasable: status is processing, the
+  // lease is unexpired and no events were committed. The only defect is the
+  // missing generation, so that has to be the reason for the rejection.
+  assert.throws(
+    () => commandStore.release(commandId),
+    (err) => err.code === "FENCING_TOKEN_REQUIRED"
+  );
+  assert.equal(commandStore.get(commandId).status, COMMAND_STATUSES.PROCESSING);
 
-  const released = commandStore.get(commandId);
-  assert.equal(released.status, COMMAND_STATUSES.RELEASED);
+  // Naming the current generation releases the same command.
+  assert.equal(commandStore.release(commandId, { fencingToken: 1 }), true);
+  assert.equal(commandStore.get(commandId).status, COMMAND_STATUSES.RELEASED);
 });
 
 // === Re-reservation conflict on released command ===

@@ -157,7 +157,7 @@ class CommandExecutionCoordinator {
       }
 
       currentFencingToken = reservation.record.leaseToken || 1;
-      this.#reconcileNewCommandReservation(commandId);
+      this.#reconcileNewCommandReservation(commandId, currentFencingToken);
     }
 
     const eventCommandId = commandId ?? this.#operationIdGenerator();
@@ -334,7 +334,7 @@ class CommandExecutionCoordinator {
     throw committedError;
   }
 
-  #reconcileNewCommandReservation(commandId) {
+  #reconcileNewCommandReservation(commandId, fencingToken) {
     let events;
 
     try {
@@ -343,7 +343,8 @@ class CommandExecutionCoordinator {
       this.#persistFailureWithoutEventReconciliation(
         commandId,
         reconciliationError,
-        []
+        [],
+        { fencingToken }
       );
       throw reconciliationError;
     }
@@ -360,13 +361,16 @@ class CommandExecutionCoordinator {
       this.#persistFailureWithoutEventReconciliation(
         commandId,
         inconsistentError,
-        events
+        events,
+        { fencingToken }
       );
       throw inconsistentError;
     }
 
     const interruptedError = createInterruptedCommandError(commandId, events);
-    this.#persistFailedCommand(commandId, interruptedError, events);
+    this.#persistFailedCommand(commandId, interruptedError, events, {
+      fencingToken,
+    });
     throw interruptedError;
   }
 
@@ -496,7 +500,8 @@ class CommandExecutionCoordinator {
         this.#persistFailureWithoutEventReconciliation(
           record.commandId,
           inconsistentError,
-          events
+          events,
+          { fencingToken: record.leaseToken }
         );
         throw inconsistentError;
       }
@@ -514,7 +519,12 @@ class CommandExecutionCoordinator {
     if (record.status === COMMAND_STATUSES.FAILED) {
       if (RECONCILABLE_UNKNOWN_COMMAND_CODES.has(record.error?.code)) {
         if (events.length === 0) {
-          this.#commandStore.releaseFailed(record.commandId, record.error.code);
+          // The recovering worker never held this lease, so it presents the
+          // generation it observed. If another worker resolved the row first,
+          // the generation moved and this release is rejected (G2).
+          this.#commandStore.releaseFailed(record.commandId, record.error.code, {
+            fencingToken: record.leaseToken,
+          });
           return this.execute(
             commandType,
             payload,
@@ -536,7 +546,8 @@ class CommandExecutionCoordinator {
           this.#commandStore.reconcileFailure(
             record.commandId,
             events,
-            serializeCommandError(interruptedError)
+            serializeCommandError(interruptedError),
+            { fencingToken: record.leaseToken }
           );
         } catch (persistenceError) {
           throw createCommandStatePersistenceError(
@@ -615,7 +626,7 @@ class CommandExecutionCoordinator {
   #persistFailedCommand(commandId, error, events, { fencingToken } = {}) {
     try {
       if (events.length > 0) {
-        this.#commandStore.reconcileEvents(commandId, events);
+        this.#commandStore.reconcileEvents(commandId, events, { fencingToken });
       }
 
       this.#commandStore.fail(commandId, serializeCommandError(error), { fencingToken });
@@ -629,9 +640,16 @@ class CommandExecutionCoordinator {
     }
   }
 
-  #persistFailureWithoutEventReconciliation(commandId, error, events) {
+  #persistFailureWithoutEventReconciliation(
+    commandId,
+    error,
+    events,
+    { fencingToken } = {}
+  ) {
     try {
-      this.#commandStore.fail(commandId, serializeCommandError(error));
+      this.#commandStore.fail(commandId, serializeCommandError(error), {
+        fencingToken,
+      });
     } catch (persistenceError) {
       throw createCommandStatePersistenceError(
         commandId,

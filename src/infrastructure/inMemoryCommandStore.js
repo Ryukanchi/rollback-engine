@@ -2,6 +2,7 @@ const { isDeepStrictEqual } = require("node:util");
 const { COMMAND_STATUSES } = require("../application/storeContracts");
 const {
   createFencingTokenStaleError,
+  createFencingTokenRequiredError,
   createCommandLeaseExpiredError,
 } = require("../application/errors");
 
@@ -244,15 +245,7 @@ class InMemoryCommandStore {
 
   recordEvent(commandId, event, { fencingToken } = {}) {
     const record = this.#requireProcessing(commandId);
-
-    if (fencingToken !== undefined && record.leaseToken !== fencingToken) {
-      throw createFencingTokenStaleError({
-        commandId,
-        providedToken: fencingToken,
-        currentToken: record.leaseToken,
-        leaseOwner: record.leaseOwner,
-      });
-    }
+    this.#assertGeneration(commandId, record, fencingToken);
 
     if (
       !event ||
@@ -295,15 +288,7 @@ class InMemoryCommandStore {
 
   complete(commandId, result, { fencingToken } = {}) {
     const record = this.#requireProcessing(commandId);
-
-    if (fencingToken !== undefined && record.leaseToken !== fencingToken) {
-      throw createFencingTokenStaleError({
-        commandId,
-        providedToken: fencingToken,
-        currentToken: record.leaseToken,
-        leaseOwner: record.leaseOwner,
-      });
-    }
+    this.#assertGeneration(commandId, record, fencingToken);
 
     const clonedResult = clone(result);
 
@@ -317,15 +302,7 @@ class InMemoryCommandStore {
 
   fail(commandId, error, { fencingToken } = {}) {
     const record = this.#requireProcessing(commandId);
-
-    if (fencingToken !== undefined && record.leaseToken !== fencingToken) {
-      throw createFencingTokenStaleError({
-        commandId,
-        providedToken: fencingToken,
-        currentToken: record.leaseToken,
-        leaseOwner: record.leaseOwner,
-      });
-    }
+    this.#assertGeneration(commandId, record, fencingToken);
 
     if (!error || typeof error !== "object" || Array.isArray(error)) {
       throw new TypeError("error must be an object");
@@ -354,14 +331,7 @@ class InMemoryCommandStore {
       throw new Error(`Command ${commandId} cannot be released`);
     }
 
-    if (fencingToken !== undefined && record.leaseToken !== fencingToken) {
-      throw createFencingTokenStaleError({
-        commandId,
-        providedToken: fencingToken,
-        currentToken: record.leaseToken,
-        leaseOwner: record.leaseOwner,
-      });
-    }
+    this.#assertGeneration(commandId, record, fencingToken);
 
     record.status = COMMAND_STATUSES.RELEASED;
     record.leaseOwner = null;
@@ -388,16 +358,16 @@ class InMemoryCommandStore {
       throw new Error(`Failed command ${commandId} cannot be released`);
     }
 
-    if (fencingToken !== undefined && record.leaseToken !== fencingToken) {
-      throw createFencingTokenStaleError({
-        commandId,
-        providedToken: fencingToken,
-        currentToken: record.leaseToken,
-        leaseOwner: record.leaseOwner,
-      });
-    }
+    this.#assertGeneration(commandId, record, fencingToken);
 
-    return this.#commands.delete(commandId);
+    // G1: the row is retained in a non-active state so the generation survives.
+    // Deleting it would let the next reserve() restart at token 1 and revive a
+    // zombie of the failed generation (ABA).
+    record.status = COMMAND_STATUSES.RELEASED;
+    record.leaseOwner = null;
+    record.leaseExpiresAt = null;
+
+    return true;
   }
 
   get(commandId) {
@@ -406,8 +376,12 @@ class InMemoryCommandStore {
     return clone(this.#commands.get(commandId) ?? null);
   }
 
-  reconcileEvents(commandId, events) {
+  reconcileEvents(commandId, events, { fencingToken } = {}) {
     const record = this.#requireProcessing(commandId);
+
+    // G4: repair authority belongs to the generation the caller observed.
+    this.#assertGeneration(commandId, record, fencingToken);
+
     const eventRange = buildEventRange(events, commandId);
 
     record.aggregateId = eventRange.aggregateId;
@@ -416,7 +390,7 @@ class InMemoryCommandStore {
     return clone(record);
   }
 
-  reconcileFailure(commandId, events, error) {
+  reconcileFailure(commandId, events, error, { fencingToken } = {}) {
     assertNonEmptyString(commandId, "commandId");
 
     const record = this.#commands.get(commandId);
@@ -424,6 +398,11 @@ class InMemoryCommandStore {
     if (!record || record.status !== COMMAND_STATUSES.FAILED) {
       throw new Error(`Command ${commandId} is not failed`);
     }
+
+    // G4: a failed row may be repaired from the event history, but only by the
+    // generation that observed it. Ownership is deliberately not required here,
+    // because post-commit reconciliation is performed by a recovering worker.
+    this.#assertGeneration(commandId, record, fencingToken);
 
     if (!error || typeof error !== "object" || Array.isArray(error)) {
       throw new TypeError("error must be an object");
@@ -437,6 +416,31 @@ class InMemoryCommandStore {
     record.error = clonedError;
 
     return clone(record);
+  }
+
+  /**
+   * G2: every mutation of an existing command row must name the generation it
+   * believes it is acting on. An omitted token is rejected rather than treated
+   * as "unfenced", because an unfenced write is indistinguishable from a stale
+   * one once a takeover has happened.
+   */
+  #assertGeneration(commandId, record, fencingToken) {
+    if (fencingToken === undefined || fencingToken === null) {
+      throw createFencingTokenRequiredError({
+        commandId,
+        leaseOwner: record.leaseOwner,
+        message: `Command ${commandId} requires a fencing token to be mutated.`,
+      });
+    }
+
+    if (record.leaseToken !== fencingToken) {
+      throw createFencingTokenStaleError({
+        commandId,
+        providedToken: fencingToken,
+        currentToken: record.leaseToken,
+        leaseOwner: record.leaseOwner,
+      });
+    }
   }
 
   #requireProcessing(commandId) {

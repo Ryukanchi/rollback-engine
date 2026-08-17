@@ -339,8 +339,8 @@ function executeOperation({ op, engine, adapters, context, stats, invariantSuite
     }
 
     case "LEASE_TAKEOVER_SIMULATION": {
-      if (invariantSuite) invariantSuite.recordLeaseTakeoverCheck();
       const { commandId } = op.params;
+      const leaseBase = Date.now();
       const rawPayload = { item: "LeaseItem", quantity: 1, amount: 150 };
       adapters.commandStore.reserve({
         commandId,
@@ -348,7 +348,7 @@ function executeOperation({ op, engine, adapters, context, stats, invariantSuite
         payload: { ...rawPayload, simulateFailureAt: null },
         workerId: "chaos-worker-1",
         leaseTtlMs: 10,
-        now: 1000,
+        now: leaseBase,
       });
       const engineWorker2 = new RollbackEngine({
         eventStore: adapters.eventStore,
@@ -356,11 +356,12 @@ function executeOperation({ op, engine, adapters, context, stats, invariantSuite
         snapshotStore: adapters.snapshotStore,
         stateRepository: adapters.stateRepository,
         workerId: "chaos-worker-2",
-        leaseTtlMs: 5000,
-        now: () => 2000,
+        leaseTtlMs: 60000,
+        now: () => leaseBase + 1000,
       });
       try {
         const res = engineWorker2.checkout(rawPayload, { commandId });
+        if (invariantSuite) invariantSuite.recordLeaseTakeoverCheck();
         if (res.aggregateId && !context.knownAggregates.includes(res.aggregateId)) {
           context.knownAggregates.push(res.aggregateId);
         }
@@ -371,8 +372,8 @@ function executeOperation({ op, engine, adapters, context, stats, invariantSuite
     }
 
     case "ZOMBIE_FENCING_SIMULATION": {
-      if (invariantSuite) invariantSuite.recordFencingSafetyCheck();
       const { commandId } = op.params;
+      const leaseBase = Date.now();
       const rawPayload = { item: "ZombieItem", quantity: 1, amount: 200 };
       adapters.commandStore.reserve({
         commandId,
@@ -380,13 +381,13 @@ function executeOperation({ op, engine, adapters, context, stats, invariantSuite
         payload: { ...rawPayload, simulateFailureAt: null },
         workerId: "chaos-worker-1",
         leaseTtlMs: 10,
-        now: 1000,
+        now: leaseBase,
       });
       adapters.commandStore.takeOverExpired({
         commandId,
         workerId: "chaos-worker-2",
-        leaseTtlMs: 5000,
-        now: 2000,
+        leaseTtlMs: 60000,
+        now: leaseBase + 1000,
       });
       try {
         const { createDomainEvent, EVENT_TYPES } = require("../../domain/events");
@@ -403,6 +404,7 @@ function executeOperation({ op, engine, adapters, context, stats, invariantSuite
         return { success: false, error: new Error("Zombie append should have been fenced!") };
       } catch (err) {
         if (err.code === "FENCING_TOKEN_STALE") {
+          if (invariantSuite) invariantSuite.recordFencingSafetyCheck();
           return { success: true, result: { fenced: true } };
         }
         return { success: false, error: err };
@@ -410,16 +412,16 @@ function executeOperation({ op, engine, adapters, context, stats, invariantSuite
     }
 
     case "MISSING_TOKEN_SIMULATION": {
-      if (invariantSuite) invariantSuite.recordMissingFencingTokenCheck();
       const { commandId } = op.params;
+      const leaseBase = Date.now();
       const rawPayload = { item: "MissingTokenItem", quantity: 1, amount: 200 };
       adapters.commandStore.reserve({
         commandId,
         commandType: "CHECKOUT",
         payload: { ...rawPayload, simulateFailureAt: null },
         workerId: "chaos-worker-1",
-        leaseTtlMs: 5000,
-        now: 1000,
+        leaseTtlMs: 60000,
+        now: leaseBase,
       });
       try {
         const { createDomainEvent, EVENT_TYPES } = require("../../domain/events");
@@ -436,6 +438,7 @@ function executeOperation({ op, engine, adapters, context, stats, invariantSuite
         return { success: false, error: new Error("Append without fencingToken should have been rejected!") };
       } catch (err) {
         if (err.code === "FENCING_TOKEN_REQUIRED") {
+          if (invariantSuite) invariantSuite.recordMissingFencingTokenCheck();
           return { success: true, result: { requiredTokenEnforced: true } };
         }
         return { success: false, error: err };
@@ -443,16 +446,16 @@ function executeOperation({ op, engine, adapters, context, stats, invariantSuite
     }
 
     case "UNRECORDED_EVENT_TAKEOVER_SIMULATION": {
-      if (invariantSuite) invariantSuite.recordAuthoritativeEventBlocksTakeoverCheck();
       const { commandId } = op.params;
+      const leaseBase = Date.now();
       const rawPayload = { item: "UnrecordedItem", quantity: 1, amount: 200 };
       adapters.commandStore.reserve({
         commandId,
         commandType: "CHECKOUT",
         payload: { ...rawPayload, simulateFailureAt: null },
         workerId: "chaos-worker-1",
-        leaseTtlMs: 10,
-        now: 1000,
+        leaseTtlMs: 60000,
+        now: leaseBase,
       });
       const { createDomainEvent, EVENT_TYPES } = require("../../domain/events");
       const unrecordedEvent = createDomainEvent({
@@ -471,10 +474,14 @@ function executeOperation({ op, engine, adapters, context, stats, invariantSuite
       const takeover = adapters.commandStore.takeOverExpired({
         commandId,
         workerId: "chaos-worker-2",
-        leaseTtlMs: 5000,
-        now: 2000,
+        leaseTtlMs: 60000,
+        now: leaseBase + 3600000,
       });
       const blocked = takeover.success === false && takeover.reason === "HAS_EVENTS";
+      // The counter is only raised once the assertion has actually been evaluated.
+      if (blocked && invariantSuite) {
+        invariantSuite.recordAuthoritativeEventBlocksTakeoverCheck();
+      }
       return { success: blocked, result: { takeoverBlocked: blocked } };
     }
 

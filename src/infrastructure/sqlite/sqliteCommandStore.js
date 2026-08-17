@@ -2,6 +2,7 @@ const { isDeepStrictEqual } = require("node:util");
 const { COMMAND_STATUSES } = require("../../application/storeContracts");
 const {
   createFencingTokenStaleError,
+  createFencingTokenRequiredError,
   createCommandLeaseExpiredError,
 } = require("../../application/errors");
 
@@ -96,8 +97,6 @@ class SqliteCommandStore {
 
   #stmtFailCommand;
 
-  #stmtDeleteCommand;
-
   #stmtReleaseCommand;
 
   #stmtReleaseFailedCommand;
@@ -131,51 +130,51 @@ class SqliteCommandStore {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
+    // G5: every status/bookkeeping mutation is a compare-and-swap on
+    // (status, lease_token). The guard lives in SQL, not in JavaScript, so a
+    // generation change that lands between validation and mutation makes the
+    // UPDATE match zero rows instead of silently clobbering the new generation.
     this.#stmtUpdateEventRange = this.#db.prepare(`
       UPDATE commands
       SET aggregate_id = ?, event_range = ?, updated_at = CURRENT_TIMESTAMP
-      WHERE command_id = ?
+      WHERE command_id = ? AND status = ? AND lease_token = ?
     `);
 
     this.#stmtCompleteCommand = this.#db.prepare(`
       UPDATE commands
       SET status = ?, result = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = CURRENT_TIMESTAMP
-      WHERE command_id = ?
+      WHERE command_id = ? AND status = ? AND lease_token = ?
     `);
 
     this.#stmtFailCommand = this.#db.prepare(`
       UPDATE commands
       SET status = ?, error = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = CURRENT_TIMESTAMP
-      WHERE command_id = ?
-    `);
-
-    this.#stmtDeleteCommand = this.#db.prepare(`
-      DELETE FROM commands WHERE command_id = ?
+      WHERE command_id = ? AND status = ? AND lease_token = ?
     `);
 
     this.#stmtReleaseCommand = this.#db.prepare(`
       UPDATE commands
       SET status = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = CURRENT_TIMESTAMP
-      WHERE command_id = ?
+      WHERE command_id = ? AND status = ? AND lease_token = ?
     `);
 
     this.#stmtReleaseFailedCommand = this.#db.prepare(`
       UPDATE commands
       SET status = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = CURRENT_TIMESTAMP
-      WHERE command_id = ?
+      WHERE command_id = ? AND status = ? AND lease_token = ?
     `);
 
     this.#stmtReReserveCommand = this.#db.prepare(`
       UPDATE commands
       SET command_type = ?, payload = ?, status = ?, aggregate_id = NULL, event_range = NULL, result = NULL, error = NULL,
           lease_owner = ?, lease_token = ?, lease_expires_at = ?, updated_at = CURRENT_TIMESTAMP
-      WHERE command_id = ?
+      WHERE command_id = ? AND status = ? AND lease_token = ?
     `);
 
     this.#stmtReconcileFailure = this.#db.prepare(`
       UPDATE commands
       SET aggregate_id = ?, event_range = ?, error = ?, updated_at = CURRENT_TIMESTAMP
-      WHERE command_id = ?
+      WHERE command_id = ? AND status = ? AND lease_token = ?
     `);
 
     this.#stmtTakeOver = this.#db.prepare(`
@@ -207,100 +206,108 @@ class SqliteCommandStore {
     assertNonEmptyString(commandType, "commandType");
     assertPayload(payload);
 
-    const existingRow = this.#stmtGetCommand.get(commandId);
+    // G5: reading the row and claiming the next generation must be one atomic
+    // step, otherwise two workers can derive the same successor token.
+    return this.#transaction(() => {
+      const existingRow = this.#stmtGetCommand.get(commandId);
 
-    if (existingRow) {
-      const existing = rowToRecord(existingRow);
+      if (existingRow) {
+        const existing = rowToRecord(existingRow);
 
-      // Re-reservation of a released or releaseFailed command: increment token to prevent ABA
-      if (existing.status === COMMAND_STATUSES.RELEASED) {
+        // Re-reservation of a non-active command: the retained row carries the
+        // previous generation, so the successor token is strictly greater (G1).
+        if (existing.status === COMMAND_STATUSES.RELEASED) {
+          const conflict =
+            existing.commandType !== commandType ||
+            !isDeepStrictEqual(existing.payload, payload);
+
+          if (conflict) {
+            return { created: false, conflict: true, record: clone(existing) };
+          }
+
+          const leaseOwner = workerId;
+          const leaseToken = (existing.leaseToken || 1) + 1;
+          const leaseExpiresAt = workerId ? now + leaseTtlMs : null;
+
+          const applied = this.#stmtReReserveCommand.run(
+            commandType,
+            JSON.stringify(payload),
+            COMMAND_STATUSES.PROCESSING,
+            leaseOwner,
+            leaseToken,
+            leaseExpiresAt,
+            commandId,
+            COMMAND_STATUSES.RELEASED,
+            existing.leaseToken
+          );
+          this.#assertApplied(commandId, existing.leaseToken, applied);
+
+          const record = {
+            commandId,
+            commandType,
+            payload: clone(payload),
+            status: COMMAND_STATUSES.PROCESSING,
+            aggregateId: null,
+            eventRange: null,
+            result: null,
+            error: null,
+            leaseOwner,
+            leaseToken,
+            leaseExpiresAt,
+          };
+
+          return { created: true, conflict: false, record: clone(record) };
+        }
+
         const conflict =
           existing.commandType !== commandType ||
           !isDeepStrictEqual(existing.payload, payload);
 
-        if (conflict) {
-          return { created: false, conflict: true, record: clone(existing) };
-        }
-
-        const leaseOwner = workerId;
-        const leaseToken = (existing.leaseToken || 1) + 1;
-        const leaseExpiresAt = workerId ? now + leaseTtlMs : null;
-
-        this.#stmtReReserveCommand.run(
-          commandType,
-          JSON.stringify(payload),
-          COMMAND_STATUSES.PROCESSING,
-          leaseOwner,
-          leaseToken,
-          leaseExpiresAt,
-          commandId
-        );
-
-        const record = {
-          commandId,
-          commandType,
-          payload: clone(payload),
-          status: COMMAND_STATUSES.PROCESSING,
-          aggregateId: null,
-          eventRange: null,
-          result: null,
-          error: null,
-          leaseOwner,
-          leaseToken,
-          leaseExpiresAt,
+        return {
+          created: false,
+          conflict,
+          record: clone(existing),
         };
-
-        return { created: true, conflict: false, record: clone(record) };
       }
 
-      const conflict =
-        existing.commandType !== commandType ||
-        !isDeepStrictEqual(existing.payload, payload);
+      const leaseOwner = workerId;
+      const leaseToken = 1;
+      const leaseExpiresAt = workerId ? now + leaseTtlMs : null;
+
+      const record = {
+        commandId,
+        commandType,
+        payload: clone(payload),
+        status: COMMAND_STATUSES.PROCESSING,
+        aggregateId: null,
+        eventRange: null,
+        result: null,
+        error: null,
+        leaseOwner,
+        leaseToken,
+        leaseExpiresAt,
+      };
+
+      this.#stmtInsertCommand.run(
+        commandId,
+        commandType,
+        JSON.stringify(payload),
+        COMMAND_STATUSES.PROCESSING,
+        null,
+        null,
+        null,
+        null,
+        leaseOwner,
+        leaseToken,
+        leaseExpiresAt
+      );
 
       return {
-        created: false,
-        conflict,
-        record: clone(existing),
+        created: true,
+        conflict: false,
+        record: clone(record),
       };
-    }
-
-    const leaseOwner = workerId;
-    const leaseToken = 1;
-    const leaseExpiresAt = workerId ? now + leaseTtlMs : null;
-
-    const record = {
-      commandId,
-      commandType,
-      payload: clone(payload),
-      status: COMMAND_STATUSES.PROCESSING,
-      aggregateId: null,
-      eventRange: null,
-      result: null,
-      error: null,
-      leaseOwner,
-      leaseToken,
-      leaseExpiresAt,
-    };
-
-    this.#stmtInsertCommand.run(
-      commandId,
-      commandType,
-      JSON.stringify(payload),
-      COMMAND_STATUSES.PROCESSING,
-      null,
-      null,
-      null,
-      null,
-      leaseOwner,
-      leaseToken,
-      leaseExpiresAt
-    );
-
-    return {
-      created: true,
-      conflict: false,
-      record: clone(record),
-    };
+    });
   }
 
   takeOverExpired({
@@ -431,188 +438,180 @@ class SqliteCommandStore {
   }
 
   recordEvent(commandId, event, { fencingToken } = {}) {
-    const record = this.#requireProcessing(commandId);
+    return this.#transaction(() => {
+      const record = this.#requireProcessing(commandId);
+      this.#assertGeneration(commandId, record, fencingToken);
 
-    if (fencingToken !== undefined && record.leaseToken !== fencingToken) {
-      throw createFencingTokenStaleError({
-        commandId,
-        providedToken: fencingToken,
-        currentToken: record.leaseToken,
-        leaseOwner: record.leaseOwner,
-      });
-    }
+      if (
+        !event ||
+        typeof event !== "object" ||
+        typeof event.eventId !== "string" ||
+        !Number.isSafeInteger(event.sequence) ||
+        event.sequence <= 0
+      ) {
+        throw new TypeError("event must contain an eventId and positive sequence");
+      }
 
-    if (
-      !event ||
-      typeof event !== "object" ||
-      typeof event.eventId !== "string" ||
-      !Number.isSafeInteger(event.sequence) ||
-      event.sequence <= 0
-    ) {
-      throw new TypeError("event must contain an eventId and positive sequence");
-    }
+      if (event.metadata?.commandId !== commandId) {
+        throw new Error(`Event ${event.eventId} does not belong to command ${commandId}`);
+      }
 
-    if (event.metadata?.commandId !== commandId) {
-      throw new Error(`Event ${event.eventId} does not belong to command ${commandId}`);
-    }
+      if (!record.eventRange) {
+        record.aggregateId = event.aggregateId;
+        record.eventRange = {
+          aggregateId: event.aggregateId,
+          firstSequence: event.sequence,
+          lastSequence: event.sequence,
+          eventIds: [event.eventId],
+        };
+      } else {
+        if (record.eventRange.aggregateId !== event.aggregateId) {
+          throw new Error(`Command ${commandId} cannot span multiple aggregates`);
+        }
 
-    if (!record.eventRange) {
-      record.aggregateId = event.aggregateId;
-      record.eventRange = {
-        aggregateId: event.aggregateId,
-        firstSequence: event.sequence,
-        lastSequence: event.sequence,
-        eventIds: [event.eventId],
-      };
+        if (event.sequence !== record.eventRange.lastSequence + 1) {
+          throw new Error(`Command ${commandId} events must be contiguous`);
+        }
 
-      this.#stmtUpdateEventRange.run(
+        record.eventRange.lastSequence = event.sequence;
+        record.eventRange.eventIds.push(event.eventId);
+      }
+
+      const applied = this.#stmtUpdateEventRange.run(
         record.aggregateId,
         JSON.stringify(record.eventRange),
-        commandId
+        commandId,
+        COMMAND_STATUSES.PROCESSING,
+        record.leaseToken
       );
+      this.#assertApplied(commandId, record.leaseToken, applied);
 
       return clone(record);
-    }
-
-    if (record.eventRange.aggregateId !== event.aggregateId) {
-      throw new Error(`Command ${commandId} cannot span multiple aggregates`);
-    }
-
-    if (event.sequence !== record.eventRange.lastSequence + 1) {
-      throw new Error(`Command ${commandId} events must be contiguous`);
-    }
-
-    record.eventRange.lastSequence = event.sequence;
-    record.eventRange.eventIds.push(event.eventId);
-
-    this.#stmtUpdateEventRange.run(
-      record.aggregateId,
-      JSON.stringify(record.eventRange),
-      commandId
-    );
-
-    return clone(record);
+    });
   }
 
   complete(commandId, result, { fencingToken } = {}) {
-    const record = this.#requireProcessing(commandId);
+    return this.#transaction(() => {
+      const record = this.#requireProcessing(commandId);
+      this.#assertGeneration(commandId, record, fencingToken);
 
-    if (fencingToken !== undefined && record.leaseToken !== fencingToken) {
-      throw createFencingTokenStaleError({
+      const clonedResult = clone(result);
+      const expectedToken = record.leaseToken;
+
+      record.status = COMMAND_STATUSES.COMPLETED;
+      record.result = clonedResult;
+      record.leaseOwner = null;
+      record.leaseExpiresAt = null;
+
+      const applied = this.#stmtCompleteCommand.run(
+        COMMAND_STATUSES.COMPLETED,
+        JSON.stringify(clonedResult),
         commandId,
-        providedToken: fencingToken,
-        currentToken: record.leaseToken,
-        leaseOwner: record.leaseOwner,
-      });
-    }
+        COMMAND_STATUSES.PROCESSING,
+        expectedToken
+      );
+      this.#assertApplied(commandId, expectedToken, applied);
 
-    const clonedResult = clone(result);
-
-    record.status = COMMAND_STATUSES.COMPLETED;
-    record.result = clonedResult;
-    record.leaseOwner = null;
-    record.leaseExpiresAt = null;
-
-    this.#stmtCompleteCommand.run(
-      COMMAND_STATUSES.COMPLETED,
-      JSON.stringify(clonedResult),
-      commandId
-    );
-
-    return clone(record);
+      return clone(record);
+    });
   }
 
   fail(commandId, error, { fencingToken } = {}) {
-    const record = this.#requireProcessing(commandId);
+    return this.#transaction(() => {
+      const record = this.#requireProcessing(commandId);
+      this.#assertGeneration(commandId, record, fencingToken);
 
-    if (fencingToken !== undefined && record.leaseToken !== fencingToken) {
-      throw createFencingTokenStaleError({
+      if (!error || typeof error !== "object" || Array.isArray(error)) {
+        throw new TypeError("error must be an object");
+      }
+
+      const clonedError = clone(error);
+      const expectedToken = record.leaseToken;
+
+      record.status = COMMAND_STATUSES.FAILED;
+      record.error = clonedError;
+      record.leaseOwner = null;
+      record.leaseExpiresAt = null;
+
+      const applied = this.#stmtFailCommand.run(
+        COMMAND_STATUSES.FAILED,
+        JSON.stringify(clonedError),
         commandId,
-        providedToken: fencingToken,
-        currentToken: record.leaseToken,
-        leaseOwner: record.leaseOwner,
-      });
-    }
+        COMMAND_STATUSES.PROCESSING,
+        expectedToken
+      );
+      this.#assertApplied(commandId, expectedToken, applied);
 
-    if (!error || typeof error !== "object" || Array.isArray(error)) {
-      throw new TypeError("error must be an object");
-    }
-
-    const clonedError = clone(error);
-
-    record.status = COMMAND_STATUSES.FAILED;
-    record.error = clonedError;
-    record.leaseOwner = null;
-    record.leaseExpiresAt = null;
-
-    this.#stmtFailCommand.run(
-      COMMAND_STATUSES.FAILED,
-      JSON.stringify(clonedError),
-      commandId
-    );
-
-    return clone(record);
+      return clone(record);
+    });
   }
 
   release(commandId, { fencingToken } = {}) {
     assertNonEmptyString(commandId, "commandId");
 
-    const row = this.#stmtGetCommand.get(commandId);
+    return this.#transaction(() => {
+      const row = this.#stmtGetCommand.get(commandId);
 
-    if (!row) {
-      return false;
-    }
+      if (!row) {
+        return false;
+      }
 
-    const record = rowToRecord(row);
+      const record = rowToRecord(row);
 
-    if (record.status !== COMMAND_STATUSES.PROCESSING || record.eventRange) {
-      throw new Error(`Command ${commandId} cannot be released`);
-    }
+      if (record.status !== COMMAND_STATUSES.PROCESSING || record.eventRange) {
+        throw new Error(`Command ${commandId} cannot be released`);
+      }
 
-    if (fencingToken !== undefined && record.leaseToken !== fencingToken) {
-      throw createFencingTokenStaleError({
+      this.#assertGeneration(commandId, record, fencingToken);
+
+      const applied = this.#stmtReleaseCommand.run(
+        COMMAND_STATUSES.RELEASED,
         commandId,
-        providedToken: fencingToken,
-        currentToken: record.leaseToken,
-        leaseOwner: record.leaseOwner,
-      });
-    }
+        COMMAND_STATUSES.PROCESSING,
+        record.leaseToken
+      );
+      this.#assertApplied(commandId, record.leaseToken, applied);
 
-    this.#stmtReleaseCommand.run(COMMAND_STATUSES.RELEASED, commandId);
-    return true;
+      return true;
+    });
   }
 
   releaseFailed(commandId, expectedErrorCode, { fencingToken } = {}) {
     assertNonEmptyString(commandId, "commandId");
     assertNonEmptyString(expectedErrorCode, "expectedErrorCode");
 
-    const row = this.#stmtGetCommand.get(commandId);
+    return this.#transaction(() => {
+      const row = this.#stmtGetCommand.get(commandId);
 
-    if (!row) {
-      return false;
-    }
+      if (!row) {
+        return false;
+      }
 
-    const record = rowToRecord(row);
+      const record = rowToRecord(row);
 
-    if (
-      record.status !== COMMAND_STATUSES.FAILED ||
-      record.eventRange ||
-      record.error?.code !== expectedErrorCode
-    ) {
-      throw new Error(`Failed command ${commandId} cannot be released`);
-    }
+      if (
+        record.status !== COMMAND_STATUSES.FAILED ||
+        record.eventRange ||
+        record.error?.code !== expectedErrorCode
+      ) {
+        throw new Error(`Failed command ${commandId} cannot be released`);
+      }
 
-    if (fencingToken !== undefined && record.leaseToken !== fencingToken) {
-      throw createFencingTokenStaleError({
+      this.#assertGeneration(commandId, record, fencingToken);
+
+      // G1: the row is retained in a non-active state so the generation
+      // survives. Deleting it would let the next reserve() restart at token 1
+      // and revive a zombie of the failed generation (ABA).
+      const applied = this.#stmtReleaseFailedCommand.run(
+        COMMAND_STATUSES.RELEASED,
         commandId,
-        providedToken: fencingToken,
-        currentToken: record.leaseToken,
-        leaseOwner: record.leaseOwner,
-      });
-    }
+        COMMAND_STATUSES.FAILED,
+        record.leaseToken
+      );
+      this.#assertApplied(commandId, record.leaseToken, applied);
 
-    this.#stmtDeleteCommand.run(commandId);
-    return true;
+      return true;
+    });
   }
 
   get(commandId) {
@@ -621,51 +620,140 @@ class SqliteCommandStore {
     return row ? clone(rowToRecord(row)) : null;
   }
 
-  reconcileEvents(commandId, events) {
-    const record = this.#requireProcessing(commandId);
-    const eventRange = buildEventRange(events, commandId);
+  reconcileEvents(commandId, events, { fencingToken } = {}) {
+    return this.#transaction(() => {
+      const record = this.#requireProcessing(commandId);
 
-    record.aggregateId = eventRange.aggregateId;
-    record.eventRange = eventRange;
+      // G4: repair authority belongs to the generation the caller observed.
+      this.#assertGeneration(commandId, record, fencingToken);
 
-    this.#stmtUpdateEventRange.run(
-      record.aggregateId,
-      JSON.stringify(record.eventRange),
-      commandId
-    );
+      const eventRange = buildEventRange(events, commandId);
 
-    return clone(record);
+      record.aggregateId = eventRange.aggregateId;
+      record.eventRange = eventRange;
+
+      const applied = this.#stmtUpdateEventRange.run(
+        record.aggregateId,
+        JSON.stringify(record.eventRange),
+        commandId,
+        COMMAND_STATUSES.PROCESSING,
+        record.leaseToken
+      );
+      this.#assertApplied(commandId, record.leaseToken, applied);
+
+      return clone(record);
+    });
   }
 
-  reconcileFailure(commandId, events, error) {
+  reconcileFailure(commandId, events, error, { fencingToken } = {}) {
     assertNonEmptyString(commandId, "commandId");
 
-    const row = this.#stmtGetCommand.get(commandId);
-    const record = rowToRecord(row);
+    return this.#transaction(() => {
+      const row = this.#stmtGetCommand.get(commandId);
+      const record = rowToRecord(row);
 
-    if (!record || record.status !== COMMAND_STATUSES.FAILED) {
-      throw new Error(`Command ${commandId} is not failed`);
+      if (!record || record.status !== COMMAND_STATUSES.FAILED) {
+        throw new Error(`Command ${commandId} is not failed`);
+      }
+
+      // G4: a failed row may be repaired from the event history, but only by
+      // the generation that observed it. Ownership is deliberately not required
+      // here, because post-commit reconciliation is performed by a recovering
+      // worker that never held the lease.
+      this.#assertGeneration(commandId, record, fencingToken);
+
+      if (!error || typeof error !== "object" || Array.isArray(error)) {
+        throw new TypeError("error must be an object");
+      }
+
+      const eventRange = buildEventRange(events, commandId);
+      const clonedError = clone(error);
+
+      record.aggregateId = eventRange.aggregateId;
+      record.eventRange = eventRange;
+      record.error = clonedError;
+
+      const applied = this.#stmtReconcileFailure.run(
+        record.aggregateId,
+        JSON.stringify(record.eventRange),
+        JSON.stringify(clonedError),
+        commandId,
+        COMMAND_STATUSES.FAILED,
+        record.leaseToken
+      );
+      this.#assertApplied(commandId, record.leaseToken, applied);
+
+      return clone(record);
+    });
+  }
+
+  /**
+   * Runs read-validate-mutate as one write transaction. BEGIN IMMEDIATE takes
+   * the write lock up front, so no other connection can change the generation
+   * between the validating SELECT and the mutating UPDATE.
+   */
+  #transaction(fn) {
+    this.#db.exec("BEGIN IMMEDIATE;");
+
+    try {
+      const result = fn();
+      this.#db.exec("COMMIT;");
+      return result;
+    } catch (error) {
+      try {
+        this.#db.exec("ROLLBACK;");
+      } catch {
+        // Rollback if a transaction is still active
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * G2: every mutation of an existing command row must name the generation it
+   * believes it is acting on. An omitted token is rejected rather than treated
+   * as "unfenced", because an unfenced write is indistinguishable from a stale
+   * one once a takeover has happened.
+   */
+  #assertGeneration(commandId, record, fencingToken) {
+    if (fencingToken === undefined || fencingToken === null) {
+      throw createFencingTokenRequiredError({
+        commandId,
+        leaseOwner: record.leaseOwner,
+        message: `Command ${commandId} requires a fencing token to be mutated.`,
+      });
     }
 
-    if (!error || typeof error !== "object" || Array.isArray(error)) {
-      throw new TypeError("error must be an object");
+    if (record.leaseToken !== fencingToken) {
+      throw createFencingTokenStaleError({
+        commandId,
+        providedToken: fencingToken,
+        currentToken: record.leaseToken,
+        leaseOwner: record.leaseOwner,
+      });
+    }
+  }
+
+  /**
+   * Second line of defence behind #transaction: if the compare-and-swap UPDATE
+   * matched no row, the generation moved underneath us and nothing was written.
+   */
+  #assertApplied(commandId, expectedToken, applied) {
+    if (applied && applied.changes === 1) {
+      return;
     }
 
-    const eventRange = buildEventRange(events, commandId);
-    const clonedError = clone(error);
+    const current = this.#stmtGetCommand.get(commandId);
 
-    record.aggregateId = eventRange.aggregateId;
-    record.eventRange = eventRange;
-    record.error = clonedError;
-
-    this.#stmtReconcileFailure.run(
-      record.aggregateId,
-      JSON.stringify(record.eventRange),
-      JSON.stringify(clonedError),
-      commandId
-    );
-
-    return clone(record);
+    throw createFencingTokenStaleError({
+      commandId,
+      providedToken: expectedToken,
+      currentToken:
+        current && current.lease_token !== null && current.lease_token !== undefined
+          ? Number(current.lease_token)
+          : null,
+      leaseOwner: current ? current.lease_owner : null,
+    });
   }
 
   #requireProcessing(commandId) {

@@ -1040,7 +1040,8 @@ test("rejects a processing event range missing from the Event Store", () => {
         correlationId: commandId,
         causationId: commandId,
       },
-    })
+    }),
+    { fencingToken: 1 }
   );
   const engine = new RollbackEngine({ commandStore, eventStore });
 
@@ -1066,11 +1067,11 @@ test("does not trust a completed command whose events are missing", () => {
     commandType: "CHECKOUT",
     payload: { ...command, simulateFailureAt: null },
   });
-  commandStore.complete(commandId, {
-    aggregateId: 99,
-    status: "completed",
-    events: [],
-  });
+  commandStore.complete(
+    commandId,
+    { aggregateId: 99, status: "completed", events: [] },
+    { fencingToken: 1 }
+  );
   const engine = new RollbackEngine({ commandStore, eventStore });
 
   assert.throws(
@@ -1139,13 +1140,17 @@ test("rejects a failed command whose event range omits committed events", () => 
     commandType: "CHECKOUT",
     payload: { ...command, simulateFailureAt: null },
   });
-  commandStore.fail(commandId, {
-    code: "COMMAND_EXECUTION_PARTIALLY_COMMITTED",
-    message: "Stored failure",
-    eventCommitted: true,
-    retrySafe: false,
-    retryAction: "MANUAL_RESOLUTION_REQUIRED",
-  });
+  commandStore.fail(
+    commandId,
+    {
+      code: "COMMAND_EXECUTION_PARTIALLY_COMMITTED",
+      message: "Stored failure",
+      eventCommitted: true,
+      retrySafe: false,
+      retryAction: "MANUAL_RESOLUTION_REQUIRED",
+    },
+    { fencingToken: 1 }
+  );
   eventStore.append(
     createDomainEvent({
       eventId: "failed-command-event-1",
@@ -1205,13 +1210,13 @@ test("a complete-store failure becomes a stable committed command failure", () =
   class FailCompleteOnceCommandStore extends InMemoryCommandStore {
     shouldFail = true;
 
-    complete(commandId, result) {
+    complete(commandId, result, options) {
       if (this.shouldFail) {
         this.shouldFail = false;
         throw new Error("Command result store unavailable");
       }
 
-      return super.complete(commandId, result);
+      return super.complete(commandId, result, options);
     }
   }
 
@@ -1243,13 +1248,13 @@ test("a transient fail-store error leaves events protected from re-execution", (
   class FailFailureOnceCommandStore extends InMemoryCommandStore {
     shouldFail = true;
 
-    fail(commandId, error) {
+    fail(commandId, error, options) {
       if (this.shouldFail) {
         this.shouldFail = false;
         throw new Error("Command failure store unavailable");
       }
 
-      return super.fail(commandId, error);
+      return super.fail(commandId, error, options);
     }
   }
 
