@@ -218,6 +218,17 @@ class CommandExecutionCoordinator {
   commitEvent(event, commandContext, expectedVersion) {
     // Only pass fencing token when command has a reserved row (keyed commands)
     const appendFencingToken = commandContext.commandId ? commandContext.fencingToken : undefined;
+
+    if (commandContext.commandId) {
+      this.#commandStore.renewLease({
+        commandId: commandContext.commandId,
+        workerId: commandContext.workerId,
+        fencingToken: commandContext.fencingToken,
+        leaseTtlMs: this.#leaseTtlMs,
+        now: this.#getNow(),
+      });
+    }
+
     const storedEvent = this.#appendEvent(event, expectedVersion, appendFencingToken);
 
     commandContext.lastEventId = storedEvent.eventId;
@@ -465,7 +476,18 @@ class CommandExecutionCoordinator {
         throw createCommandInProgressError(record);
       }
 
+      const nowMs = this.#getNow();
+      const expiresAt =
+        record.leaseExpiresAt !== null && record.leaseExpiresAt !== undefined
+          ? Number(record.leaseExpiresAt)
+          : null;
+
       // If events.length >= 1: partial-commit reconciliation. NO TAKEOVER!
+      // But only abort if the owner's lease has actually expired!
+      if (expiresAt !== null && expiresAt > nowMs) {
+        throw createCommandInProgressError(record);
+      }
+
       if (!this.#commandEventsFormContiguousRange(record.commandId, events)) {
         const inconsistentError = createCommandHistoryInconsistentError(
           record.commandId,

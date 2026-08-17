@@ -1253,11 +1253,12 @@ test("a transient fail-store error leaves events protected from re-execution", (
     }
   }
 
-  const eventStore = new InMemoryEventStore();
+  const eventStore = new InMemoryEventStore({ now: () => testTime });
   let clockCalls = 0;
+  let testTime = new Date("2026-08-15T15:30:00.000Z").getTime();
   const engine = new RollbackEngine({
     eventStore,
-    commandStore: new FailFailureOnceCommandStore(),
+    commandStore: new FailFailureOnceCommandStore({ now: () => testTime }),
     eventIdGenerator: () => "fail-store-event-1",
     clock: () => {
       clockCalls += 1;
@@ -1266,8 +1267,9 @@ test("a transient fail-store error leaves events protected from re-execution", (
         throw new Error("Clock unavailable");
       }
 
-      return "2026-08-15T15:30:00.000Z";
+      return new Date(testTime).toISOString();
     },
+    now: () => testTime,
   });
   const command = { item: "Pizza", quantity: 1, amount: 100 };
   const context = { commandId: "fail-store-command-1" };
@@ -1279,6 +1281,10 @@ test("a transient fail-store error leaves events protected from re-execution", (
       error.eventCommitted === true &&
       error.retryAction === "RECONCILE_SAME_KEY"
   );
+  
+  // Advance time past the lease TTL so Worker B doesn't see COMMAND_IN_PROGRESS
+  testTime += 35000;
+  
   assert.throws(
     () => engine.checkout(command, context),
     (error) =>
