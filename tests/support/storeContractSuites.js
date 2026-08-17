@@ -489,6 +489,20 @@ function registerCommandStoreContract({ adapterName, createStore }) {
           }),
         (err) => err.code === "FENCING_TOKEN_STALE"
       );
+
+      // Naming no generation at all is rejected too. Renewal operates on an
+      // existing generation, so owner identity alone carries no authority.
+      assert.throws(
+        () =>
+          store.renewLease({
+            commandId: descriptor.commandId,
+            workerId: "worker-a",
+            leaseTtlMs: 1000,
+            now: 2000,
+          }),
+        (err) => err.code === "FENCING_TOKEN_REQUIRED"
+      );
+      assert.equal(store.get(descriptor.commandId).leaseExpiresAt, 3500);
     });
 
     test("fences complete and fail transitions against stale fencing tokens", () => {

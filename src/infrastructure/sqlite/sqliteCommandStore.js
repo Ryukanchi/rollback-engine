@@ -186,7 +186,7 @@ class SqliteCommandStore {
     this.#stmtRenewLease = this.#db.prepare(`
       UPDATE commands
       SET lease_expires_at = ?, updated_at = CURRENT_TIMESTAMP
-      WHERE command_id = ?
+      WHERE command_id = ? AND status = ? AND lease_token = ?
     `);
 
     this.#stmtCountEvents = this.#db.prepare(`
@@ -402,8 +402,16 @@ class SqliteCommandStore {
       }
 
       const currentToken = row.lease_token !== null ? Number(row.lease_token) : 1;
+      const record = { leaseToken: currentToken, leaseOwner: row.lease_owner };
 
-      if (row.lease_owner !== workerId || (fencingToken !== undefined && currentToken !== fencingToken)) {
+      // Renewal acts on an existing generation, so the caller has to name it.
+      // The owner answers "which worker", the generation answers "which
+      // reservation". Neither substitutes for the other: a long-lived worker
+      // keeps its identity across generations of the same command, so an owner
+      // match alone cannot tell generation N from generation N+1.
+      this.#assertGeneration(commandId, record, fencingToken, workerId);
+
+      if (row.lease_owner !== workerId) {
         throw createFencingTokenStaleError({
           commandId,
           providedToken: fencingToken,
@@ -425,7 +433,13 @@ class SqliteCommandStore {
       }
 
       const newExpiresAt = now + leaseTtlMs;
-      this.#stmtRenewLease.run(newExpiresAt, commandId);
+      const applied = this.#stmtRenewLease.run(
+        newExpiresAt,
+        commandId,
+        COMMAND_STATUSES.PROCESSING,
+        currentToken
+      );
+      this.#assertApplied(commandId, currentToken, applied);
       this.#db.exec("COMMIT;");
 
       return { renewed: true, leaseExpiresAt: newExpiresAt };
@@ -715,10 +729,11 @@ class SqliteCommandStore {
    * as "unfenced", because an unfenced write is indistinguishable from a stale
    * one once a takeover has happened.
    */
-  #assertGeneration(commandId, record, fencingToken) {
+  #assertGeneration(commandId, record, fencingToken, workerId) {
     if (fencingToken === undefined || fencingToken === null) {
       throw createFencingTokenRequiredError({
         commandId,
+        workerId,
         leaseOwner: record.leaseOwner,
         message: `Command ${commandId} requires a fencing token to be mutated.`,
       });
@@ -729,6 +744,7 @@ class SqliteCommandStore {
         commandId,
         providedToken: fencingToken,
         currentToken: record.leaseToken,
+        workerId,
         leaseOwner: record.leaseOwner,
       });
     }

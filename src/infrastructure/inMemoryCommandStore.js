@@ -219,7 +219,14 @@ class InMemoryCommandStore {
       throw new Error(`Command ${commandId} is not processing`);
     }
 
-    if (record.leaseOwner !== workerId || (fencingToken !== undefined && record.leaseToken !== fencingToken)) {
+    // Renewal acts on an existing generation, so the caller has to name it.
+    // The owner answers "which worker", the generation answers "which
+    // reservation". Neither substitutes for the other: a long-lived worker
+    // keeps its identity across generations of the same command, so an owner
+    // match alone cannot tell generation N from generation N+1.
+    this.#assertGeneration(commandId, record, fencingToken, workerId);
+
+    if (record.leaseOwner !== workerId) {
       throw createFencingTokenStaleError({
         commandId,
         providedToken: fencingToken,
@@ -424,10 +431,11 @@ class InMemoryCommandStore {
    * as "unfenced", because an unfenced write is indistinguishable from a stale
    * one once a takeover has happened.
    */
-  #assertGeneration(commandId, record, fencingToken) {
+  #assertGeneration(commandId, record, fencingToken, workerId) {
     if (fencingToken === undefined || fencingToken === null) {
       throw createFencingTokenRequiredError({
         commandId,
+        workerId,
         leaseOwner: record.leaseOwner,
         message: `Command ${commandId} requires a fencing token to be mutated.`,
       });
@@ -438,6 +446,7 @@ class InMemoryCommandStore {
         commandId,
         providedToken: fencingToken,
         currentToken: record.leaseToken,
+        workerId,
         leaseOwner: record.leaseOwner,
       });
     }

@@ -312,6 +312,109 @@ for (const storeType of ["memory", "sqlite"]) {
       adapters.close();
     });
 
+    // === G2 for renewLease: owner identity is not a generation =============
+
+    test("renewLease() requires the generation even when the owner identity matches", () => {
+      const adapters = createAdapters(storeType);
+      const store = adapters.commandStore;
+      const commandId = "g2-renew";
+      const OWNER = "worker-A";
+
+      // Generation 1 ends the way the coordinator ends an unknown commit.
+      const g1 = reserve(store, commandId, { workerId: OWNER, leaseTtlMs: 60_000, now: 1_000 });
+      store.fail(commandId, { code: "EVENT_APPEND_COMMIT_UNKNOWN" }, { fencingToken: g1.record.leaseToken });
+      store.releaseFailed(commandId, "EVENT_APPEND_COMMIT_UNKNOWN", {
+        fencingToken: g1.record.leaseToken,
+      });
+
+      // Generation 2 is taken by the SAME owner identity. This is the normal
+      // case, not a contrived one: the default worker id is derived once per
+      // engine instance, so one engine drives both generations. Because the
+      // owner is identical, only the generation can distinguish the two.
+      const g2 = reserve(store, commandId, { workerId: OWNER, leaseTtlMs: 60_000, now: 10_000 });
+      assert.equal(g1.record.leaseOwner, g2.record.leaseOwner);
+      assert.equal(g1.record.leaseToken, 1);
+      assert.equal(g2.record.leaseToken, 2);
+
+      // Generation 2 is fully renewable: it exists, it is processing, its lease
+      // is unexpired at every probe time below, and the owner is correct. The
+      // generation is the only variable across the four probes.
+      const before = store.get(commandId);
+      assert.equal(before.status, COMMAND_STATUSES.PROCESSING);
+      assert.equal(before.leaseExpiresAt, 70_000);
+
+      const assertRowUntouched = (label) => {
+        const row = store.get(commandId);
+        assert.equal(row.leaseExpiresAt, before.leaseExpiresAt, `${label}: lease was extended`);
+        assert.equal(row.leaseToken, before.leaseToken, `${label}: generation changed`);
+        assert.equal(row.status, before.status, `${label}: status changed`);
+        assert.equal(row.leaseOwner, before.leaseOwner, `${label}: owner changed`);
+        assert.equal(row.eventRange, before.eventRange, `${label}: eventRange changed`);
+        assert.equal(row.result, before.result, `${label}: result changed`);
+        assert.equal(row.error, before.error, `${label}: error changed`);
+      };
+
+      // Probe A - the stale generation-1 path names no generation at all.
+      assert.throws(
+        () => store.renewLease({ commandId, workerId: OWNER, leaseTtlMs: 90_000, now: 20_000 }),
+        (error) => {
+          assert.equal(error.code, "FENCING_TOKEN_REQUIRED");
+          return true;
+        }
+      );
+      assertRowUntouched("probe A");
+
+      // Probe B - the stale generation-1 path names its own, spent generation.
+      assert.throws(
+        () =>
+          store.renewLease({
+            commandId,
+            workerId: OWNER,
+            fencingToken: 1,
+            leaseTtlMs: 90_000,
+            now: 21_000,
+          }),
+        (error) => isStaleGeneration(error, { provided: 1, current: 2 })
+      );
+      assertRowUntouched("probe B");
+
+      // Probe D - correct generation, wrong worker: the owner check still holds,
+      // so the two dimensions are enforced independently.
+      assert.throws(
+        () =>
+          store.renewLease({
+            commandId,
+            workerId: "worker-B",
+            fencingToken: 2,
+            leaseTtlMs: 90_000,
+            now: 21_500,
+          }),
+        (error) => {
+          assert.equal(error.code, "FENCING_TOKEN_STALE");
+          assert.equal(error.leaseOwner, OWNER);
+          assert.equal(error.workerId, "worker-B");
+          return true;
+        }
+      );
+      assertRowUntouched("probe D");
+
+      // Probe C - the live generation renews the identical call successfully,
+      // which proves A, B and D were rejected for the generation and the owner,
+      // not for status, expiry, payload or a missing row.
+      const renewed = store.renewLease({
+        commandId,
+        workerId: OWNER,
+        fencingToken: 2,
+        leaseTtlMs: 90_000,
+        now: 22_000,
+      });
+      assert.equal(renewed.renewed, true);
+      assert.equal(renewed.leaseExpiresAt, 112_000);
+      assert.equal(store.get(commandId).leaseExpiresAt, 112_000);
+
+      adapters.close();
+    });
+
     // === G2 end to end: the eventless-command hijack ========================
 
     test("a zombie of a resolved generation cannot complete the retry that replaced it", () => {
@@ -410,6 +513,53 @@ describe("Generation authority (SQLite atomicity)", () => {
       const row = store.get(commandId);
       assert.equal(row.status, COMMAND_STATUSES.PROCESSING);
       assert.equal(row.result, null);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("a generation change inside the renewal window makes the stale renewal match no row", () => {
+    const dbPath = join(tmpdir(), `rollback-renew-cas-${randomUUID()}.db`);
+    const db = createSqliteDatabase({ path: dbPath });
+    const commandId = "renew-cas-cmd";
+
+    let armed = false;
+    const store = new SqliteCommandStore({
+      db: withBarrierAfterSelect(db, () => {
+        if (!armed) return;
+        armed = false;
+        // The generation moves on after renewLease validated it but before it
+        // writes the new expiry.
+        db.prepare("UPDATE commands SET lease_token = lease_token + 1 WHERE command_id = ?").run(
+          commandId
+        );
+      }),
+    });
+
+    try {
+      reserve(store, commandId, { workerId: "A", leaseTtlMs: 60_000, now: 1_000 });
+      const before = store.get(commandId).leaseExpiresAt;
+
+      armed = true;
+      assert.throws(
+        () =>
+          store.renewLease({
+            commandId,
+            workerId: "A",
+            fencingToken: 1,
+            leaseTtlMs: 90_000,
+            now: 2_000,
+          }),
+        (error) => {
+          assert.equal(error.code, "FENCING_TOKEN_STALE");
+          return true;
+        }
+      );
+
+      // Nothing the stale renewal attempted survived.
+      const row = store.get(commandId);
+      assert.equal(row.leaseExpiresAt, before);
+      assert.equal(row.status, COMMAND_STATUSES.PROCESSING);
     } finally {
       db.close();
     }
