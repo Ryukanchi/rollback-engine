@@ -230,7 +230,7 @@ test("Z-4: re-reservation after release increments token preventing ABA", () => 
 
 // === Scenario F: healthy command exceeding TTL has defined safe behavior ===
 
-test("Z-5: event store accepts append when lease is expired if no takeover occurred (healthy slow worker)", () => {
+test("Z-5: event store rejects append when lease is exactly expired (boundary)", () => {
   let currentTime = 1000;
   const { commandStore, eventStore } = createLeaseStores({ now: () => currentTime });
 
@@ -249,9 +249,10 @@ test("Z-5: event store accepts append when lease is expired if no takeover occur
 
   const event = createTestEvent({ commandId, aggregateId: 1, sequence: 1 });
 
-  // No takeover occurred, so the healthy slow worker should succeed
-  const storedEvent = eventStore.append(event, { expectedVersion: 0, fencingToken: 1 });
-  assert.equal(storedEvent.eventId, event.eventId);
+  assert.throws(
+    () => eventStore.append(event, { expectedVersion: 0, fencingToken: 1 }),
+    (err) => err.code === "COMMAND_LEASE_EXPIRED"
+  );
 });
 
 // === Scenario G: lease expiry during compensation ===

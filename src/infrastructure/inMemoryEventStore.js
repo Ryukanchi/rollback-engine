@@ -2,6 +2,7 @@ const { assertDomainEvent } = require("../domain/events");
 const {
   createFencingTokenStaleError,
   createFencingTokenRequiredError,
+  createCommandLeaseExpiredError,
   createFencingContextInvalidError,
 } = require("../application/errors");
 
@@ -116,6 +117,18 @@ class InMemoryEventStore {
               currentToken,
               leaseOwner: cmd.leaseOwner,
             });
+          }
+
+          if (cmd.leaseExpiresAt !== null && cmd.leaseExpiresAt !== undefined) {
+            const nowMs = this.#now();
+            if (Number(cmd.leaseExpiresAt) <= nowMs) {
+              throw createCommandLeaseExpiredError({
+                commandId: event.metadata.commandId,
+                fencingToken: Number(fencingToken),
+                leaseExpiresAt: Number(cmd.leaseExpiresAt),
+                now: nowMs,
+              });
+            }
           }
         }
       } else if (fencingToken !== undefined && fencingToken !== null) {

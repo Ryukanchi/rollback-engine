@@ -201,6 +201,14 @@ class CommandExecutionCoordinator {
           currentToken: caughtError.currentToken,
           workerId: this.#workerId,
         });
+      } else if (caughtError?.code === "COMMAND_LEASE_EXPIRED") {
+        this.#emitDiagnostic({
+          type: DIAGNOSTIC_TYPES.COMMAND_LEASE,
+          status: DIAGNOSTIC_STATUSES.LEASE_EXPIRED,
+          commandId,
+          fencingToken: caughtError.fencingToken,
+          workerId: this.#workerId,
+        });
       }
 
       return this.#handleExecutionError(caughtError, commandContext);
@@ -276,7 +284,7 @@ class CommandExecutionCoordinator {
         caughtError.retrySafe = false;
         caughtError.retryAction = "RECONCILE_SAME_KEY";
         this.#persistFailedCommand(commandId, caughtError, [], { fencingToken });
-      } else if (caughtError.code === "FENCING_TOKEN_STALE" || caughtError.code === "FENCING_TOKEN_REQUIRED" || caughtError.code === "FENCING_CONTEXT_INVALID") {
+      } else if (caughtError.code === "FENCING_TOKEN_STALE" || caughtError.code === "COMMAND_LEASE_EXPIRED" || caughtError.code === "FENCING_TOKEN_REQUIRED" || caughtError.code === "FENCING_CONTEXT_INVALID") {
         // Stale or expired worker must not release the command reservation
         throw caughtError;
       } else if (DETERMINISTIC_COMMAND_REJECTION_CODES.has(caughtError.code)) {
@@ -617,7 +625,7 @@ class CommandExecutionCoordinator {
       return this.#eventStore.append(event, { expectedVersion, fencingToken });
     } catch (appendError) {
       // If append failed because fencing token was stale or lease expired, rethrow immediately
-      if (appendError?.code === "FENCING_TOKEN_STALE" || appendError?.code === "FENCING_TOKEN_REQUIRED" || appendError?.code === "FENCING_CONTEXT_INVALID") {
+      if (appendError?.code === "FENCING_TOKEN_STALE" || appendError?.code === "COMMAND_LEASE_EXPIRED" || appendError?.code === "FENCING_TOKEN_REQUIRED" || appendError?.code === "FENCING_CONTEXT_INVALID") {
         throw appendError;
       }
 

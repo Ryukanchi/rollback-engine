@@ -146,6 +146,28 @@ function createFencingTokenStaleError({
   return error;
 }
 
+function createCommandLeaseExpiredError({
+  commandId,
+  fencingToken,
+  leaseExpiresAt,
+  now,
+  workerId,
+}) {
+  const error = new Error(
+    `Command ${commandId} lease expired at ${leaseExpiresAt} (current time: ${now}).`
+  );
+  error.code = "COMMAND_LEASE_EXPIRED";
+  error.commandId = commandId;
+  error.fencingToken = fencingToken;
+  error.leaseExpiresAt = leaseExpiresAt;
+  error.now = now;
+  if (workerId !== undefined) error.workerId = workerId;
+  error.eventCommitted = false;
+  error.retrySafe = false;
+  error.retryAction = "RENEW_OR_TAKEOVER";
+  return error;
+}
+
 function createFencingTokenRequiredError({
   commandId,
   workerId,
@@ -229,6 +251,7 @@ module.exports = {
   createCommandReconciliationError,
   createFencingTokenStaleError,
   createFencingTokenRequiredError,
+  createCommandLeaseExpiredError,
   createFencingContextInvalidError,
   serializeCommandError,
   deserializeCommandError,
