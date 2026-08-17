@@ -2,7 +2,6 @@ const { isDeepStrictEqual } = require("node:util");
 const { COMMAND_STATUSES } = require("../../application/storeContracts");
 const {
   createFencingTokenStaleError,
-  createCommandLeaseExpiredError,
 } = require("../../application/errors");
 
 function assertNonEmptyString(value, fieldName) {
@@ -403,17 +402,6 @@ class SqliteCommandStore {
           currentToken,
           workerId,
           leaseOwner: row.lease_owner,
-        });
-      }
-
-      const expiresAt = row.lease_expires_at !== null ? Number(row.lease_expires_at) : null;
-      if (expiresAt !== null && expiresAt <= now) {
-        throw createCommandLeaseExpiredError({
-          commandId,
-          fencingToken: currentToken,
-          leaseExpiresAt: expiresAt,
-          now,
-          workerId,
         });
       }
 

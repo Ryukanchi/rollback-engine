@@ -2,7 +2,6 @@ const { isDeepStrictEqual } = require("node:util");
 const { COMMAND_STATUSES } = require("../application/storeContracts");
 const {
   createFencingTokenStaleError,
-  createCommandLeaseExpiredError,
 } = require("../application/errors");
 
 function assertNonEmptyString(value, fieldName) {
@@ -225,16 +224,6 @@ class InMemoryCommandStore {
         currentToken: record.leaseToken,
         workerId,
         leaseOwner: record.leaseOwner,
-      });
-    }
-
-    if (record.leaseExpiresAt !== null && record.leaseExpiresAt <= now) {
-      throw createCommandLeaseExpiredError({
-        commandId,
-        fencingToken: record.leaseToken,
-        leaseExpiresAt: record.leaseExpiresAt,
-        now,
-        workerId,
       });
     }
 
