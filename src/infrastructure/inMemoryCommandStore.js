@@ -86,6 +86,34 @@ class InMemoryCommandStore {
     const existing = this.#commands.get(commandId);
 
     if (existing) {
+      // Re-reservation of a released command: increment token to prevent ABA
+      if (existing.status === COMMAND_STATUSES.RELEASED) {
+        const conflict =
+          existing.commandType !== commandType ||
+          !isDeepStrictEqual(existing.payload, payload);
+
+        if (conflict) {
+          return { created: false, conflict: true, record: clone(existing) };
+        }
+
+        const leaseOwner = workerId;
+        const leaseToken = (existing.leaseToken || 1) + 1;
+        const leaseExpiresAt = workerId ? now + leaseTtlMs : null;
+
+        existing.commandType = commandType;
+        existing.payload = clone(payload);
+        existing.status = COMMAND_STATUSES.PROCESSING;
+        existing.aggregateId = null;
+        existing.eventRange = null;
+        existing.result = null;
+        existing.error = null;
+        existing.leaseOwner = leaseOwner;
+        existing.leaseToken = leaseToken;
+        existing.leaseExpiresAt = leaseExpiresAt;
+
+        return { created: true, conflict: false, record: clone(existing) };
+      }
+
       const conflict =
         existing.commandType !== commandType ||
         !isDeepStrictEqual(existing.payload, payload);
@@ -313,7 +341,7 @@ class InMemoryCommandStore {
     return clone(record);
   }
 
-  release(commandId) {
+  release(commandId, { fencingToken } = {}) {
     assertNonEmptyString(commandId, "commandId");
 
     const record = this.#commands.get(commandId);
@@ -326,10 +354,23 @@ class InMemoryCommandStore {
       throw new Error(`Command ${commandId} cannot be released`);
     }
 
-    return this.#commands.delete(commandId);
+    if (fencingToken !== undefined && record.leaseToken !== fencingToken) {
+      throw createFencingTokenStaleError({
+        commandId,
+        providedToken: fencingToken,
+        currentToken: record.leaseToken,
+        leaseOwner: record.leaseOwner,
+      });
+    }
+
+    record.status = COMMAND_STATUSES.RELEASED;
+    record.leaseOwner = null;
+    record.leaseExpiresAt = null;
+
+    return true;
   }
 
-  releaseFailed(commandId, expectedErrorCode) {
+  releaseFailed(commandId, expectedErrorCode, { fencingToken } = {}) {
     assertNonEmptyString(commandId, "commandId");
     assertNonEmptyString(expectedErrorCode, "expectedErrorCode");
 
@@ -345,6 +386,15 @@ class InMemoryCommandStore {
       record.error?.code !== expectedErrorCode
     ) {
       throw new Error(`Failed command ${commandId} cannot be released`);
+    }
+
+    if (fencingToken !== undefined && record.leaseToken !== fencingToken) {
+      throw createFencingTokenStaleError({
+        commandId,
+        providedToken: fencingToken,
+        currentToken: record.leaseToken,
+        leaseOwner: record.leaseOwner,
+      });
     }
 
     return this.#commands.delete(commandId);

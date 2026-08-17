@@ -22,6 +22,7 @@ const {
   createCommandReconciliationError,
   createFencingTokenStaleError,
   createCommandLeaseExpiredError,
+  createFencingContextInvalidError,
   serializeCommandError,
   deserializeCommandError,
 } = require("./errors");
@@ -215,7 +216,9 @@ class CommandExecutionCoordinator {
   }
 
   commitEvent(event, commandContext, expectedVersion) {
-    const storedEvent = this.#appendEvent(event, expectedVersion, commandContext.fencingToken);
+    // Only pass fencing token when command has a reserved row (keyed commands)
+    const appendFencingToken = commandContext.commandId ? commandContext.fencingToken : undefined;
+    const storedEvent = this.#appendEvent(event, expectedVersion, appendFencingToken);
 
     commandContext.lastEventId = storedEvent.eventId;
     commandContext.committedEvents.push(storedEvent);
@@ -281,7 +284,7 @@ class CommandExecutionCoordinator {
         caughtError.retrySafe = false;
         caughtError.retryAction = "RECONCILE_SAME_KEY";
         this.#persistFailedCommand(commandId, caughtError, [], { fencingToken });
-      } else if (caughtError.code === "FENCING_TOKEN_STALE" || caughtError.code === "COMMAND_LEASE_EXPIRED") {
+      } else if (caughtError.code === "FENCING_TOKEN_STALE" || caughtError.code === "COMMAND_LEASE_EXPIRED" || caughtError.code === "FENCING_TOKEN_REQUIRED" || caughtError.code === "FENCING_CONTEXT_INVALID") {
         // Stale or expired worker must not release the command reservation
         throw caughtError;
       } else if (DETERMINISTIC_COMMAND_REJECTION_CODES.has(caughtError.code)) {
@@ -293,7 +296,7 @@ class CommandExecutionCoordinator {
         caughtError.eventCommitted = false;
         caughtError.retrySafe = true;
         caughtError.retryAction = "RETRY_SAME_KEY";
-        this.#commandStore.release(commandId);
+        this.#commandStore.release(commandId, { fencingToken });
       }
 
       throw caughtError;
@@ -622,7 +625,7 @@ class CommandExecutionCoordinator {
       return this.#eventStore.append(event, { expectedVersion, fencingToken });
     } catch (appendError) {
       // If append failed because fencing token was stale or lease expired, rethrow immediately
-      if (appendError?.code === "FENCING_TOKEN_STALE" || appendError?.code === "COMMAND_LEASE_EXPIRED") {
+      if (appendError?.code === "FENCING_TOKEN_STALE" || appendError?.code === "COMMAND_LEASE_EXPIRED" || appendError?.code === "FENCING_TOKEN_REQUIRED" || appendError?.code === "FENCING_CONTEXT_INVALID") {
         throw appendError;
       }
 

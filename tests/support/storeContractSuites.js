@@ -296,7 +296,10 @@ function registerCommandStoreContract({ adapterName, createStore }) {
 
       store.reserve(commandDescriptor("retryable-command"));
       assert.equal(store.release("retryable-command"), true);
-      assert.equal(store.get("retryable-command"), null);
+      const released = store.get("retryable-command");
+      assert.equal(released.status, "released");
+      assert.equal(released.leaseOwner, null);
+      assert.equal(released.leaseExpiresAt, null);
 
       store.reserve(commandDescriptor("committed-command"));
       store.recordEvent(

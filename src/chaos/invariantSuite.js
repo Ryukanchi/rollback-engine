@@ -457,7 +457,7 @@ class InvariantSuite {
           );
         }
 
-        if (cmdRecord.status === "completed" || cmdRecord.status === "failed") {
+        if (cmdRecord.status === "completed" || cmdRecord.status === "failed" || cmdRecord.status === "released") {
           if (cmdRecord.leaseOwner !== null || cmdRecord.leaseExpiresAt !== null) {
             throw new InvariantViolationError(
               "LeaseOwnershipConsistency",

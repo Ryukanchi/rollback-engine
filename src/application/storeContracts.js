@@ -2,6 +2,7 @@ const COMMAND_STATUSES = Object.freeze({
   PROCESSING: "processing",
   COMPLETED: "completed",
   FAILED: "failed",
+  RELEASED: "released",
 });
 
 const STORE_ADAPTER_METHODS = Object.freeze({

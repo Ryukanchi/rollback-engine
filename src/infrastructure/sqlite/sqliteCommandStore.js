@@ -98,6 +98,12 @@ class SqliteCommandStore {
 
   #stmtDeleteCommand;
 
+  #stmtReleaseCommand;
+
+  #stmtReleaseFailedCommand;
+
+  #stmtReReserveCommand;
+
   #stmtReconcileFailure;
 
   #stmtTakeOver;
@@ -147,6 +153,25 @@ class SqliteCommandStore {
       DELETE FROM commands WHERE command_id = ?
     `);
 
+    this.#stmtReleaseCommand = this.#db.prepare(`
+      UPDATE commands
+      SET status = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = CURRENT_TIMESTAMP
+      WHERE command_id = ?
+    `);
+
+    this.#stmtReleaseFailedCommand = this.#db.prepare(`
+      UPDATE commands
+      SET status = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = CURRENT_TIMESTAMP
+      WHERE command_id = ?
+    `);
+
+    this.#stmtReReserveCommand = this.#db.prepare(`
+      UPDATE commands
+      SET command_type = ?, payload = ?, status = ?, aggregate_id = NULL, event_range = NULL, result = NULL, error = NULL,
+          lease_owner = ?, lease_token = ?, lease_expires_at = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE command_id = ?
+    `);
+
     this.#stmtReconcileFailure = this.#db.prepare(`
       UPDATE commands
       SET aggregate_id = ?, event_range = ?, error = ?, updated_at = CURRENT_TIMESTAMP
@@ -186,6 +211,48 @@ class SqliteCommandStore {
 
     if (existingRow) {
       const existing = rowToRecord(existingRow);
+
+      // Re-reservation of a released or releaseFailed command: increment token to prevent ABA
+      if (existing.status === COMMAND_STATUSES.RELEASED) {
+        const conflict =
+          existing.commandType !== commandType ||
+          !isDeepStrictEqual(existing.payload, payload);
+
+        if (conflict) {
+          return { created: false, conflict: true, record: clone(existing) };
+        }
+
+        const leaseOwner = workerId;
+        const leaseToken = (existing.leaseToken || 1) + 1;
+        const leaseExpiresAt = workerId ? now + leaseTtlMs : null;
+
+        this.#stmtReReserveCommand.run(
+          commandType,
+          JSON.stringify(payload),
+          COMMAND_STATUSES.PROCESSING,
+          leaseOwner,
+          leaseToken,
+          leaseExpiresAt,
+          commandId
+        );
+
+        const record = {
+          commandId,
+          commandType,
+          payload: clone(payload),
+          status: COMMAND_STATUSES.PROCESSING,
+          aggregateId: null,
+          eventRange: null,
+          result: null,
+          error: null,
+          leaseOwner,
+          leaseToken,
+          leaseExpiresAt,
+        };
+
+        return { created: true, conflict: false, record: clone(record) };
+      }
+
       const conflict =
         existing.commandType !== commandType ||
         !isDeepStrictEqual(existing.payload, payload);
@@ -487,7 +554,7 @@ class SqliteCommandStore {
     return clone(record);
   }
 
-  release(commandId) {
+  release(commandId, { fencingToken } = {}) {
     assertNonEmptyString(commandId, "commandId");
 
     const row = this.#stmtGetCommand.get(commandId);
@@ -502,11 +569,20 @@ class SqliteCommandStore {
       throw new Error(`Command ${commandId} cannot be released`);
     }
 
-    this.#stmtDeleteCommand.run(commandId);
+    if (fencingToken !== undefined && record.leaseToken !== fencingToken) {
+      throw createFencingTokenStaleError({
+        commandId,
+        providedToken: fencingToken,
+        currentToken: record.leaseToken,
+        leaseOwner: record.leaseOwner,
+      });
+    }
+
+    this.#stmtReleaseCommand.run(COMMAND_STATUSES.RELEASED, commandId);
     return true;
   }
 
-  releaseFailed(commandId, expectedErrorCode) {
+  releaseFailed(commandId, expectedErrorCode, { fencingToken } = {}) {
     assertNonEmptyString(commandId, "commandId");
     assertNonEmptyString(expectedErrorCode, "expectedErrorCode");
 
@@ -524,6 +600,15 @@ class SqliteCommandStore {
       record.error?.code !== expectedErrorCode
     ) {
       throw new Error(`Failed command ${commandId} cannot be released`);
+    }
+
+    if (fencingToken !== undefined && record.leaseToken !== fencingToken) {
+      throw createFencingTokenStaleError({
+        commandId,
+        providedToken: fencingToken,
+        currentToken: record.leaseToken,
+        leaseOwner: record.leaseOwner,
+      });
     }
 
     this.#stmtDeleteCommand.run(commandId);

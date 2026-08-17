@@ -3,6 +3,7 @@ const {
   createFencingTokenStaleError,
   createFencingTokenRequiredError,
   createCommandLeaseExpiredError,
+  createFencingContextInvalidError,
 } = require("../application/errors");
 
 function isIdentifier(value) {
@@ -120,7 +121,7 @@ class InMemoryEventStore {
 
           if (cmd.leaseExpiresAt !== null && cmd.leaseExpiresAt !== undefined) {
             const nowMs = this.#now();
-            if (Number(cmd.leaseExpiresAt) < nowMs) {
+            if (Number(cmd.leaseExpiresAt) <= nowMs) {
               throw createCommandLeaseExpiredError({
                 commandId: event.metadata.commandId,
                 fencingToken: Number(fencingToken),
@@ -130,6 +131,12 @@ class InMemoryEventStore {
             }
           }
         }
+      } else if (fencingToken !== undefined && fencingToken !== null) {
+        // Command row missing but fencing token was provided: fencing context is invalid
+        throw createFencingContextInvalidError({
+          commandId: event.metadata.commandId,
+          fencingToken: Number(fencingToken),
+        });
       }
     }
 

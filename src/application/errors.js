@@ -187,6 +187,23 @@ function createFencingTokenRequiredError({
   return error;
 }
 
+function createFencingContextInvalidError({
+  commandId,
+  fencingToken,
+  message,
+} = {}) {
+  const error = new Error(
+    message || `Command ${commandId} fencing context is invalid: command record not found but fencing token was provided.`
+  );
+  error.code = "FENCING_CONTEXT_INVALID";
+  error.commandId = commandId;
+  error.fencingToken = fencingToken;
+  error.eventCommitted = false;
+  error.retrySafe = false;
+  error.retryAction = "MANUAL_RESOLUTION_REQUIRED";
+  return error;
+}
+
 function serializeCommandError(error) {
   const serialized = {
     code: error.code,
@@ -235,6 +252,7 @@ module.exports = {
   createFencingTokenStaleError,
   createFencingTokenRequiredError,
   createCommandLeaseExpiredError,
+  createFencingContextInvalidError,
   serializeCommandError,
   deserializeCommandError,
 };
