@@ -1002,13 +1002,26 @@ describe("Lease authority under SQLite concurrency", () => {
 
     let armed = false;
     let revocation = null;
+    let revokeAttempts = 0;
     const commandA = sqliteStoreWithClock(dbA, 1000);
+
+    // storeB already reads a fixed lease clock of 90_000, so the revocation it
+    // attempts is temporally eligible and only SQLite's write lock can stop it.
+    // The counter proves the attempt actually entered the store: a revocation
+    // that died in test setup would never reach this far, and the race the test
+    // is named for would silently not happen.
+    const realRevoke = storeB.revokeExpired.bind(storeB);
+    storeB.revokeExpired = (args) => {
+      revokeAttempts += 1;
+      return realRevoke(args);
+    };
+
     const eventA = new SqliteEventStore({
       db: withBarrierAfterSelect(dbA, () => {
         if (!armed) return;
         armed = false;
         try {
-          revocation = at(storeB, 90_000).revokeExpired({
+          revocation = storeB.revokeExpired({
             commandId,
             expectedToken: 1,
             error: REVOKE_ERROR,
@@ -1017,7 +1030,6 @@ describe("Lease authority under SQLite concurrency", () => {
           revocation = { success: false, reason: "BLOCKED", error };
         }
       }),
-      now: () => 90_000,
     });
 
     try {
@@ -1044,10 +1056,31 @@ describe("Lease authority under SQLite concurrency", () => {
       }
 
       assert.notEqual(revocation, null, "the barrier must have run inside the append window");
+      assert.equal(
+        revokeAttempts,
+        1,
+        "the competing revocation must actually reach SqliteCommandStore.revokeExpired"
+      );
       assert.notEqual(
         revocation.success,
         true,
         "a revocation must never commit inside an append transaction"
+      );
+
+      // The refusal has to come from SQLite's write lock. Anything else - a
+      // helper that throws, an argument rejection, a missing precondition -
+      // would mean the revocation never contended with the append at all, and
+      // the test would be passing without exercising its own subject.
+      assert.equal(revocation.reason, "BLOCKED");
+      assert.equal(
+        revocation.error.code,
+        "ERR_SQLITE_ERROR",
+        `the block must come from SQLite, got: ${revocation.error.message}`
+      );
+      assert.equal(
+        revocation.error.errcode,
+        5,
+        "SQLITE_BUSY: the append transaction still held the write lock"
       );
 
       // Whichever way contention resolved, the row is never terminal while its
