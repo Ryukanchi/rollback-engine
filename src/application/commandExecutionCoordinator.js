@@ -475,7 +475,16 @@ class CommandExecutionCoordinator {
             }
           }
 
-          // If takeover failed due to race, re-evaluate existing command
+          // The Store is the sole decider of temporal eligibility, and its
+          // answer is stable: re-reading the unchanged row would only produce
+          // the same refusal. A live lease is therefore reported, not retried
+          // - the mirror of the has-events revocation path below (D-1).
+          if (takeover.reason === "NOT_EXPIRED") {
+            throw createCommandInProgressError(record);
+          }
+
+          // Status or generation moved underneath us; re-read and act on the
+          // state that actually exists now.
           return this.#resolveExistingCommand(
             this.#commandStore.get(record.commandId),
             commandType,

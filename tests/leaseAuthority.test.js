@@ -1153,3 +1153,90 @@ describe("Lease authority under SQLite concurrency", () => {
     });
   }
 });
+
+// ===========================================================================
+// D-1: a stable NOT_EXPIRED answer to a zero-event takeover must terminate.
+//
+// The Coordinator picks *which* challenge is meaningful from persisted facts;
+// the Store decides temporal eligibility. Those two can disagree the moment
+// they no longer read the same clock. When the Store keeps answering the same
+// stable NOT_EXPIRED, re-resolving the unchanged row cannot make progress, so
+// the answer has to terminate as COMMAND_IN_PROGRESS - exactly as the
+// has-events revocation path already does.
+//
+// The Store clock here is deliberately *earlier* than the Coordinator's. The
+// wrapper does not fake the answer: it hands the real store its own clock and
+// the real expiry logic produces the real NOT_EXPIRED.
+// ===========================================================================
+for (const storeType of ["memory", "sqlite"]) {
+  describe(`Zero-event takeover termination (${storeType})`, () => {
+    test("D-1: a stable NOT_EXPIRED terminates in one challenge, not a resolution loop", () => {
+      const adapters = createAdapters(storeType);
+      const commandId = "d1-stable-not-expired";
+
+      // Lease is born at 1000 and runs to 6000.
+      reserve(adapters.commandStore, commandId, {
+        workerId: "worker-A",
+        now: 1000,
+        payload: ENGINE_PAYLOAD,
+      });
+      const before = adapters.commandStore.get(commandId);
+
+      // The Store reads its own clock, which still says the lease is live.
+      const storeNow = 1500;
+      const challenges = [];
+      const realTakeover = adapters.commandStore.takeOverExpired.bind(
+        adapters.commandStore
+      );
+      adapters.commandStore.takeOverExpired = (args) => {
+        const outcome = realTakeover({ ...args, now: storeNow });
+        challenges.push(outcome);
+        return outcome;
+      };
+
+      // The Coordinator believes the lease is long gone.
+      let clock = 60_000;
+      if (typeof adapters.eventStore.setNow === "function") {
+        adapters.eventStore.setNow(() => clock);
+      }
+      const engine = new RollbackEngine({
+        eventStore: adapters.eventStore,
+        commandStore: adapters.commandStore,
+        snapshotStore: adapters.snapshotStore,
+        stateRepository: adapters.stateRepository,
+        workerId: "worker-B",
+        leaseTtlMs: TTL,
+        now: () => clock,
+        clock: () => new Date(clock).toISOString(),
+      });
+
+      assert.throws(
+        () => engine.checkout(PAYLOAD, { commandId }),
+        (error) => error.code === "COMMAND_IN_PROGRESS",
+        "a stable NOT_EXPIRED must surface as COMMAND_IN_PROGRESS"
+      );
+
+      // Anti-vacuity: the Store really was challenged, and really refused.
+      assert.equal(
+        challenges.length,
+        1,
+        "the Store must be challenged exactly once, not re-challenged in a loop"
+      );
+      assert.deepEqual(challenges[0], { success: false, reason: "NOT_EXPIRED" });
+
+      // A refused challenge mutates nothing.
+      const after = adapters.commandStore.get(commandId);
+      assert.deepEqual(after, before, "a refused challenge must not touch the row");
+      assert.equal(after.status, COMMAND_STATUSES.PROCESSING);
+      assert.equal(after.leaseToken, 1, "no generation increment");
+      assert.equal(after.leaseOwner, "worker-A", "the owner keeps its lease");
+      assert.equal(
+        adapters.eventStore.getByCommandId(commandId).length,
+        0,
+        "no event may be appended by a refused challenger"
+      );
+
+      adapters.close();
+    });
+  });
+}
