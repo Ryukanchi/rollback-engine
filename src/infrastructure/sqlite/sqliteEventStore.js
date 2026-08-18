@@ -78,8 +78,6 @@ class SqliteEventStore {
 
   #upcasterRegistry;
 
-  #now;
-
   #stmtInsertEvent;
 
   #stmtLastEventByAggregate;
@@ -96,14 +94,13 @@ class SqliteEventStore {
 
   #stmtGetCommandLease;
 
-  constructor({ db, upcasterRegistry, now = () => Date.now() } = {}) {
+  constructor({ db, upcasterRegistry } = {}) {
     if (!db || typeof db.prepare !== "function") {
       throw new TypeError("db must be a valid SQLite database instance");
     }
 
     this.#db = db;
     this.#upcasterRegistry = upcasterRegistry;
-    this.#now = typeof now === "function" ? now : () => Date.now();
 
     this.#stmtInsertEvent = this.#db.prepare(`
       INSERT INTO events (
@@ -154,10 +151,6 @@ class SqliteEventStore {
       FROM commands
       WHERE command_id = ?
     `);
-  }
-
-  setNow(now) {
-    this.#now = typeof now === "function" ? now : () => Date.now();
   }
 
   append(event, { expectedVersion, fencingToken } = {}) {

@@ -140,9 +140,6 @@ for (const storeType of ["memory", "sqlite"]) {
       const leaseClock = adapters.leaseClock;
       leaseClock.ms = 1_000_000;
       const now = () => leaseClock.ms;
-      if (typeof adapters.eventStore.setNow === "function") {
-        adapters.eventStore.setNow(now);
-      }
 
       const observations = [];
       let appends = 0;
@@ -723,9 +720,6 @@ for (const storeType of ["memory", "sqlite"]) {
       const leaseClock = adapters.leaseClock;
       leaseClock.ms = base;
       const clockOf = () => leaseClock.ms;
-      if (typeof adapters.eventStore.setNow === "function") {
-        adapters.eventStore.setNow(clockOf);
-      }
       const event = seedPartialCommit(adapters, "death-1", {
         now: base,
         payload: ENGINE_PAYLOAD,
@@ -783,9 +777,6 @@ for (const storeType of ["memory", "sqlite"]) {
       const leaseClock = adapters.leaseClock;
       leaseClock.ms = 1_000_000;
       const clockOf = () => leaseClock.ms;
-      if (typeof adapters.eventStore.setNow === "function") {
-        adapters.eventStore.setNow(clockOf);
-      }
       const engine = engineOn(adapters, "worker-A", clockOf);
 
       engine.checkout({ ...PAYLOAD, simulateFailureAt: "after_payment" }, { commandId: "zero-setup" });
@@ -876,7 +867,7 @@ describe("Lease authority under SQLite concurrency", () => {
     }
 
     const storeA = sqliteStoreWithClock(samplingDb(dbA), 1000);
-    const eventA = new SqliteEventStore({ db: dbA, now: () => 90_000 });
+    const eventA = new SqliteEventStore({ db: dbA });
 
     try {
       at(storeA, 1000).reserve({
@@ -965,7 +956,7 @@ describe("Lease authority under SQLite concurrency", () => {
       }),
       casClock
     );
-    const eventStore = new SqliteEventStore({ db, now: () => 90_000 });
+    const eventStore = new SqliteEventStore({ db });
 
     try {
       at(store, 1000).reserve({
@@ -1117,7 +1108,7 @@ describe("Lease authority under SQLite concurrency", () => {
         }),
         1000
       );
-      const eventA = new SqliteEventStore({ db: dbA, now: () => 90_000 });
+      const eventA = new SqliteEventStore({ db: dbA });
 
       try {
         at(storeA, 1000).reserve({

@@ -25,7 +25,6 @@ function createEngineWithCustomClock({
   const adapters = createStorageAdapters({
     type: storageType,
     dbPath,
-    now: getNow,
     leaseNow: getNow,
   });
   const engine = new RollbackEngine({
@@ -68,7 +67,7 @@ test("command lease: initial reservation acquires lease with token 1 and owner",
 test("command lease: active unexpired command with 0 events returns COMMAND_IN_PROGRESS", () => {
   let currentTime = 1000;
   const commandStore = new InMemoryCommandStore({ now: () => currentTime });
-  const eventStore = new InMemoryEventStore({ commandStore, now: () => currentTime });
+  const eventStore = new InMemoryEventStore({ commandStore });
   const commandId = "in-flight-command";
 
   // Worker 1 reserves command with lease expiring at 3000
@@ -110,7 +109,7 @@ test("command lease: active unexpired command with 0 events returns COMMAND_IN_P
 test("command lease: expired command with 0 events is safely taken over by new worker with incremented fencing token", () => {
   let currentTime = 1000;
   const commandStore = new InMemoryCommandStore({ now: () => currentTime });
-  const eventStore = new InMemoryEventStore({ commandStore, now: () => currentTime });
+  const eventStore = new InMemoryEventStore({ commandStore });
   const commandId = "abandoned-processing-command";
   const diagnostics = [];
 
@@ -160,7 +159,7 @@ test("command lease: expired command with 0 events is safely taken over by new w
 test("fencing: zombie worker with stale fencing token is rejected at EventStore.append", () => {
   let currentTime = 1000;
   const commandStore = new InMemoryCommandStore({ now: () => currentTime });
-  const eventStore = new InMemoryEventStore({ commandStore, now: () => currentTime });
+  const eventStore = new InMemoryEventStore({ commandStore });
   const commandId = "zombie-test-command";
 
   // Worker 1 reserves at t=1000 (token 1, expires at 2000)
@@ -242,7 +241,7 @@ test("SQLite atomic fencing check rejects stale append in shared database", () =
   try {
     let currentTime = 1000;
     const commandStore = new SqliteCommandStore({ db, now: () => currentTime });
-    const eventStore = new SqliteEventStore({ db, now: () => 2500 });
+    const eventStore = new SqliteEventStore({ db });
     const commandId = "sqlite-fencing-cmd";
 
     // Worker 1 reserves command with token 1
@@ -319,7 +318,7 @@ test("SQLite atomic fencing check rejects stale append in shared database", () =
 test("partial commit protection: command with >=1 committed events CANNOT be taken over even if expired", () => {
   let currentTime = 1000;
   const commandStore = new InMemoryCommandStore({ now: () => currentTime });
-  const eventStore = new InMemoryEventStore({ commandStore, now: () => currentTime });
+  const eventStore = new InMemoryEventStore({ commandStore });
   commandStore.setEventStore(eventStore);
   const commandId = "partial-commit-expired-lease";
 
@@ -392,7 +391,7 @@ test("authoritative event in events table + stale/empty command event_range bloc
   try {
     let currentTime = 1000;
     const commandStore = new SqliteCommandStore({ db, now: () => currentTime });
-    const eventStore = new SqliteEventStore({ db, now: () => currentTime });
+    const eventStore = new SqliteEventStore({ db });
     const commandId = "unrecorded-event-cmd";
 
     // Worker 1 reserves at t=1000 (expires at 2000)
@@ -553,7 +552,7 @@ test("stale token rejected while command is STILL processing under new owner", (
   try {
     let currentTime = 1000;
     const commandStore = new SqliteCommandStore({ db, now: () => currentTime });
-    const eventStore = new SqliteEventStore({ db, now: () => 2500 });
+    const eventStore = new SqliteEventStore({ db });
     const commandId = "still-proc-cmd";
 
     // Worker 1 reserves at t=1000 (token 1, expires at 2000)

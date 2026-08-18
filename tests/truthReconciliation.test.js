@@ -43,9 +43,6 @@ function raceAt({ storeType, hook, target = "commandStore", nth = 1, interfere, 
   const base = Date.parse("2026-08-15T12:00:00.000Z");
   let clock = base;
   const adapters = createAdapters(storeType, () => clock);
-  if (typeof adapters.eventStore.setNow === "function") {
-    adapters.eventStore.setNow(() => clock);
-  }
 
   const commandId = `race-${randomUUID().slice(0, 8)}`;
   const host = target === "eventStore" ? adapters.eventStore : adapters.commandStore;
@@ -199,9 +196,6 @@ for (const storeType of ["memory", "sqlite"]) {
       const base = Date.parse("2026-08-15T12:00:00.000Z");
       let clock = base;
       const adapters = createAdapters(storeType, () => clock);
-      if (typeof adapters.eventStore.setNow === "function") {
-        adapters.eventStore.setNow(() => clock);
-      }
       const commandId = "l6-generation-loss";
 
       // A deterministic domain rejection persists its failure with zero events.
@@ -343,9 +337,6 @@ for (const storeType of ["memory", "sqlite"]) {
       const base = Date.parse("2026-08-15T12:00:00.000Z");
       let clock = base;
       const adapters = createAdapters(storeType, () => clock);
-      if (typeof adapters.eventStore.setNow === "function") {
-        adapters.eventStore.setNow(() => clock);
-      }
       const commandId = "release-loss";
 
       // A zero-event command fails with a domain error while a competitor takes

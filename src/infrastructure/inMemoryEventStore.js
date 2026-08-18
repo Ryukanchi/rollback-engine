@@ -68,20 +68,13 @@ class InMemoryEventStore {
 
   #commandStore;
 
-  #now;
-
-  constructor({ upcasterRegistry, commandStore = null, now = () => Date.now() } = {}) {
+  constructor({ upcasterRegistry, commandStore = null } = {}) {
     this.#upcasterRegistry = upcasterRegistry;
     this.#commandStore = commandStore;
-    this.#now = typeof now === "function" ? now : () => Date.now();
   }
 
   setCommandStore(commandStore) {
     this.#commandStore = commandStore;
-  }
-
-  setNow(now) {
-    this.#now = typeof now === "function" ? now : () => Date.now();
   }
 
   append(event, { expectedVersion, fencingToken } = {}) {

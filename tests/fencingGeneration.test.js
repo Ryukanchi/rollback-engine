@@ -42,11 +42,11 @@ function at(store, ms) {
   return store;
 }
 
-function createLeaseStores({ now } = {}) {
+function createLeaseStores() {
   const leaseClock = { ms: 1000 };
   const commandStore = new InMemoryCommandStore({ now: () => leaseClock.ms });
   leaseClocks.set(commandStore, leaseClock);
-  const eventStore = new InMemoryEventStore({ now });
+  const eventStore = new InMemoryEventStore();
   commandStore.setEventStore(eventStore);
   eventStore.setCommandStore(commandStore);
   return { commandStore, eventStore };
@@ -58,7 +58,7 @@ function createEngineWithClock({
   getNow,
 } = {}) {
   const commandStore = new InMemoryCommandStore({ now: getNow });
-  const eventStore = new InMemoryEventStore({ now: getNow });
+  const eventStore = new InMemoryEventStore();
   const snapshotStore = new InMemorySnapshotStore();
   const stateRepository = new InMemoryStateRepository();
   commandStore.setEventStore(eventStore);
@@ -151,7 +151,7 @@ for (const fencingCode of [
   test(`Z-2: ${fencingCode} from the event store leaves the reservation untouched`, () => {
     let currentTime = 1000;
     const commandStore = new InMemoryCommandStore({ now: () => currentTime });
-    const eventStore = new InMemoryEventStore({ now: () => currentTime });
+    const eventStore = new InMemoryEventStore();
     commandStore.setEventStore(eventStore);
     eventStore.setCommandStore(commandStore);
 
@@ -272,7 +272,7 @@ test("Z-4: re-reservation after release increments token preventing ABA", () => 
 
 test("Z-5: an uncontested current generation may append past the expiry boundary", () => {
   let currentTime = 1000;
-  const { commandStore, eventStore } = createLeaseStores({ now: () => currentTime });
+  const { commandStore, eventStore } = createLeaseStores();
 
   const commandId = "cmd-f";
   at(commandStore, currentTime).reserve({
@@ -303,7 +303,7 @@ test("Z-5: an uncontested current generation may append past the expiry boundary
 
 test("Z-5: the same append past the boundary is rejected once the generation moved", () => {
   let currentTime = 1000;
-  const { commandStore, eventStore } = createLeaseStores({ now: () => currentTime });
+  const { commandStore, eventStore } = createLeaseStores();
 
   const commandId = "cmd-f-contested";
   at(commandStore, currentTime).reserve({
@@ -346,7 +346,7 @@ test("Z-5: the same append past the boundary is rejected once the generation mov
 
 test("Z-5: lease expiry at boundary is consistent between takeover and event store", () => {
   let currentTime = 1000;
-  const { commandStore, eventStore } = createLeaseStores({ now: () => currentTime });
+  const { commandStore, eventStore } = createLeaseStores();
   const commandId = "cmd-g";
 
   at(commandStore, currentTime).reserve({
@@ -454,7 +454,7 @@ test("Z-1: complete after takeover with old fencing token is rejected", () => {
 
 test("Z-3: event store rejects append with fencing token when command row is missing", () => {
   let currentTime = 1000;
-  const { eventStore } = createLeaseStores({ now: () => currentTime });
+  const { eventStore } = createLeaseStores();
 
   // Do NOT reserve any command — simulate a deleted/missing row
   const commandId = "cmd-k-missing";
@@ -469,7 +469,7 @@ test("Z-3: event store rejects append with fencing token when command row is mis
 
 test("Z-3: event store allows append without fencing token when command row is missing", () => {
   let currentTime = 1000;
-  const { eventStore } = createLeaseStores({ now: () => currentTime });
+  const { eventStore } = createLeaseStores();
 
   const commandId = "cmd-k-no-token";
   const event = createTestEvent({ commandId, aggregateId: 1, sequence: 1 });
@@ -484,7 +484,7 @@ test("Z-3: event store allows append without fencing token when command row is m
 test("Z-5: at exact expiry boundary, event store and takeover agree lease is expired", () => {
   const expiryTime = 5000;
   let currentTime = 1000;
-  const { commandStore, eventStore } = createLeaseStores({ now: () => currentTime });
+  const { commandStore, eventStore } = createLeaseStores();
   const commandId = "cmd-l";
 
   at(commandStore, currentTime).reserve({

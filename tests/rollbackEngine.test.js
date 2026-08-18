@@ -1258,7 +1258,7 @@ test("a transient fail-store error leaves events protected from re-execution", (
     }
   }
 
-  const eventStore = new InMemoryEventStore({ now: () => testTime });
+  const eventStore = new InMemoryEventStore();
   let clockCalls = 0;
   let testTime = new Date("2026-08-15T15:30:00.000Z").getTime();
   const engine = new RollbackEngine({
