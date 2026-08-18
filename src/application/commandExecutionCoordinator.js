@@ -306,7 +306,16 @@ class CommandExecutionCoordinator {
         caughtError.eventCommitted = false;
         caughtError.retrySafe = true;
         caughtError.retryAction = "RETRY_SAME_KEY";
-        this.#commandStore.release(commandId, { fencingToken });
+
+        try {
+          this.#commandStore.release(commandId, { fencingToken });
+        } catch (releaseError) {
+          // The reservation could not be given up because this execution no
+          // longer owns it. That is a technical consequence, not the reason the
+          // command failed, so the original cause stays the primary answer and
+          // the lease loss is attached underneath it.
+          caughtError.cause ??= releaseError;
+        }
       }
 
       throw caughtError;
@@ -662,13 +671,78 @@ class CommandExecutionCoordinator {
 
       this.#commandStore.fail(commandId, serializeCommandError(error), { fencingToken });
     } catch (persistenceError) {
-      throw createCommandStatePersistenceError(
+      throw this.#reconcilePersistenceFailure(
+        commandId,
+        events,
+        error,
+        persistenceError,
+        fencingToken
+      );
+    }
+  }
+
+  /**
+   * A refused error-persistence attempt is not automatically a persistence
+   * problem. The write can equally have been refused because a third party
+   * already established the terminal truth for this command, in which case
+   * nothing failed at all. Only the persisted state can tell the two apart, so
+   * this is a pure truth read: no mutation, no retry, no status change, no
+   * generation change.
+   *
+   * The answer a caller receives must describe the state that is actually
+   * persisted, not the mechanism by which the caller discovered its loss - a
+   * losing owner and a retrying client that find the same state get the same
+   * answer.
+   */
+  #reconcilePersistenceFailure(
+    commandId,
+    events,
+    error,
+    persistenceError,
+    fencingToken
+  ) {
+    const persistenceFailure = () =>
+      createCommandStatePersistenceError(
         commandId,
         events,
         persistenceError,
         error.eventCommitted
       );
+
+    let record;
+
+    try {
+      record = this.#commandStore.get(commandId);
+    } catch {
+      // The truth read itself failed: it must not obscure the original cause.
+      return persistenceFailure();
     }
+
+    if (!record) {
+      return persistenceFailure();
+    }
+
+    // A lost generation is the more precise diagnosis whatever the status is,
+    // so it is checked first. Revocation leaves the generation untouched, so a
+    // differing token always means a takeover replaced this execution.
+    if (fencingToken !== undefined && record.leaseToken !== fencingToken) {
+      return createFencingTokenStaleError({
+        commandId,
+        providedToken: fencingToken,
+        currentToken: record.leaseToken,
+        workerId: this.#workerId,
+        leaseOwner: record.leaseOwner,
+      });
+    }
+
+    // Someone else terminalised this command under our own generation, i.e. it
+    // was revoked. Their record is the truth; hand it back unchanged.
+    if (record.status !== COMMAND_STATUSES.PROCESSING && record.error) {
+      return deserializeCommandError(record.error);
+    }
+
+    // The row is still ours and still processing: the write genuinely failed.
+    return persistenceFailure();
   }
 
   #persistFailureWithoutEventReconciliation(
@@ -682,11 +756,12 @@ class CommandExecutionCoordinator {
         fencingToken,
       });
     } catch (persistenceError) {
-      throw createCommandStatePersistenceError(
+      throw this.#reconcilePersistenceFailure(
         commandId,
         events,
+        error,
         persistenceError,
-        error.eventCommitted
+        fencingToken
       );
     }
   }
