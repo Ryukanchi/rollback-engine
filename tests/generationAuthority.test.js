@@ -35,22 +35,46 @@ function createEvent({ commandId, aggregateId = 1, sequence = 1, eventId }) {
   });
 }
 
+/**
+ * Lease time belongs to the command store, so a test cannot hand a chosen `now`
+ * to a single mutation. It positions the store's own clock at the moment it
+ * means, and the store decides from there.
+ */
+const leaseClocks = new WeakMap();
+
+function trackLeaseClock(store, clock) {
+  leaseClocks.set(store, clock);
+  return store;
+}
+
+/** Positions `store`'s lease clock at `ms`, then hands the store back. */
+function at(store, ms) {
+  leaseClocks.get(store).ms = ms;
+  return store;
+}
+
 function createAdapters(type) {
-  if (type === "sqlite") {
-    const dbPath = join(tmpdir(), `rollback-generation-${randomUUID()}.db`);
-    return createStorageAdapters({ type: "sqlite", dbPath });
-  }
-  return createStorageAdapters({ type: "memory" });
+  const clock = { ms: 1000 };
+  const leaseNow = () => clock.ms;
+  const adapters =
+    type === "sqlite"
+      ? createStorageAdapters({
+          type: "sqlite",
+          dbPath: join(tmpdir(), `rollback-generation-${randomUUID()}.db`),
+          leaseNow,
+        })
+      : createStorageAdapters({ type: "memory", leaseNow });
+  trackLeaseClock(adapters.commandStore, clock);
+  return adapters;
 }
 
 function reserve(store, commandId, { workerId = "worker-1", leaseTtlMs = 1000, now = 1000 } = {}) {
-  return store.reserve({
+  return at(store, now).reserve({
     commandId,
     commandType: "CHECKOUT",
     payload: { ...PAYLOAD },
     workerId,
     leaseTtlMs,
-    now,
   });
 }
 
@@ -127,8 +151,8 @@ for (const storeType of ["memory", "sqlite"]) {
       const seen = [];
 
       seen.push(reserve(store, commandId, { workerId: "A", leaseTtlMs: 10, now: 1000 }).record.leaseToken);
-      seen.push(store.takeOverExpired({ commandId, workerId: "B", leaseTtlMs: 10, now: 5000 }).record.leaseToken);
-      seen.push(store.takeOverExpired({ commandId, workerId: "C", leaseTtlMs: 10, now: 9000 }).record.leaseToken);
+      seen.push(at(store, 5000).takeOverExpired({ commandId, workerId: "B", leaseTtlMs: 10 }).record.leaseToken);
+      seen.push(at(store, 9000).takeOverExpired({ commandId, workerId: "C", leaseTtlMs: 10 }).record.leaseToken);
 
       store.fail(commandId, { code: "EVENT_APPEND_COMMIT_UNKNOWN" }, { fencingToken: 3 });
       store.releaseFailed(commandId, "EVENT_APPEND_COMMIT_UNKNOWN", { fencingToken: 3 });
@@ -168,11 +192,10 @@ for (const storeType of ["memory", "sqlite"]) {
         const commandId = `g2-${mutation}`;
 
         reserve(store, commandId, { workerId: "A", leaseTtlMs: 10, now: 1000 });
-        const takeover = store.takeOverExpired({
+        const takeover = at(store, 5000).takeOverExpired({
           commandId,
           workerId: "B",
           leaseTtlMs: 60000,
-          now: 5000,
         });
         assert.equal(takeover.record.leaseToken, 2);
         assert.equal(takeover.record.status, COMMAND_STATUSES.PROCESSING);
@@ -228,7 +251,7 @@ for (const storeType of ["memory", "sqlite"]) {
       const commandId = "g4-events";
 
       reserve(store, commandId, { workerId: "A", leaseTtlMs: 10, now: 1000 });
-      store.takeOverExpired({ commandId, workerId: "B", leaseTtlMs: 60000, now: 5000 });
+      at(store, 5000).takeOverExpired({ commandId, workerId: "B", leaseTtlMs: 60000 });
 
       const forgedEvents = [createEvent({ commandId, aggregateId: 42, sequence: 7 })];
 
@@ -254,7 +277,7 @@ for (const storeType of ["memory", "sqlite"]) {
       // Generation 1 fails, generation 2 takes the row over and fails as well,
       // so the row is FAILED and the live generation is 2.
       reserve(store, commandId, { workerId: "A", leaseTtlMs: 10, now: 1000 });
-      store.takeOverExpired({ commandId, workerId: "B", leaseTtlMs: 60000, now: 5000 });
+      at(store, 5000).takeOverExpired({ commandId, workerId: "B", leaseTtlMs: 60000 });
       store.fail(
         commandId,
         { code: "EVENT_APPEND_COMMIT_UNKNOWN", message: "written by generation 2" },
@@ -356,7 +379,7 @@ for (const storeType of ["memory", "sqlite"]) {
 
       // Probe A - the stale generation-1 path names no generation at all.
       assert.throws(
-        () => store.renewLease({ commandId, workerId: OWNER, leaseTtlMs: 90_000, now: 20_000 }),
+        () => at(store, 20_000).renewLease({ commandId, workerId: OWNER, leaseTtlMs: 90_000 }),
         (error) => {
           assert.equal(error.code, "FENCING_TOKEN_REQUIRED");
           return true;
@@ -367,12 +390,11 @@ for (const storeType of ["memory", "sqlite"]) {
       // Probe B - the stale generation-1 path names its own, spent generation.
       assert.throws(
         () =>
-          store.renewLease({
+          at(store, 21_000).renewLease({
             commandId,
             workerId: OWNER,
             fencingToken: 1,
             leaseTtlMs: 90_000,
-            now: 21_000,
           }),
         (error) => isStaleGeneration(error, { provided: 1, current: 2 })
       );
@@ -382,12 +404,11 @@ for (const storeType of ["memory", "sqlite"]) {
       // so the two dimensions are enforced independently.
       assert.throws(
         () =>
-          store.renewLease({
+          at(store, 21_500).renewLease({
             commandId,
             workerId: "worker-B",
             fencingToken: 2,
             leaseTtlMs: 90_000,
-            now: 21_500,
           }),
         (error) => {
           assert.equal(error.code, "FENCING_TOKEN_STALE");
@@ -401,12 +422,11 @@ for (const storeType of ["memory", "sqlite"]) {
       // Probe C - the live generation renews the identical call successfully,
       // which proves A, B and D were rejected for the generation and the owner,
       // not for status, expiry, payload or a missing row.
-      const renewed = store.renewLease({
+      const renewed = at(store, 22_000).renewLease({
         commandId,
         workerId: OWNER,
         fencingToken: 2,
         leaseTtlMs: 90_000,
-        now: 22_000,
       });
       assert.equal(renewed.renewed, true);
       assert.equal(renewed.leaseExpiresAt, 112_000);
@@ -484,8 +504,10 @@ describe("Generation authority (SQLite atomicity)", () => {
     const commandId = "cas-cmd";
 
     let armed = false;
-    const store = new SqliteCommandStore({
-      db: withBarrierAfterSelect(db, () => {
+    const casClock = { ms: 1000 };
+    const store = trackLeaseClock(
+      new SqliteCommandStore({
+        db: withBarrierAfterSelect(db, () => {
         if (!armed) return;
         armed = false;
         // The generation moves on after the store validated it but before it
@@ -493,8 +515,11 @@ describe("Generation authority (SQLite atomicity)", () => {
         db.prepare("UPDATE commands SET lease_token = lease_token + 1 WHERE command_id = ?").run(
           commandId
         );
+        }),
+        now: () => casClock.ms,
       }),
-    });
+      casClock
+    );
 
     try {
       reserve(store, commandId, { workerId: "A", leaseTtlMs: 60000, now: 1000 });
@@ -524,8 +549,10 @@ describe("Generation authority (SQLite atomicity)", () => {
     const commandId = "renew-cas-cmd";
 
     let armed = false;
-    const store = new SqliteCommandStore({
-      db: withBarrierAfterSelect(db, () => {
+    const casClock = { ms: 1000 };
+    const store = trackLeaseClock(
+      new SqliteCommandStore({
+        db: withBarrierAfterSelect(db, () => {
         if (!armed) return;
         armed = false;
         // The generation moves on after renewLease validated it but before it
@@ -533,8 +560,11 @@ describe("Generation authority (SQLite atomicity)", () => {
         db.prepare("UPDATE commands SET lease_token = lease_token + 1 WHERE command_id = ?").run(
           commandId
         );
+        }),
+        now: () => casClock.ms,
       }),
-    });
+      casClock
+    );
 
     try {
       reserve(store, commandId, { workerId: "A", leaseTtlMs: 60_000, now: 1_000 });
@@ -543,12 +573,11 @@ describe("Generation authority (SQLite atomicity)", () => {
       armed = true;
       assert.throws(
         () =>
-          store.renewLease({
+          at(store, 2_000).renewLease({
             commandId,
             workerId: "A",
             fencingToken: 1,
             leaseTtlMs: 90_000,
-            now: 2_000,
           }),
         (error) => {
           assert.equal(error.code, "FENCING_TOKEN_STALE");
@@ -571,12 +600,14 @@ describe("Generation authority (SQLite atomicity)", () => {
     const dbA = createSqliteDatabase({ path: dbPath, busyTimeout: 50 });
     const dbB = createSqliteDatabase({ path: dbPath, busyTimeout: 50 });
     const commandId = "serialize-cmd";
-    const storeB = new SqliteCommandStore({ db: dbB });
+    const storeB = new SqliteCommandStore({ db: dbB, now: () => 50_000 });
 
     let armed = false;
     let takeoverOutcome = null;
-    const storeA = new SqliteCommandStore({
-      db: withBarrierAfterSelect(dbA, () => {
+    const serializeClock = { ms: 1000 };
+    const storeA = trackLeaseClock(
+      new SqliteCommandStore({
+        db: withBarrierAfterSelect(dbA, () => {
         if (!armed) return;
         armed = false;
         try {
@@ -584,14 +615,16 @@ describe("Generation authority (SQLite atomicity)", () => {
             commandId,
             workerId: "B",
             leaseTtlMs: 60000,
-            now: 50_000,
             expectedToken: 1,
           });
         } catch (error) {
           takeoverOutcome = { success: false, reason: "BLOCKED", error };
         }
+        }),
+        now: () => serializeClock.ms,
       }),
-    });
+      serializeClock
+    );
 
     try {
       reserve(storeA, commandId, { workerId: "A", leaseTtlMs: 1000, now: 1000 });

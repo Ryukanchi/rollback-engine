@@ -84,14 +84,12 @@ test("multi-process lease takeover and atomic zombie fencing while command is st
 
     async function main() {
       const adapters = createStorageAdapters({ type: 'sqlite', dbPath: ${JSON.stringify(dbPath)} });
-      const now = Date.now();
       const reservation = adapters.commandStore.reserve({
         commandId: ${JSON.stringify(commandId)},
         commandType: 'CHECKOUT',
         payload: { item: 'Drone', quantity: 1, amount: 999, simulateFailureAt: null },
         workerId: 'worker-process-a',
         leaseTtlMs: 500,
-        now: now,
       });
 
       // Signal parent that reservation is complete
@@ -155,7 +153,6 @@ test("multi-process lease takeover and atomic zombie fencing while command is st
             commandId: ${JSON.stringify(commandId)},
             workerId: 'worker-process-b',
             leaseTtlMs: 5000,
-            now: Date.now(),
           });
 
           process.stdout.write(JSON.stringify({
@@ -307,14 +304,12 @@ test("multi-process partial commit: unrecorded event in events table blocks take
 
     async function main() {
       const adapters = createStorageAdapters({ type: 'sqlite', dbPath: ${JSON.stringify(dbPath)} });
-      const now = Date.now();
       const reservation = adapters.commandStore.reserve({
         commandId: ${JSON.stringify(commandId)},
         commandType: 'CHECKOUT',
         payload: { item: 'Microscope', quantity: 1, amount: 750, simulateFailureAt: null },
         workerId: 'worker-process-a',
         leaseTtlMs: 500,
-        now: now,
       });
 
       const firstEvent = createDomainEvent({
@@ -357,7 +352,6 @@ test("multi-process partial commit: unrecorded event in events table blocks take
         commandId: ${JSON.stringify(commandId)},
         workerId: 'worker-process-b',
         leaseTtlMs: 3000,
-        now: Date.now(),
       });
 
       process.stdout.write(JSON.stringify({

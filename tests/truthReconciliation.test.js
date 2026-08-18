@@ -19,13 +19,19 @@ const REVOKE_ERROR = {
   retryAction: "MANUAL_RESOLUTION_REQUIRED",
 };
 
-function createAdapters(storeType) {
+/**
+ * `leaseNow` is the command store's lease clock. Tests that need a lease to
+ * expire advance the variable it closes over; they cannot hand a chosen time to
+ * an individual mutation any more.
+ */
+function createAdapters(storeType, leaseNow) {
   return storeType === "sqlite"
     ? createStorageAdapters({
         type: "sqlite",
         dbPath: join(tmpdir(), `rollback-truth-${randomUUID()}.db`),
+        leaseNow,
       })
-    : createStorageAdapters({ type: "memory" });
+    : createStorageAdapters({ type: "memory", leaseNow });
 }
 
 /**
@@ -34,9 +40,9 @@ function createAdapters(storeType) {
  * owner surfaced plus the state that was actually persisted.
  */
 function raceAt({ storeType, hook, target = "commandStore", nth = 1, interfere, command = PAYLOAD }) {
-  const adapters = createAdapters(storeType);
   const base = Date.parse("2026-08-15T12:00:00.000Z");
   let clock = base;
+  const adapters = createAdapters(storeType, () => clock);
   if (typeof adapters.eventStore.setNow === "function") {
     adapters.eventStore.setNow(() => clock);
   }
@@ -50,7 +56,7 @@ function raceAt({ storeType, hook, target = "commandStore", nth = 1, interfere, 
     calls += 1;
     if (interference === null && calls === nth) {
       clock += 60_000; // the owner stalls; its lease expires
-      interference = interfere(adapters, commandId, clock);
+      interference = interfere(adapters, commandId);
     }
     return real(...args);
   };
@@ -62,7 +68,6 @@ function raceAt({ storeType, hook, target = "commandStore", nth = 1, interfere, 
     stateRepository: adapters.stateRepository,
     workerId: "worker-A",
     leaseTtlMs: TTL,
-    now: () => clock,
     clock: () => new Date(clock).toISOString(),
   });
 
@@ -83,20 +88,18 @@ function raceAt({ storeType, hook, target = "commandStore", nth = 1, interfere, 
   };
 }
 
-const revoke = (adapters, commandId, now) =>
+const revoke = (adapters, commandId) =>
   adapters.commandStore.revokeExpired({
     commandId,
     expectedToken: 1,
-    now,
     error: REVOKE_ERROR,
   });
 
-const takeover = (adapters, commandId, now) =>
+const takeover = (adapters, commandId) =>
   adapters.commandStore.takeOverExpired({
     commandId,
     workerId: "worker-B",
     leaseTtlMs: TTL,
-    now,
     expectedToken: 1,
   });
 
@@ -151,7 +154,6 @@ for (const storeType of ["memory", "sqlite"]) {
           stateRepository: run.adapters.stateRepository,
           workerId: "worker-C",
           leaseTtlMs: TTL,
-          now: () => Date.parse("2026-08-15T12:10:00.000Z"),
         });
         assert.throws(
           () => engine.checkout(PAYLOAD, { commandId: run.commandId }),
@@ -194,9 +196,9 @@ for (const storeType of ["memory", "sqlite"]) {
     // --- F1-L6: generation loss discovered *by* the truth read -------------
 
     test("F1-L6: a zero-event persistence attempt that lost the generation reports fencing", () => {
-      const adapters = createAdapters(storeType);
       const base = Date.parse("2026-08-15T12:00:00.000Z");
       let clock = base;
+      const adapters = createAdapters(storeType, () => clock);
       if (typeof adapters.eventStore.setNow === "function") {
         adapters.eventStore.setNow(() => clock);
       }
@@ -216,7 +218,6 @@ for (const storeType of ["memory", "sqlite"]) {
             commandId,
             workerId: "worker-B",
             leaseTtlMs: TTL,
-            now: clock,
             expectedToken: 1,
           });
           assert.equal(outcome.success, true, "the competitor must actually have won");
@@ -231,7 +232,6 @@ for (const storeType of ["memory", "sqlite"]) {
         stateRepository: adapters.stateRepository,
         workerId: "worker-A",
         leaseTtlMs: TTL,
-        now: () => clock,
         clock: () => new Date(clock).toISOString(),
       });
 
@@ -340,9 +340,9 @@ for (const storeType of ["memory", "sqlite"]) {
     // --- The release path keeps the domain error as the primary cause ------
 
     test("release path: the original domain error survives a lost reservation", () => {
-      const adapters = createAdapters(storeType);
       const base = Date.parse("2026-08-15T12:00:00.000Z");
       let clock = base;
+      const adapters = createAdapters(storeType, () => clock);
       if (typeof adapters.eventStore.setNow === "function") {
         adapters.eventStore.setNow(() => clock);
       }
@@ -360,7 +360,6 @@ for (const storeType of ["memory", "sqlite"]) {
             commandId,
             workerId: "worker-B",
             leaseTtlMs: TTL,
-            now: clock,
             expectedToken: 1,
           });
           throw Object.assign(new Error("inventory service exploded"), {
@@ -377,7 +376,6 @@ for (const storeType of ["memory", "sqlite"]) {
         stateRepository: adapters.stateRepository,
         workerId: "worker-A",
         leaseTtlMs: TTL,
-        now: () => clock,
         clock: () => new Date(clock).toISOString(),
       });
 

@@ -7,7 +7,9 @@ function runLeaseFencingScenario(session) {
   const payload = { item: "AutonomousNode", quantity: 1, amount: 1500 };
   const normalizedPayload = { ...payload, simulateFailureAt: null };
 
-  let simulatedTime = 1000;
+  // The command store owns lease time, so the scenario drives the store's
+  // clock rather than passing a chosen `now` into each mutation.
+  session.leaseClock.pinnedMs = 1000;
 
   // Step 1: Worker 1 reserves command at t=1000 with 1000ms TTL (token 1, expires at 2000)
   const initialReservation = session.adapters.commandStore.reserve({
@@ -16,11 +18,10 @@ function runLeaseFencingScenario(session) {
     payload: normalizedPayload,
     workerId: "worker-process-1",
     leaseTtlMs: 1000,
-    now: simulatedTime,
   });
 
-  // Step 2: Advance time past expiry to t=2500
-  simulatedTime = 2500;
+  // Step 2: Advance the store clock past expiry to t=2500
+  session.leaseClock.pinnedMs = 2500;
 
   // Worker 2 takes over the expired lease and completes the command
   const engineWorker2 = new RollbackEngine({
@@ -30,7 +31,6 @@ function runLeaseFencingScenario(session) {
     stateRepository: session.adapters.stateRepository,
     workerId: "worker-process-2",
     leaseTtlMs: 3000,
-    now: () => simulatedTime,
   });
 
   const worker2Result = engineWorker2.checkout(payload, { commandId });

@@ -29,8 +29,23 @@ function createTestEvent({ commandId, aggregateId = 1, sequence = 1, eventId } =
   });
 }
 
+/**
+ * Lease time belongs to the command store, so a test cannot hand a chosen `now`
+ * to a single mutation. It positions the store's own clock at the moment it
+ * means, and the store decides from there.
+ */
+const leaseClocks = new WeakMap();
+
+/** Positions `store`'s lease clock at `ms`, then hands the store back. */
+function at(store, ms) {
+  leaseClocks.get(store).ms = ms;
+  return store;
+}
+
 function createLeaseStores({ now } = {}) {
-  const commandStore = new InMemoryCommandStore();
+  const leaseClock = { ms: 1000 };
+  const commandStore = new InMemoryCommandStore({ now: () => leaseClock.ms });
+  leaseClocks.set(commandStore, leaseClock);
   const eventStore = new InMemoryEventStore({ now });
   commandStore.setEventStore(eventStore);
   eventStore.setCommandStore(commandStore);
@@ -42,7 +57,7 @@ function createEngineWithClock({
   leaseTtlMs = 1000,
   getNow,
 } = {}) {
-  const commandStore = new InMemoryCommandStore();
+  const commandStore = new InMemoryCommandStore({ now: getNow });
   const eventStore = new InMemoryEventStore({ now: getNow });
   const snapshotStore = new InMemorySnapshotStore();
   const stateRepository = new InMemoryStateRepository();
@@ -56,7 +71,6 @@ function createEngineWithClock({
     stateRepository,
     workerId,
     leaseTtlMs,
-    now: getNow,
   });
 
   return { engine, commandStore, eventStore };
@@ -69,21 +83,19 @@ test("Z-1: stale token cannot release current owner's command after takeover", (
   const commandId = "cmd-a";
 
   // Worker 1 reserves (token=1)
-  commandStore.reserve({
+  at(commandStore, 1000).reserve({
     commandId,
     commandType: "CHECKOUT",
     payload: { item: "X", quantity: 1 },
     workerId: "worker-1",
     leaseTtlMs: 100,
-    now: 1000,
   });
 
   // Expire and takeover by worker 2 (token=2)
-  const takeover = commandStore.takeOverExpired({
+  const takeover = at(commandStore, 2000).takeOverExpired({
     commandId,
     workerId: "worker-2",
     leaseTtlMs: 5000,
-    now: 2000,
   });
   assert.equal(takeover.success, true);
   assert.equal(takeover.record.leaseToken, 2);
@@ -107,13 +119,12 @@ test("Z-1: stale token cannot releaseFailed current owner's command", () => {
   const { commandStore } = createLeaseStores();
   const commandId = "cmd-b";
 
-  commandStore.reserve({
+  at(commandStore, 1000).reserve({
     commandId,
     commandType: "CHECKOUT",
     payload: { item: "X", quantity: 1 },
     workerId: "worker-1",
     leaseTtlMs: 100,
-    now: 1000,
   });
 
   // Fail the command
@@ -139,7 +150,7 @@ for (const fencingCode of [
 ]) {
   test(`Z-2: ${fencingCode} from the event store leaves the reservation untouched`, () => {
     let currentTime = 1000;
-    const commandStore = new InMemoryCommandStore();
+    const commandStore = new InMemoryCommandStore({ now: () => currentTime });
     const eventStore = new InMemoryEventStore({ now: () => currentTime });
     commandStore.setEventStore(eventStore);
     eventStore.setCommandStore(commandStore);
@@ -159,7 +170,6 @@ for (const fencingCode of [
       stateRepository: new InMemoryStateRepository(),
       workerId: "worker-1",
       leaseTtlMs: 5000,
-      now: () => currentTime,
     });
 
     const commandId = `fencing-nocleanup-${fencingCode}`;
@@ -190,13 +200,12 @@ test("Z-4: release transitions to 'released' status preserving the fencing token
   const { commandStore } = createLeaseStores();
   const commandId = "cmd-d";
 
-  commandStore.reserve({
+  at(commandStore, 1000).reserve({
     commandId,
     commandType: "CHECKOUT",
     payload: { item: "X", quantity: 1 },
     workerId: "worker-1",
     leaseTtlMs: 5000,
-    now: 1000,
   });
 
   commandStore.release(commandId, { fencingToken: 1 });
@@ -215,26 +224,24 @@ test("Z-4: re-reservation after release increments token preventing ABA", () => 
   const commandId = "cmd-e";
 
   // Reserve → token=1
-  commandStore.reserve({
+  at(commandStore, 1000).reserve({
     commandId,
     commandType: "CHECKOUT",
     payload: { item: "X", quantity: 1 },
     workerId: "worker-1",
     leaseTtlMs: 5000,
-    now: 1000,
   });
 
   // Release (now status='released', token=1)
   commandStore.release(commandId, { fencingToken: 1 });
 
   // Re-reserve same commandId → token must be 2, not 1
-  const rereservation = commandStore.reserve({
+  const rereservation = at(commandStore, 2000).reserve({
     commandId,
     commandType: "CHECKOUT",
     payload: { item: "X", quantity: 1 },
     workerId: "worker-2",
     leaseTtlMs: 5000,
-    now: 2000,
   });
 
   assert.equal(rereservation.created, true);
@@ -268,13 +275,12 @@ test("Z-5: an uncontested current generation may append past the expiry boundary
   const { commandStore, eventStore } = createLeaseStores({ now: () => currentTime });
 
   const commandId = "cmd-f";
-  commandStore.reserve({
+  at(commandStore, currentTime).reserve({
     commandId,
     commandType: "CHECKOUT",
     payload: { item: "X", quantity: 1 },
     workerId: "worker-1",
     leaseTtlMs: 1000,
-    now: currentTime,
   });
 
   // Past the expiry boundary: leaseExpiresAt = 2000, now = 5000.
@@ -300,13 +306,12 @@ test("Z-5: the same append past the boundary is rejected once the generation mov
   const { commandStore, eventStore } = createLeaseStores({ now: () => currentTime });
 
   const commandId = "cmd-f-contested";
-  commandStore.reserve({
+  at(commandStore, currentTime).reserve({
     commandId,
     commandType: "CHECKOUT",
     payload: { item: "X", quantity: 1 },
     workerId: "worker-1",
     leaseTtlMs: 1000,
-    now: currentTime,
   });
 
   currentTime = 5000;
@@ -314,11 +319,10 @@ test("Z-5: the same append past the boundary is rejected once the generation mov
   // Control for the test above: identical state, identical call, but this time a
   // third party won the atomic transition first. The rejection is therefore the
   // generation, not the clock.
-  const takeover = commandStore.takeOverExpired({
+  const takeover = at(commandStore, currentTime).takeOverExpired({
     commandId,
     workerId: "worker-2",
     leaseTtlMs: 5000,
-    now: currentTime,
     expectedToken: 1,
   });
   assert.equal(takeover.success, true);
@@ -345,24 +349,22 @@ test("Z-5: lease expiry at boundary is consistent between takeover and event sto
   const { commandStore, eventStore } = createLeaseStores({ now: () => currentTime });
   const commandId = "cmd-g";
 
-  commandStore.reserve({
+  at(commandStore, currentTime).reserve({
     commandId,
     commandType: "COMPENSATE",
     payload: { item: "X", quantity: 1 },
     workerId: "worker-1",
     leaseTtlMs: 500,
-    now: currentTime,
   });
 
   // At exactly lease expiry (1500), both takeover and append must agree
   currentTime = 1500;
 
   // Takeover should succeed (expired)
-  const takeover = commandStore.takeOverExpired({
+  const takeover = at(commandStore, currentTime).takeOverExpired({
     commandId,
     workerId: "worker-2",
     leaseTtlMs: 5000,
-    now: currentTime,
   });
   assert.equal(takeover.success, true);
 
@@ -380,20 +382,18 @@ test("Z-1: recordEvent after takeover with old fencing token is rejected", () =>
   const { commandStore } = createLeaseStores();
   const commandId = "cmd-h";
 
-  commandStore.reserve({
+  at(commandStore, 1000).reserve({
     commandId,
     commandType: "CHECKOUT",
     payload: { item: "X", quantity: 1 },
     workerId: "worker-1",
     leaseTtlMs: 100,
-    now: 1000,
   });
 
-  commandStore.takeOverExpired({
+  at(commandStore, 2000).takeOverExpired({
     commandId,
     workerId: "worker-2",
     leaseTtlMs: 5000,
-    now: 2000,
   });
 
   assert.throws(
@@ -406,20 +406,18 @@ test("Z-1: fail after takeover with old fencing token is rejected", () => {
   const { commandStore } = createLeaseStores();
   const commandId = "cmd-i";
 
-  commandStore.reserve({
+  at(commandStore, 1000).reserve({
     commandId,
     commandType: "CHECKOUT",
     payload: { item: "X", quantity: 1 },
     workerId: "worker-1",
     leaseTtlMs: 100,
-    now: 1000,
   });
 
-  commandStore.takeOverExpired({
+  at(commandStore, 2000).takeOverExpired({
     commandId,
     workerId: "worker-2",
     leaseTtlMs: 5000,
-    now: 2000,
   });
 
   assert.throws(
@@ -432,20 +430,18 @@ test("Z-1: complete after takeover with old fencing token is rejected", () => {
   const { commandStore } = createLeaseStores();
   const commandId = "cmd-j";
 
-  commandStore.reserve({
+  at(commandStore, 1000).reserve({
     commandId,
     commandType: "CHECKOUT",
     payload: { item: "X", quantity: 1 },
     workerId: "worker-1",
     leaseTtlMs: 100,
-    now: 1000,
   });
 
-  commandStore.takeOverExpired({
+  at(commandStore, 2000).takeOverExpired({
     commandId,
     workerId: "worker-2",
     leaseTtlMs: 5000,
-    now: 2000,
   });
 
   assert.throws(
@@ -491,24 +487,22 @@ test("Z-5: at exact expiry boundary, event store and takeover agree lease is exp
   const { commandStore, eventStore } = createLeaseStores({ now: () => currentTime });
   const commandId = "cmd-l";
 
-  commandStore.reserve({
+  at(commandStore, currentTime).reserve({
     commandId,
     commandType: "CHECKOUT",
     payload: { item: "X", quantity: 1 },
     workerId: "worker-1",
     leaseTtlMs: expiryTime - 1000, // expires at 5000
-    now: currentTime,
   });
 
   // Set to exact expiry
   currentTime = expiryTime;
 
   // Takeover: should see as expired (expiresAt > now fails since 5000 > 5000 is false)
-  const takeover = commandStore.takeOverExpired({
+  const takeover = at(commandStore, currentTime).takeOverExpired({
     commandId,
     workerId: "worker-2",
     leaseTtlMs: 5000,
-    now: currentTime,
   });
   assert.equal(takeover.success, true, "takeover should succeed at exact expiry");
 
@@ -527,31 +521,28 @@ test("double takeover produces monotonically increasing fencing tokens", () => {
   const { commandStore } = createLeaseStores();
   const commandId = "cmd-double-takeover";
 
-  commandStore.reserve({
+  at(commandStore, 1000).reserve({
     commandId,
     commandType: "CHECKOUT",
     payload: { item: "X", quantity: 1 },
     workerId: "worker-1",
     leaseTtlMs: 100,
-    now: 1000,
   });
 
   // First takeover: token 1 → 2
-  const take1 = commandStore.takeOverExpired({
+  const take1 = at(commandStore, 2000).takeOverExpired({
     commandId,
     workerId: "worker-2",
     leaseTtlMs: 100,
-    now: 2000,
   });
   assert.equal(take1.success, true);
   assert.equal(take1.record.leaseToken, 2);
 
   // Second takeover: token 2 → 3
-  const take2 = commandStore.takeOverExpired({
+  const take2 = at(commandStore, 3000).takeOverExpired({
     commandId,
     workerId: "worker-3",
     leaseTtlMs: 100,
-    now: 3000,
   });
   assert.equal(take2.success, true);
   assert.equal(take2.record.leaseToken, 3);
@@ -573,13 +564,12 @@ test("mutating a command without a fencing token is rejected, not treated as unf
   const { commandStore } = createLeaseStores();
   const commandId = "cmd-compat";
 
-  commandStore.reserve({
+  at(commandStore, 1000).reserve({
     commandId,
     commandType: "CHECKOUT",
     payload: { item: "X", quantity: 1 },
     workerId: "worker-1",
     leaseTtlMs: 5000,
-    now: 1000,
   });
 
   // The command is otherwise perfectly releasable: status is processing, the
@@ -602,25 +592,23 @@ test("re-reservation of released command with different payload reports conflict
   const { commandStore } = createLeaseStores();
   const commandId = "cmd-conflict";
 
-  commandStore.reserve({
+  at(commandStore, 1000).reserve({
     commandId,
     commandType: "CHECKOUT",
     payload: { item: "X", quantity: 1 },
     workerId: "worker-1",
     leaseTtlMs: 5000,
-    now: 1000,
   });
 
   commandStore.release(commandId, { fencingToken: 1 });
 
   // Try to re-reserve with different payload
-  const result = commandStore.reserve({
+  const result = at(commandStore, 2000).reserve({
     commandId,
     commandType: "CHECKOUT",
     payload: { item: "Y", quantity: 2 },
     workerId: "worker-2",
     leaseTtlMs: 5000,
-    now: 2000,
   });
 
   assert.equal(result.created, false);

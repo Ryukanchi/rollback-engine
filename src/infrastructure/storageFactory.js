@@ -9,12 +9,19 @@ const { InMemoryCommandStore } = require("./inMemoryCommandStore");
 const { InMemorySnapshotStore } = require("./inMemorySnapshotStore");
 const { InMemoryStateRepository } = require("./inMemoryStateRepository");
 
+/**
+ * `leaseNow` is the Command Store's lease clock: it decides when a lease is
+ * created, extended, transferable or revocable. It is deliberately a separate
+ * option from `now`, which is the Event Store clock - the two answer different
+ * questions and must never be conflated.
+ */
 function createStorageAdapters({
   type = "memory",
   dbPath = ":memory:",
   db = null,
   upcasterRegistry = null,
   now = null,
+  leaseNow = null,
   wal = true,
   busyTimeout = 5000,
 } = {}) {
@@ -32,7 +39,7 @@ function createStorageAdapters({
     }
 
     const eventStore = new SqliteEventStore({ db: database, upcasterRegistry, now });
-    const commandStore = new SqliteCommandStore({ db: database });
+    const commandStore = new SqliteCommandStore({ db: database, now: leaseNow ?? undefined });
     const snapshotStore = new SqliteSnapshotStore({ db: database });
     const stateRepository = new SqliteStateRepository({ db: database });
 
@@ -54,7 +61,7 @@ function createStorageAdapters({
   }
 
   if (type === "memory") {
-    const commandStore = new InMemoryCommandStore();
+    const commandStore = new InMemoryCommandStore({ now: leaseNow ?? undefined });
     const eventStore = new InMemoryEventStore({ upcasterRegistry, commandStore, now });
     commandStore.setEventStore(eventStore);
     const snapshotStore = new InMemorySnapshotStore();

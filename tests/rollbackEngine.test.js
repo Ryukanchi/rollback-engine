@@ -1274,7 +1274,6 @@ test("a transient fail-store error leaves events protected from re-execution", (
 
       return new Date(testTime).toISOString();
     },
-    now: () => testTime,
   });
   const command = { item: "Pizza", quantity: 1, amount: 100 };
   const context = { commandId: "fail-store-command-1" };

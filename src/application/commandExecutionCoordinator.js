@@ -88,8 +88,6 @@ class CommandExecutionCoordinator {
 
   #clock;
 
-  #now;
-
   #emitDiagnostic;
 
   constructor({
@@ -107,25 +105,29 @@ class CommandExecutionCoordinator {
       throw new TypeError("operationIdGenerator must be a function");
     }
 
+    // Lease time is the Command Store's, not the Coordinator's (TA-2/TA-3).
+    // Accepting and ignoring a lease clock here would leave callers - tests
+    // above all - holding a control that looks authoritative and decides
+    // nothing, so it is refused loudly instead.
+    if (now !== null && now !== undefined) {
+      throw new TypeError(
+        "now is no longer a Coordinator option: the lease clock belongs to the command store (construct it with { now })"
+      );
+    }
+
     this.#eventStore = assertEventStoreAdapter(eventStore);
     this.#commandStore = assertCommandStoreAdapter(commandStore);
     this.#operationIdGenerator = operationIdGenerator;
     this.#workerId = String(workerId);
     this.#leaseTtlMs = Number.isSafeInteger(leaseTtlMs) && leaseTtlMs > 0 ? leaseTtlMs : 30000;
     this.#clock = typeof clock === "function" ? clock : () => new Date().toISOString();
-    this.#now = typeof now === "function" ? now : () => Date.now();
     this.#emitDiagnostic =
       emitDiagnostic ?? createDiagnosticEmitter(diagnosticReporter);
-  }
-
-  #getNow() {
-    return this.#now();
   }
 
   execute(commandType, payload, options, executeCommand) {
     const normalizedOptions = normalizeCommandOptions(options);
     const { commandId } = normalizedOptions;
-    const nowMs = this.#getNow();
     const workerId = this.#workerId;
     const leaseTtlMs = this.#leaseTtlMs;
 
@@ -138,7 +140,6 @@ class CommandExecutionCoordinator {
         payload,
         workerId,
         leaseTtlMs,
-        now: nowMs,
       });
 
       if (reservation.conflict) {
@@ -224,7 +225,6 @@ class CommandExecutionCoordinator {
         workerId: commandContext.workerId,
         fencingToken: commandContext.fencingToken,
         leaseTtlMs: this.#leaseTtlMs,
-        now: this.#getNow(),
       });
     }
 
@@ -422,93 +422,83 @@ class CommandExecutionCoordinator {
           throw createCommandHistoryInconsistentError(record.commandId, events);
         }
 
-        const nowMs = this.#getNow();
         const expiresAt =
           record.leaseExpiresAt !== null && record.leaseExpiresAt !== undefined
             ? Number(record.leaseExpiresAt)
             : null;
 
-        // If lease is still valid, return command in progress
-        if (expiresAt !== null && expiresAt > nowMs) {
+        // A row without a lease deadline was never leased to anyone, so no
+        // expiry-based challenge exists for it. That is a persisted fact, not
+        // a reading of any clock, which is why the Coordinator may still decide
+        // it (D-6 keeps this asymmetry with the has-events path unchanged).
+        if (expiresAt === null) {
           throw createCommandInProgressError(record);
         }
 
-        // If lease is expired and 0 events exist: safe takeover allowed!
-        if (expiresAt !== null && expiresAt <= nowMs) {
-          const takeover = this.#commandStore.takeOverExpired({
+        // Zero authoritative events: takeover is the meaningful challenge. Which
+        // challenge to attempt is decided from persisted facts here; whether the
+        // lease has actually expired is the Store's decision alone, taken
+        // against its own clock inside the mutation (TA-2).
+        const takeover = this.#commandStore.takeOverExpired({
+          commandId: record.commandId,
+          workerId: this.#workerId,
+          leaseTtlMs: this.#leaseTtlMs,
+          expectedToken: record.leaseToken,
+        });
+
+        if (takeover.success) {
+          const newToken = takeover.record.leaseToken;
+          this.#emitDiagnostic({
+            type: DIAGNOSTIC_TYPES.COMMAND_LEASE,
+            status: DIAGNOSTIC_STATUSES.LEASE_TAKEN_OVER,
             commandId: record.commandId,
             workerId: this.#workerId,
-            leaseTtlMs: this.#leaseTtlMs,
-            now: nowMs,
-            expectedToken: record.leaseToken,
+            fencingToken: newToken,
+            previousToken: record.leaseToken,
           });
 
-          if (takeover.success) {
-            const newToken = takeover.record.leaseToken;
-            this.#emitDiagnostic({
-              type: DIAGNOSTIC_TYPES.COMMAND_LEASE,
-              status: DIAGNOSTIC_STATUSES.LEASE_TAKEN_OVER,
-              commandId: record.commandId,
-              workerId: this.#workerId,
-              fencingToken: newToken,
-              previousToken: record.leaseToken,
-            });
+          const eventCommandId = record.commandId;
+          const commandContext = {
+            commandId: record.commandId,
+            eventCommandId,
+            correlationId: normalizedOptions.correlationId ?? eventCommandId,
+            initialCausationId: normalizedOptions.causationId ?? eventCommandId,
+            lastEventId: null,
+            committedEvents: [],
+            workerId: this.#workerId,
+            fencingToken: newToken,
+          };
 
-            const eventCommandId = record.commandId;
-            const commandContext = {
-              commandId: record.commandId,
-              eventCommandId,
-              correlationId: normalizedOptions.correlationId ?? eventCommandId,
-              initialCausationId: normalizedOptions.causationId ?? eventCommandId,
-              lastEventId: null,
-              committedEvents: [],
-              workerId: this.#workerId,
-              fencingToken: newToken,
-            };
-
-            try {
-              const result = executeCommand(commandContext);
-              this.#commandStore.complete(record.commandId, result, { fencingToken: newToken });
-              return result;
-            } catch (caughtError) {
-              return this.#handleExecutionError(caughtError, commandContext);
-            }
+          try {
+            const result = executeCommand(commandContext);
+            this.#commandStore.complete(record.commandId, result, { fencingToken: newToken });
+            return result;
+          } catch (caughtError) {
+            return this.#handleExecutionError(caughtError, commandContext);
           }
-
-          // The Store is the sole decider of temporal eligibility, and its
-          // answer is stable: re-reading the unchanged row would only produce
-          // the same refusal. A live lease is therefore reported, not retried
-          // - the mirror of the has-events revocation path below (D-1).
-          if (takeover.reason === "NOT_EXPIRED") {
-            throw createCommandInProgressError(record);
-          }
-
-          // Status or generation moved underneath us; re-read and act on the
-          // state that actually exists now.
-          return this.#resolveExistingCommand(
-            this.#commandStore.get(record.commandId),
-            commandType,
-            payload,
-            normalizedOptions,
-            executeCommand
-          );
         }
 
-        throw createCommandInProgressError(record);
+        // The Store is the sole decider of temporal eligibility, and its
+        // answer is stable: re-reading the unchanged row would only produce
+        // the same refusal. A live lease is therefore reported, not retried
+        // - the mirror of the has-events revocation path below (D-1).
+        if (takeover.reason === "NOT_EXPIRED") {
+          throw createCommandInProgressError(record);
+        }
+
+        // Status or generation moved underneath us; re-read and act on the
+        // state that actually exists now.
+        return this.#resolveExistingCommand(
+          this.#commandStore.get(record.commandId),
+          commandType,
+          payload,
+          normalizedOptions,
+          executeCommand
+        );
       }
 
-      const nowMs = this.#getNow();
-      const expiresAt =
-        record.leaseExpiresAt !== null && record.leaseExpiresAt !== undefined
-          ? Number(record.leaseExpiresAt)
-          : null;
-
-      // If events.length >= 1: partial-commit reconciliation. NO TAKEOVER!
-      // But only abort if the owner's lease has actually expired!
-      if (expiresAt !== null && expiresAt > nowMs) {
-        throw createCommandInProgressError(record);
-      }
-
+      // events.length >= 1: partial-commit reconciliation. NO TAKEOVER. Whether
+      // the owner's lease has actually expired is decided by the Store below.
       if (!this.#commandEventsFormContiguousRange(record.commandId, events)) {
         const inconsistentError = createCommandHistoryInconsistentError(
           record.commandId,
@@ -534,7 +524,6 @@ class CommandExecutionCoordinator {
       const revocation = this.#commandStore.revokeExpired({
         commandId: record.commandId,
         expectedToken: record.leaseToken,
-        now: nowMs,
         error: serializeCommandError(interruptedError),
       });
 

@@ -22,7 +22,12 @@ function createEngineWithCustomClock({
   getNow,
   diagnostics = [],
 } = {}) {
-  const adapters = createStorageAdapters({ type: storageType, dbPath, now: getNow });
+  const adapters = createStorageAdapters({
+    type: storageType,
+    dbPath,
+    now: getNow,
+    leaseNow: getNow,
+  });
   const engine = new RollbackEngine({
     eventStore: adapters.eventStore,
     commandStore: adapters.commandStore,
@@ -30,7 +35,6 @@ function createEngineWithCustomClock({
     stateRepository: adapters.stateRepository,
     workerId,
     leaseTtlMs,
-    now: getNow,
     diagnosticReporter: (d) => diagnostics.push(d),
   });
 
@@ -63,7 +67,7 @@ test("command lease: initial reservation acquires lease with token 1 and owner",
 
 test("command lease: active unexpired command with 0 events returns COMMAND_IN_PROGRESS", () => {
   let currentTime = 1000;
-  const commandStore = new InMemoryCommandStore();
+  const commandStore = new InMemoryCommandStore({ now: () => currentTime });
   const eventStore = new InMemoryEventStore({ commandStore, now: () => currentTime });
   const commandId = "in-flight-command";
 
@@ -74,7 +78,6 @@ test("command lease: active unexpired command with 0 events returns COMMAND_IN_P
     payload: { item: "Bike", quantity: 1, amount: 500, simulateFailureAt: null },
     workerId: "worker-1",
     leaseTtlMs: 2000,
-    now: currentTime,
   });
 
   // Worker 2 attempts execution at currentTime = 2000 (lease still valid until 3000)
@@ -83,7 +86,6 @@ test("command lease: active unexpired command with 0 events returns COMMAND_IN_P
     commandStore,
     eventStore,
     workerId: "worker-2",
-    now: () => currentTime,
   });
 
   assert.throws(
@@ -107,7 +109,7 @@ test("command lease: active unexpired command with 0 events returns COMMAND_IN_P
 
 test("command lease: expired command with 0 events is safely taken over by new worker with incremented fencing token", () => {
   let currentTime = 1000;
-  const commandStore = new InMemoryCommandStore();
+  const commandStore = new InMemoryCommandStore({ now: () => currentTime });
   const eventStore = new InMemoryEventStore({ commandStore, now: () => currentTime });
   const commandId = "abandoned-processing-command";
   const diagnostics = [];
@@ -119,7 +121,6 @@ test("command lease: expired command with 0 events is safely taken over by new w
     payload: { item: "Phone", quantity: 1, amount: 800, simulateFailureAt: null },
     workerId: "worker-1",
     leaseTtlMs: 2000,
-    now: currentTime,
   });
 
   // Time advances to t=3500 (lease is expired, 0 events committed)
@@ -129,7 +130,6 @@ test("command lease: expired command with 0 events is safely taken over by new w
     eventStore,
     workerId: "worker-2",
     leaseTtlMs: 3000,
-    now: () => currentTime,
     diagnosticReporter: (d) => diagnostics.push(d),
   });
 
@@ -159,7 +159,7 @@ test("command lease: expired command with 0 events is safely taken over by new w
 
 test("fencing: zombie worker with stale fencing token is rejected at EventStore.append", () => {
   let currentTime = 1000;
-  const commandStore = new InMemoryCommandStore();
+  const commandStore = new InMemoryCommandStore({ now: () => currentTime });
   const eventStore = new InMemoryEventStore({ commandStore, now: () => currentTime });
   const commandId = "zombie-test-command";
 
@@ -170,7 +170,6 @@ test("fencing: zombie worker with stale fencing token is rejected at EventStore.
     payload: { item: "Tablet", quantity: 1, amount: 400, simulateFailureAt: null },
     workerId: "worker-1",
     leaseTtlMs: 1000,
-    now: currentTime,
   });
 
   // Worker 2 takes over at t=2500 (token becomes 2, expires at 4500)
@@ -179,7 +178,6 @@ test("fencing: zombie worker with stale fencing token is rejected at EventStore.
     commandId,
     workerId: "worker-2",
     leaseTtlMs: 2000,
-    now: currentTime,
   });
   assert.equal(takeover.success, true);
   assert.equal(takeover.record.leaseToken, 2);
@@ -242,7 +240,8 @@ test("SQLite atomic fencing check rejects stale append in shared database", () =
   const db = createSqliteDatabase({ path: dbPath });
 
   try {
-    const commandStore = new SqliteCommandStore({ db });
+    let currentTime = 1000;
+    const commandStore = new SqliteCommandStore({ db, now: () => currentTime });
     const eventStore = new SqliteEventStore({ db, now: () => 2500 });
     const commandId = "sqlite-fencing-cmd";
 
@@ -253,15 +252,14 @@ test("SQLite atomic fencing check rejects stale append in shared database", () =
       payload: { item: "Monitor", quantity: 1, amount: 300 },
       workerId: "worker-1",
       leaseTtlMs: 1000,
-      now: 1000,
     });
 
     // Worker 2 takes over after expiry at t=2500 -> token becomes 2
+    currentTime = 2500;
     const takeover = commandStore.takeOverExpired({
       commandId,
       workerId: "worker-2",
       leaseTtlMs: 2000,
-      now: 2500,
     });
     assert.equal(takeover.success, true);
     assert.equal(takeover.record.leaseToken, 2);
@@ -320,7 +318,7 @@ test("SQLite atomic fencing check rejects stale append in shared database", () =
 
 test("partial commit protection: command with >=1 committed events CANNOT be taken over even if expired", () => {
   let currentTime = 1000;
-  const commandStore = new InMemoryCommandStore();
+  const commandStore = new InMemoryCommandStore({ now: () => currentTime });
   const eventStore = new InMemoryEventStore({ commandStore, now: () => currentTime });
   commandStore.setEventStore(eventStore);
   const commandId = "partial-commit-expired-lease";
@@ -332,7 +330,6 @@ test("partial commit protection: command with >=1 committed events CANNOT be tak
     payload: { item: "Desk", quantity: 1, amount: 600, simulateFailureAt: null },
     workerId: "worker-1",
     leaseTtlMs: 1000,
-    now: currentTime,
   });
 
   // Worker 1 commits 1 event before crashing / pausing
@@ -361,7 +358,6 @@ test("partial commit protection: command with >=1 committed events CANNOT be tak
     commandId,
     workerId: "worker-2",
     leaseTtlMs: 2000,
-    now: currentTime,
   });
   assert.equal(takeover.success, false);
   assert.equal(takeover.reason, "HAS_EVENTS");
@@ -371,7 +367,6 @@ test("partial commit protection: command with >=1 committed events CANNOT be tak
     commandStore,
     eventStore,
     workerId: "worker-2",
-    now: () => currentTime,
   });
 
   assert.throws(
@@ -396,7 +391,7 @@ test("authoritative event in events table + stale/empty command event_range bloc
 
   try {
     let currentTime = 1000;
-    const commandStore = new SqliteCommandStore({ db });
+    const commandStore = new SqliteCommandStore({ db, now: () => currentTime });
     const eventStore = new SqliteEventStore({ db, now: () => currentTime });
     const commandId = "unrecorded-event-cmd";
 
@@ -407,7 +402,6 @@ test("authoritative event in events table + stale/empty command event_range bloc
       payload: { item: "Camera", quantity: 1, amount: 500 },
       workerId: "worker-1",
       leaseTtlMs: 1000,
-      now: currentTime,
     });
 
     // Worker 1 commits event directly to eventStore at t=1500, but crashes BEFORE commandStore.recordEvent()
@@ -439,7 +433,6 @@ test("authoritative event in events table + stale/empty command event_range bloc
       commandId,
       workerId: "worker-2",
       leaseTtlMs: 2000,
-      now: currentTime,
     });
 
     // Takeover MUST be rejected because authoritative events table contains an event
@@ -462,7 +455,7 @@ test("missing fencing token cannot append for leased command (FENCING_TOKEN_REQU
   const db = createSqliteDatabase({ path: dbPath });
 
   try {
-    const commandStore = new SqliteCommandStore({ db });
+    const commandStore = new SqliteCommandStore({ db, now: () => 1000 });
     const eventStore = new SqliteEventStore({ db });
     const commandId = "leased-no-token-cmd";
 
@@ -472,7 +465,6 @@ test("missing fencing token cannot append for leased command (FENCING_TOKEN_REQU
       payload: { item: "Speaker", quantity: 1, amount: 200 },
       workerId: "worker-1",
       leaseTtlMs: 5000,
-      now: 1000,
     });
 
     const event = createDomainEvent({
@@ -518,7 +510,7 @@ test("missing fencing token cannot append for leased command (FENCING_TOKEN_REQU
   }
 
   // Test In-Memory store parity
-  const memCommandStore = new InMemoryCommandStore();
+  const memCommandStore = new InMemoryCommandStore({ now: () => 1000 });
   const memEventStore = new InMemoryEventStore({ commandStore: memCommandStore });
   memCommandStore.reserve({
     commandId: "mem-no-token-cmd",
@@ -526,7 +518,6 @@ test("missing fencing token cannot append for leased command (FENCING_TOKEN_REQU
     payload: { item: "Speaker", quantity: 1, amount: 200 },
     workerId: "worker-1",
     leaseTtlMs: 5000,
-    now: 1000,
   });
 
   const memEvent = createDomainEvent({
@@ -560,7 +551,8 @@ test("stale token rejected while command is STILL processing under new owner", (
   const db = createSqliteDatabase({ path: dbPath });
 
   try {
-    const commandStore = new SqliteCommandStore({ db });
+    let currentTime = 1000;
+    const commandStore = new SqliteCommandStore({ db, now: () => currentTime });
     const eventStore = new SqliteEventStore({ db, now: () => 2500 });
     const commandId = "still-proc-cmd";
 
@@ -571,15 +563,14 @@ test("stale token rejected while command is STILL processing under new owner", (
       payload: { item: "Headphones", quantity: 1, amount: 150 },
       workerId: "worker-1",
       leaseTtlMs: 1000,
-      now: 1000,
     });
 
     // Worker 2 takes over at t=2500 -> token becomes 2, status remains PROCESSING
+    currentTime = 2500;
     const takeover = commandStore.takeOverExpired({
       commandId,
       workerId: "worker-2",
       leaseTtlMs: 3000,
-      now: 2500,
     });
     assert.equal(takeover.success, true);
     assert.equal(takeover.record.leaseToken, 2);
@@ -646,7 +637,8 @@ test("separation of protection layers: status check vs token check tested separa
   const db = createSqliteDatabase({ path: dbPath });
 
   try {
-    const commandStore = new SqliteCommandStore({ db });
+    let currentTime = 1000;
+    const commandStore = new SqliteCommandStore({ db, now: () => currentTime });
     const eventStore = new SqliteEventStore({ db });
     const cmdProcessing = "cmd-layer-processing";
     const cmdCompleted = "cmd-layer-completed";
@@ -658,13 +650,12 @@ test("separation of protection layers: status check vs token check tested separa
       payload: { item: "Item1", quantity: 1, amount: 100 },
       workerId: "worker-1",
       leaseTtlMs: 1000,
-      now: 1000,
     });
+    currentTime = 2500;
     commandStore.takeOverExpired({
       commandId: cmdProcessing,
       workerId: "worker-2",
       leaseTtlMs: 2000,
-      now: 2500,
     });
 
     const evtForProcessing = createDomainEvent({
@@ -689,13 +680,13 @@ test("separation of protection layers: status check vs token check tested separa
     );
 
     // Layer 2: Status check rejection when status is 'completed' (even if presenting historical token 1)
+    currentTime = 1000;
     commandStore.reserve({
       commandId: cmdCompleted,
       commandType: "CHECKOUT",
       payload: { item: "Item2", quantity: 1, amount: 100 },
       workerId: "worker-1",
       leaseTtlMs: 5000,
-      now: 1000,
     });
     commandStore.complete(cmdCompleted, { aggregateId: 102, status: "completed" }, { fencingToken: 1 });
 
@@ -769,13 +760,16 @@ test("migrated legacy SQLite partial commit cannot be taken over", () => {
   rawDb.close();
 
   // Open with storage adapters -> triggers v1 to v2 migration
-  const adapters = createStorageAdapters({ type: "sqlite", dbPath });
+  const adapters = createStorageAdapters({
+    type: "sqlite",
+    dbPath,
+    leaseNow: () => Date.now() + 10000,
+  });
   try {
     const takeover = adapters.commandStore.takeOverExpired({
       commandId: legacyCmdId,
       workerId: "worker-new",
       leaseTtlMs: 2000,
-      now: Date.now() + 10000,
     });
 
     // Authoritative event in events table prevents takeover even on migrated legacy databases

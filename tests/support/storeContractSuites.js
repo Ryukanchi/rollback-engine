@@ -3,6 +3,31 @@ const assert = require("node:assert/strict");
 
 const { EVENT_TYPES, createDomainEvent } = require("../../src/domain/events");
 
+/**
+ * Lease time belongs to the command store, so a contract test cannot hand a
+ * chosen `now` to a single mutation. It positions the store's own clock at the
+ * moment it means, and the store decides from there. Both adapters are held to
+ * this identically.
+ */
+const leaseClocks = new WeakMap();
+
+function createClockedStore(createStore) {
+  const clock = { ms: 1000 };
+  const store = createStore({ now: () => clock.ms });
+  leaseClocks.set(store, clock);
+  return store;
+}
+
+/** Positions `store`'s lease clock at `ms`, then hands the store back. */
+function at(store, ms) {
+  const clock = leaseClocks.get(store);
+  if (!clock) {
+    throw new Error("this store has no test-owned lease clock to position");
+  }
+  clock.ms = ms;
+  return store;
+}
+
 function createEvent({
   eventId,
   aggregateId = 1,
@@ -389,55 +414,54 @@ function registerCommandStoreContract({ adapterName, createStore }) {
     });
 
     test("revokes only a processing, correctly-generationed, still-expired command", () => {
-      const store = createStore();
+      const store = createClockedStore(createStore);
       const descriptor = commandDescriptor("revoke-cmd");
       const error = { code: "COMMAND_EXECUTION_INTERRUPTED_AFTER_COMMIT" };
 
       assert.deepEqual(
-        store.revokeExpired({ commandId: "absent-cmd", expectedToken: 1, now: 9000, error }),
+        at(store, 9000).revokeExpired({ commandId: "absent-cmd", expectedToken: 1, error }),
         { success: false, reason: "NOT_FOUND" }
       );
 
-      store.reserve({ ...descriptor, workerId: "worker-a", leaseTtlMs: 1000, now: 1000 });
+      at(store, 1000).reserve({ ...descriptor, workerId: "worker-a", leaseTtlMs: 1000 });
 
       // Still inside the lease: a third party may not revoke yet.
       assert.deepEqual(
-        store.revokeExpired({ commandId: descriptor.commandId, expectedToken: 1, now: 1500, error }),
+        at(store, 1500).revokeExpired({ commandId: descriptor.commandId, expectedToken: 1, error }),
         { success: false, reason: "NOT_EXPIRED" }
       );
 
       // Expired, but naming a generation that is not the current one.
       assert.deepEqual(
-        store.revokeExpired({ commandId: descriptor.commandId, expectedToken: 99, now: 9000, error }),
+        at(store, 9000).revokeExpired({ commandId: descriptor.commandId, expectedToken: 99, error }),
         { success: false, reason: "TOKEN_MISMATCH" }
       );
 
       // A terminal command is no longer revocable.
       store.complete(descriptor.commandId, { ok: true }, { fencingToken: 1 });
       assert.deepEqual(
-        store.revokeExpired({ commandId: descriptor.commandId, expectedToken: 1, now: 9000, error }),
+        at(store, 9000).revokeExpired({ commandId: descriptor.commandId, expectedToken: 1, error }),
         { success: false, reason: "NOT_PROCESSING" }
       );
 
       // Argument contract.
       assert.throws(() =>
-        store.revokeExpired({ commandId: descriptor.commandId, now: 9000, error })
+        at(store, 9000).revokeExpired({ commandId: descriptor.commandId, error })
       );
       assert.throws(() =>
-        store.revokeExpired({ commandId: descriptor.commandId, expectedToken: 1, now: 9000 })
+        at(store, 9000).revokeExpired({ commandId: descriptor.commandId, expectedToken: 1 })
       );
     });
 
     test("allows safe takeover only when processing, expired, and without committed events", () => {
-      const store = createStore();
+      const store = createClockedStore(createStore);
       const descriptor = commandDescriptor("takeover-cmd");
 
       // Worker A reserves with lease TTL 1000ms at now = 1000
-      const initial = store.reserve({
+      const initial = at(store, 1000).reserve({
         ...descriptor,
         workerId: "worker-a",
         leaseTtlMs: 1000,
-        now: 1000,
       });
       assert.equal(initial.created, true);
       assert.equal(initial.record.leaseOwner, "worker-a");
@@ -445,21 +469,19 @@ function registerCommandStoreContract({ adapterName, createStore }) {
       assert.equal(initial.record.leaseExpiresAt, 2000);
 
       // Attempt takeover before expiry (at now = 1500)
-      const earlyTakeover = store.takeOverExpired({
+      const earlyTakeover = at(store, 1500).takeOverExpired({
         commandId: descriptor.commandId,
         workerId: "worker-b",
         leaseTtlMs: 1000,
-        now: 1500,
       });
       assert.equal(earlyTakeover.success, false);
       assert.equal(earlyTakeover.reason, "NOT_EXPIRED");
 
       // Attempt takeover after expiry (at now = 2001)
-      const validTakeover = store.takeOverExpired({
+      const validTakeover = at(store, 2001).takeOverExpired({
         commandId: descriptor.commandId,
         workerId: "worker-b",
         leaseTtlMs: 1000,
-        now: 2001,
       });
       assert.equal(validTakeover.success, true);
       assert.equal(validTakeover.record.leaseOwner, "worker-b");
@@ -472,34 +494,31 @@ function registerCommandStoreContract({ adapterName, createStore }) {
       });
 
       // Attempt takeover after events committed (even if expired at now = 5000)
-      const postEventTakeover = store.takeOverExpired({
+      const postEventTakeover = at(store, 5000).takeOverExpired({
         commandId: descriptor.commandId,
         workerId: "worker-c",
         leaseTtlMs: 1000,
-        now: 5000,
       });
       assert.equal(postEventTakeover.success, false);
       assert.equal(postEventTakeover.reason, "HAS_EVENTS");
     });
 
     test("renews lease only for active owner and valid fencing token", () => {
-      const store = createStore();
+      const store = createClockedStore(createStore);
       const descriptor = commandDescriptor("renewal-cmd");
 
-      store.reserve({
+      at(store, 1000).reserve({
         ...descriptor,
         workerId: "worker-a",
         leaseTtlMs: 1000,
-        now: 1000,
       });
 
       // Valid renewal by Worker A
-      const renewed = store.renewLease({
+      const renewed = at(store, 1500).renewLease({
         commandId: descriptor.commandId,
         workerId: "worker-a",
         fencingToken: 1,
         leaseTtlMs: 2000,
-        now: 1500,
       });
       assert.equal(renewed.renewed, true);
       assert.equal(renewed.leaseExpiresAt, 3500);
@@ -507,12 +526,11 @@ function registerCommandStoreContract({ adapterName, createStore }) {
       // Impostor Worker B renewal rejected
       assert.throws(
         () =>
-          store.renewLease({
+          at(store, 2000).renewLease({
             commandId: descriptor.commandId,
             workerId: "worker-b",
             fencingToken: 1,
             leaseTtlMs: 1000,
-            now: 2000,
           }),
         (err) => err.code === "FENCING_TOKEN_STALE"
       );
@@ -520,12 +538,11 @@ function registerCommandStoreContract({ adapterName, createStore }) {
       // Stale fencing token rejected
       assert.throws(
         () =>
-          store.renewLease({
+          at(store, 2000).renewLease({
             commandId: descriptor.commandId,
             workerId: "worker-a",
             fencingToken: 99,
             leaseTtlMs: 1000,
-            now: 2000,
           }),
         (err) => err.code === "FENCING_TOKEN_STALE"
       );
@@ -534,11 +551,10 @@ function registerCommandStoreContract({ adapterName, createStore }) {
       // existing generation, so owner identity alone carries no authority.
       assert.throws(
         () =>
-          store.renewLease({
+          at(store, 2000).renewLease({
             commandId: descriptor.commandId,
             workerId: "worker-a",
             leaseTtlMs: 1000,
-            now: 2000,
           }),
         (err) => err.code === "FENCING_TOKEN_REQUIRED"
       );
@@ -546,22 +562,20 @@ function registerCommandStoreContract({ adapterName, createStore }) {
     });
 
     test("fences complete and fail transitions against stale fencing tokens", () => {
-      const store = createStore();
+      const store = createClockedStore(createStore);
       const descriptor = commandDescriptor("fencing-test-cmd");
 
-      store.reserve({
+      at(store, 1000).reserve({
         ...descriptor,
         workerId: "worker-a",
         leaseTtlMs: 1000,
-        now: 1000,
       });
 
       // Worker B takes over after expiration
-      const takeover = store.takeOverExpired({
+      const takeover = at(store, 2500).takeOverExpired({
         commandId: descriptor.commandId,
         workerId: "worker-b",
         leaseTtlMs: 2000,
-        now: 2500,
       });
       assert.equal(takeover.success, true);
       assert.equal(takeover.record.leaseToken, 2);

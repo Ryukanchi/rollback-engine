@@ -22,7 +22,7 @@ registerEventStoreContract({
 
 registerCommandStoreContract({
   adapterName: "InMemoryCommandStore",
-  createStore: () => new InMemoryCommandStore(),
+  createStore: ({ now } = {}) => new InMemoryCommandStore({ now }),
 });
 
 registerSnapshotStoreContract({

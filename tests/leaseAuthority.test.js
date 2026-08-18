@@ -51,13 +51,48 @@ function createEvent({ commandId, aggregateId = 1, sequence = 1, eventId }) {
   });
 }
 
+/**
+ * Lease time belongs to the command store, so a test cannot hand a chosen `now`
+ * to a single mutation. Every store built here carries a mutable clock; a test
+ * positions that clock at the moment it means and the store decides from there.
+ */
+const leaseClocks = new WeakMap();
+
+function trackLeaseClock(store, clock) {
+  leaseClocks.set(store, clock);
+  return store;
+}
+
+/** Positions `store`'s lease clock at `ms`, then hands the store back. */
+function at(store, ms) {
+  const clock = leaseClocks.get(store);
+  if (!clock) {
+    throw new Error("this store has no test-owned lease clock to position");
+  }
+  clock.ms = ms;
+  return store;
+}
+
 function createAdapters(type) {
-  return type === "sqlite"
-    ? createStorageAdapters({
-        type: "sqlite",
-        dbPath: join(tmpdir(), `rollback-lease-${randomUUID()}.db`),
-      })
-    : createStorageAdapters({ type: "memory" });
+  const leaseClock = { ms: 1000 };
+  const leaseNow = () => leaseClock.ms;
+  const adapters =
+    type === "sqlite"
+      ? createStorageAdapters({
+          type: "sqlite",
+          dbPath: join(tmpdir(), `rollback-lease-${randomUUID()}.db`),
+          leaseNow,
+        })
+      : createStorageAdapters({ type: "memory", leaseNow });
+  trackLeaseClock(adapters.commandStore, leaseClock);
+  adapters.leaseClock = leaseClock;
+  return adapters;
+}
+
+/** A directly wired SQLite store plus the lease clock the test drives it with. */
+function sqliteStoreWithClock(db, startMs) {
+  const clock = { ms: startMs };
+  return trackLeaseClock(new SqliteCommandStore({ db, now: () => clock.ms }), clock);
 }
 
 function reserve(
@@ -65,13 +100,12 @@ function reserve(
   commandId,
   { workerId = "worker-A", leaseTtlMs = TTL, now = 1000, payload = { ...PAYLOAD } } = {}
 ) {
-  return store.reserve({
+  return at(store, now).reserve({
     commandId,
     commandType: "CHECKOUT",
     payload,
     workerId,
     leaseTtlMs,
-    now,
   });
 }
 
@@ -103,8 +137,9 @@ for (const storeType of ["memory", "sqlite"]) {
      */
     function runSlowCheckout({ slowAt, command = PAYLOAD, commandId }) {
       const adapters = createAdapters(storeType);
-      let clock = 1_000_000;
-      const now = () => clock;
+      const leaseClock = adapters.leaseClock;
+      leaseClock.ms = 1_000_000;
+      const now = () => leaseClock.ms;
       if (typeof adapters.eventStore.setNow === "function") {
         adapters.eventStore.setNow(now);
       }
@@ -115,7 +150,7 @@ for (const storeType of ["memory", "sqlite"]) {
       adapters.eventStore.append = (event, options) => {
         appends += 1;
         if (slowAt === `before-event-${appends}`) {
-          clock += LONG_STEP;
+          leaseClock.ms += LONG_STEP;
         }
         observations.push({
           at: `append-${appends}`,
@@ -147,8 +182,7 @@ for (const storeType of ["memory", "sqlite"]) {
         stateRepository: adapters.stateRepository,
         workerId: "worker-A",
         leaseTtlMs: TTL,
-        now,
-        clock: () => new Date(clock).toISOString(),
+        clock: () => new Date(now()).toISOString(),
       });
 
       const result = engine.checkout(command, { commandId });
@@ -222,10 +256,9 @@ for (const storeType of ["memory", "sqlite"]) {
       const adapters = createAdapters(storeType);
       const event = seedPartialCommit(adapters, "rev-ok");
 
-      const outcome = adapters.commandStore.revokeExpired({
+      const outcome = at(adapters.commandStore, 60_000).revokeExpired({
         commandId: "rev-ok",
         expectedToken: 1,
-        now: 60_000,
         error: REVOKE_ERROR,
       });
 
@@ -251,18 +284,16 @@ for (const storeType of ["memory", "sqlite"]) {
       assert.ok(observed.leaseExpiresAt <= 60_000, "precondition: observed as expired");
 
       // ... but the healthy owner renews before the revocation is attempted.
-      adapters.commandStore.renewLease({
+      at(adapters.commandStore, 60_000).renewLease({
         commandId: "rev-ce12",
         workerId: "worker-A",
         fencingToken: 1,
         leaseTtlMs: TTL,
-        now: 60_000,
       });
 
-      const outcome = adapters.commandStore.revokeExpired({
+      const outcome = at(adapters.commandStore, 60_000).revokeExpired({
         commandId: "rev-ce12",
         expectedToken: 1,
-        now: 60_000,
         error: REVOKE_ERROR,
       });
 
@@ -279,10 +310,9 @@ for (const storeType of ["memory", "sqlite"]) {
       // rejection above was the expiry revalidation and nothing else.
       const control = createAdapters(storeType);
       seedPartialCommit(control, "rev-ce12");
-      const controlOutcome = control.commandStore.revokeExpired({
+      const controlOutcome = at(control.commandStore, 60_000).revokeExpired({
         commandId: "rev-ce12",
         expectedToken: 1,
-        now: 60_000,
         error: REVOKE_ERROR,
       });
       assert.equal(controlOutcome.success, true);
@@ -299,10 +329,9 @@ for (const storeType of ["memory", "sqlite"]) {
       adapters.eventStore.append(event, { expectedVersion: 0, fencingToken: 1 });
       assert.equal(adapters.commandStore.get("rev-hist").eventRange, null);
 
-      const outcome = adapters.commandStore.revokeExpired({
+      const outcome = at(adapters.commandStore, 60_000).revokeExpired({
         commandId: "rev-hist",
         expectedToken: 1,
-        now: 60_000,
         error: REVOKE_ERROR,
       });
 
@@ -322,10 +351,9 @@ for (const storeType of ["memory", "sqlite"]) {
       assert.equal(adapters.commandStore.get("rev-atomic").eventRange.eventIds.length, 1);
       assert.equal(adapters.eventStore.getByCommandId("rev-atomic").length, 2);
 
-      const outcome = adapters.commandStore.revokeExpired({
+      const outcome = at(adapters.commandStore, 60_000).revokeExpired({
         commandId: "rev-atomic",
         expectedToken: 1,
-        now: 60_000,
         error: REVOKE_ERROR,
       });
 
@@ -346,10 +374,9 @@ for (const storeType of ["memory", "sqlite"]) {
       const adapters = createAdapters(storeType);
       reserve(adapters.commandStore, "rev-zero");
 
-      const outcome = adapters.commandStore.revokeExpired({
+      const outcome = at(adapters.commandStore, 60_000).revokeExpired({
         commandId: "rev-zero",
         expectedToken: 1,
-        now: 60_000,
         error: REVOKE_ERROR,
       });
 
@@ -363,10 +390,9 @@ for (const storeType of ["memory", "sqlite"]) {
       const adapters = createAdapters(storeType);
       seedPartialCommit(adapters, "rev-gen");
 
-      const outcome = adapters.commandStore.revokeExpired({
+      const outcome = at(adapters.commandStore, 60_000).revokeExpired({
         commandId: "rev-gen",
         expectedToken: 99,
-        now: 60_000,
         error: REVOKE_ERROR,
       });
 
@@ -384,10 +410,9 @@ for (const storeType of ["memory", "sqlite"]) {
       const seeded = seedPartialCommit(first, "race-append");
       const late = createEvent({ commandId: "race-append", sequence: 2 });
       first.eventStore.append(late, { expectedVersion: 1, fencingToken: 1 });
-      const afterAppend = first.commandStore.revokeExpired({
+      const afterAppend = at(first.commandStore, 60_000).revokeExpired({
         commandId: "race-append",
         expectedToken: 1,
-        now: 60_000,
         error: REVOKE_ERROR,
       });
       assert.equal(afterAppend.success, true);
@@ -401,10 +426,9 @@ for (const storeType of ["memory", "sqlite"]) {
       // Revoke first: the owner's append is rejected.
       const second = createAdapters(storeType);
       seedPartialCommit(second, "race-append");
-      second.commandStore.revokeExpired({
+      at(second.commandStore, 60_000).revokeExpired({
         commandId: "race-append",
         expectedToken: 1,
-        now: 60_000,
         error: REVOKE_ERROR,
       });
       assert.throws(
@@ -426,10 +450,9 @@ for (const storeType of ["memory", "sqlite"]) {
       const completeFirst = createAdapters(storeType);
       seedPartialCommit(completeFirst, "race-complete");
       completeFirst.commandStore.complete("race-complete", { ok: true }, { fencingToken: 1 });
-      const revokeAfter = completeFirst.commandStore.revokeExpired({
+      const revokeAfter = at(completeFirst.commandStore, 60_000).revokeExpired({
         commandId: "race-complete",
         expectedToken: 1,
-        now: 60_000,
         error: REVOKE_ERROR,
       });
       assert.equal(revokeAfter.success, false);
@@ -443,10 +466,9 @@ for (const storeType of ["memory", "sqlite"]) {
       const revokeFirst = createAdapters(storeType);
       seedPartialCommit(revokeFirst, "race-complete");
       assert.equal(
-        revokeFirst.commandStore.revokeExpired({
+        at(revokeFirst.commandStore, 60_000).revokeExpired({
           commandId: "race-complete",
           expectedToken: 1,
-          now: 60_000,
           error: REVOKE_ERROR,
         }).success,
         true
@@ -466,18 +488,16 @@ for (const storeType of ["memory", "sqlite"]) {
       // Renew first -> revocation is refused as not expired (this is CE-12).
       const renewFirst = createAdapters(storeType);
       seedPartialCommit(renewFirst, "race-renew");
-      renewFirst.commandStore.renewLease({
+      at(renewFirst.commandStore, 60_000).renewLease({
         commandId: "race-renew",
         workerId: "worker-A",
         fencingToken: 1,
         leaseTtlMs: TTL,
-        now: 60_000,
       });
       assert.equal(
-        renewFirst.commandStore.revokeExpired({
+        at(renewFirst.commandStore, 60_000).revokeExpired({
           commandId: "race-renew",
           expectedToken: 1,
-          now: 60_000,
           error: REVOKE_ERROR,
         }).reason,
         "NOT_EXPIRED"
@@ -492,22 +512,20 @@ for (const storeType of ["memory", "sqlite"]) {
       const revokeFirst = createAdapters(storeType);
       seedPartialCommit(revokeFirst, "race-renew");
       assert.equal(
-        revokeFirst.commandStore.revokeExpired({
+        at(revokeFirst.commandStore, 60_000).revokeExpired({
           commandId: "race-renew",
           expectedToken: 1,
-          now: 60_000,
           error: REVOKE_ERROR,
         }).success,
         true
       );
       assert.throws(
         () =>
-          revokeFirst.commandStore.renewLease({
+          at(revokeFirst.commandStore, 60_000).renewLease({
             commandId: "race-renew",
             workerId: "worker-A",
             fencingToken: 1,
             leaseTtlMs: TTL,
-            now: 60_000,
           }),
         /is not processing/
       );
@@ -518,19 +536,17 @@ for (const storeType of ["memory", "sqlite"]) {
       const adapters = createAdapters(storeType);
       const event = seedPartialCommit(adapters, "rev-ack");
 
-      const first = adapters.commandStore.revokeExpired({
+      const first = at(adapters.commandStore, 60_000).revokeExpired({
         commandId: "rev-ack",
         expectedToken: 1,
-        now: 60_000,
         error: REVOKE_ERROR,
       });
       assert.equal(first.success, true);
       const afterFirst = adapters.commandStore.get("rev-ack");
 
-      const second = adapters.commandStore.revokeExpired({
+      const second = at(adapters.commandStore, 60_000).revokeExpired({
         commandId: "rev-ack",
         expectedToken: 1,
-        now: 60_000,
         error: REVOKE_ERROR,
       });
       assert.equal(second.success, false);
@@ -550,12 +566,11 @@ for (const storeType of ["memory", "sqlite"]) {
       seedPartialCommit(adapters, "suspend-1");
 
       assert.equal(
-        adapters.commandStore.renewLease({
+        at(adapters.commandStore, 60_000).renewLease({
           commandId: "suspend-1",
           workerId: "worker-A",
           fencingToken: 1,
           leaseTtlMs: TTL,
-          now: 60_000,
         }).renewed,
         true
       );
@@ -574,11 +589,10 @@ for (const storeType of ["memory", "sqlite"]) {
     test("SUSPEND-2: after a zero-event takeover the old generation is rejected", () => {
       const adapters = createAdapters(storeType);
       reserve(adapters.commandStore, "suspend-2");
-      const takeover = adapters.commandStore.takeOverExpired({
+      const takeover = at(adapters.commandStore, 60_000).takeOverExpired({
         commandId: "suspend-2",
         workerId: "worker-B",
         leaseTtlMs: TTL,
-        now: 60_000,
         expectedToken: 1,
       });
       assert.equal(takeover.success, true);
@@ -586,12 +600,11 @@ for (const storeType of ["memory", "sqlite"]) {
 
       assert.throws(
         () =>
-          adapters.commandStore.renewLease({
+          at(adapters.commandStore, 60_000).renewLease({
             commandId: "suspend-2",
             workerId: "worker-A",
             fencingToken: 1,
             leaseTtlMs: TTL,
-            now: 60_000,
           }),
         (error) => error.code === "FENCING_TOKEN_STALE"
       );
@@ -613,21 +626,19 @@ for (const storeType of ["memory", "sqlite"]) {
     test("SUSPEND-3: after revocation the old execution path is rejected by status", () => {
       const adapters = createAdapters(storeType);
       seedPartialCommit(adapters, "suspend-3");
-      adapters.commandStore.revokeExpired({
+      at(adapters.commandStore, 60_000).revokeExpired({
         commandId: "suspend-3",
         expectedToken: 1,
-        now: 60_000,
         error: REVOKE_ERROR,
       });
 
       assert.throws(
         () =>
-          adapters.commandStore.renewLease({
+          at(adapters.commandStore, 60_000).renewLease({
             commandId: "suspend-3",
             workerId: "worker-A",
             fencingToken: 1,
             leaseTtlMs: TTL,
-            now: 60_000,
           }),
         /is not processing/
       );
@@ -649,11 +660,10 @@ for (const storeType of ["memory", "sqlite"]) {
     test("OWNER-1: the same owner across generations is still fenced", () => {
       const adapters = createAdapters(storeType);
       reserve(adapters.commandStore, "owner-1", { workerId: "worker-A" });
-      const takeover = adapters.commandStore.takeOverExpired({
+      const takeover = at(adapters.commandStore, 60_000).takeOverExpired({
         commandId: "owner-1",
         workerId: "worker-A", // same identity, new generation
         leaseTtlMs: TTL,
-        now: 60_000,
         expectedToken: 1,
       });
       assert.equal(takeover.record.leaseToken, 2);
@@ -661,12 +671,11 @@ for (const storeType of ["memory", "sqlite"]) {
 
       assert.throws(
         () =>
-          adapters.commandStore.renewLease({
+          at(adapters.commandStore, 60_000).renewLease({
             commandId: "owner-1",
             workerId: "worker-A",
             fencingToken: 1,
             leaseTtlMs: TTL,
-            now: 60_000,
           }),
         (error) => {
           assert.equal(error.code, "FENCING_TOKEN_STALE");
@@ -677,12 +686,11 @@ for (const storeType of ["memory", "sqlite"]) {
       );
       // Control: the identical call from the live generation succeeds.
       assert.equal(
-        adapters.commandStore.renewLease({
+        at(adapters.commandStore, 60_000).renewLease({
           commandId: "owner-1",
           workerId: "worker-A",
           fencingToken: 2,
           leaseTtlMs: TTL,
-          now: 60_000,
         }).renewed,
         true
       );
@@ -704,7 +712,6 @@ for (const storeType of ["memory", "sqlite"]) {
         stateRepository: adapters.stateRepository,
         workerId,
         leaseTtlMs: TTL,
-        now,
         clock: () => new Date(now()).toISOString(),
       });
     }
@@ -713,9 +720,11 @@ for (const storeType of ["memory", "sqlite"]) {
       const adapters = createAdapters(storeType);
       // A real epoch base keeps engine-generated timestamps after the seeded one.
       const base = Date.parse("2026-08-15T12:00:00.000Z");
-      let clock = base;
+      const leaseClock = adapters.leaseClock;
+      leaseClock.ms = base;
+      const clockOf = () => leaseClock.ms;
       if (typeof adapters.eventStore.setNow === "function") {
-        adapters.eventStore.setNow(() => clock);
+        adapters.eventStore.setNow(clockOf);
       }
       const event = seedPartialCommit(adapters, "death-1", {
         now: base,
@@ -723,14 +732,14 @@ for (const storeType of ["memory", "sqlite"]) {
       });
 
       // The owner is gone. Its lease is still valid, so a retry must wait.
-      clock = base + 1000;
-      const engine = engineOn(adapters, "worker-B", () => clock);
+      leaseClock.ms = base + 1000;
+      const engine = engineOn(adapters, "worker-B", clockOf);
       assert.throws(
         () => engine.checkout(PAYLOAD, { commandId: "death-1" }),
         (error) => error.code === "COMMAND_IN_PROGRESS"
       );
 
-      clock = base + 90_000;
+      leaseClock.ms = base + 90_000;
       const outcomes = [];
       for (let attempt = 0; attempt < 3; attempt += 1) {
         try {
@@ -755,11 +764,10 @@ for (const storeType of ["memory", "sqlite"]) {
 
       // Takeover of a partially committed command stays forbidden.
       assert.equal(
-        adapters.commandStore.takeOverExpired({
+        at(adapters.commandStore, leaseClock.ms).takeOverExpired({
           commandId: "death-1",
           workerId: "worker-C",
           leaseTtlMs: TTL,
-          now: clock,
         }).success,
         false
       );
@@ -772,16 +780,18 @@ for (const storeType of ["memory", "sqlite"]) {
 
     test("ZERO-2: a zero-event command completes after expiry when uncontested", () => {
       const adapters = createAdapters(storeType);
-      let clock = 1_000_000;
+      const leaseClock = adapters.leaseClock;
+      leaseClock.ms = 1_000_000;
+      const clockOf = () => leaseClock.ms;
       if (typeof adapters.eventStore.setNow === "function") {
-        adapters.eventStore.setNow(() => clock);
+        adapters.eventStore.setNow(clockOf);
       }
-      const engine = engineOn(adapters, "worker-A", () => clock);
+      const engine = engineOn(adapters, "worker-A", clockOf);
 
       engine.checkout({ ...PAYLOAD, simulateFailureAt: "after_payment" }, { commandId: "zero-setup" });
       assert.equal(engine.replay(1).lifecycle, "rolled_back");
 
-      clock += 10 * LONG_STEP;
+      leaseClock.ms += 10 * LONG_STEP;
       const compensation = engine.compensate(1, "already compensated", { commandId: "zero-2" });
       assert.equal(compensation.events.length, 0, "this path never reaches commitEvent()");
       assert.equal(adapters.commandStore.get("zero-2").status, COMMAND_STATUSES.COMPLETED);
@@ -791,11 +801,10 @@ for (const storeType of ["memory", "sqlite"]) {
     test("ZERO-1/3: an expired zero-event command is taken over, old generation rejected", () => {
       const adapters = createAdapters(storeType);
       reserve(adapters.commandStore, "zero-1");
-      const takeover = adapters.commandStore.takeOverExpired({
+      const takeover = at(adapters.commandStore, 60_000).takeOverExpired({
         commandId: "zero-1",
         workerId: "worker-B",
         leaseTtlMs: TTL,
-        now: 60_000,
         expectedToken: 1,
       });
       assert.equal(takeover.success, true);
@@ -838,7 +847,7 @@ describe("Lease authority under SQLite concurrency", () => {
     const dbPath = join(tmpdir(), `rollback-lease-atomic-${randomUUID()}.db`);
     const dbA = createSqliteDatabase({ path: dbPath, busyTimeout: 50 });
     const dbB = createSqliteDatabase({ path: dbPath, busyTimeout: 50 });
-    const observer = new SqliteCommandStore({ db: dbB });
+    const observer = new SqliteCommandStore({ db: dbB, now: () => 90_000 });
     const commandId = "sqlite-revoke-atomicity";
 
     // Every write connection A performs during the revocation is sampled from a
@@ -866,17 +875,16 @@ describe("Lease authority under SQLite concurrency", () => {
       };
     }
 
-    const storeA = new SqliteCommandStore({ db: samplingDb(dbA) });
+    const storeA = sqliteStoreWithClock(samplingDb(dbA), 1000);
     const eventA = new SqliteEventStore({ db: dbA, now: () => 90_000 });
 
     try {
-      storeA.reserve({
+      at(storeA, 1000).reserve({
         commandId,
         commandType: "CHECKOUT",
         payload: { ...PAYLOAD },
         workerId: "worker-A",
         leaseTtlMs: TTL,
-        now: 1000,
       });
       const first = createEvent({ commandId, sequence: 1 });
       eventA.append(first, { expectedVersion: 0, fencingToken: 1 });
@@ -889,10 +897,9 @@ describe("Lease authority under SQLite concurrency", () => {
       const authoritative = [first.eventId, second.eventId];
 
       sampling = true;
-      const outcome = storeA.revokeExpired({
+      const outcome = at(storeA, 90_000).revokeExpired({
         commandId,
         expectedToken: 1,
-        now: 90_000,
         error: REVOKE_ERROR,
       });
       sampling = false;
@@ -927,8 +934,10 @@ describe("Lease authority under SQLite concurrency", () => {
     const commandId = "sqlite-revoke-cas";
 
     let armed = false;
-    const store = new SqliteCommandStore({
-      db: {
+    const casClock = { ms: 1000 };
+    const store = trackLeaseClock(
+      new SqliteCommandStore({
+        db: {
         prepare(sql) {
           const statement = db.prepare(sql);
           const isCommandSelect = /SELECT[\s\S]*FROM commands[\s\S]*WHERE command_id/i.test(sql);
@@ -950,19 +959,21 @@ describe("Lease authority under SQLite concurrency", () => {
           };
         },
         exec: (sql) => db.exec(sql),
-        close: () => db.close(),
-      },
-    });
+          close: () => db.close(),
+        },
+        now: () => casClock.ms,
+      }),
+      casClock
+    );
     const eventStore = new SqliteEventStore({ db, now: () => 90_000 });
 
     try {
-      store.reserve({
+      at(store, 1000).reserve({
         commandId,
         commandType: "CHECKOUT",
         payload: { ...PAYLOAD },
         workerId: "worker-A",
         leaseTtlMs: TTL,
-        now: 1000,
       });
       const event = createEvent({ commandId, sequence: 1 });
       eventStore.append(event, { expectedVersion: 0, fencingToken: 1 });
@@ -971,10 +982,9 @@ describe("Lease authority under SQLite concurrency", () => {
       armed = true;
       assert.throws(
         () =>
-          store.revokeExpired({
+          at(store, 90_000).revokeExpired({
             commandId,
             expectedToken: 1,
-            now: 90_000,
             error: REVOKE_ERROR,
           }),
         (error) => {
@@ -996,21 +1006,20 @@ describe("Lease authority under SQLite concurrency", () => {
     const dbPath = join(tmpdir(), `rollback-lease-append-${randomUUID()}.db`);
     const dbA = createSqliteDatabase({ path: dbPath, busyTimeout: 50 });
     const dbB = createSqliteDatabase({ path: dbPath, busyTimeout: 50 });
-    const storeB = new SqliteCommandStore({ db: dbB });
+    const storeB = new SqliteCommandStore({ db: dbB, now: () => 90_000 });
     const commandId = "sqlite-append-vs-revoke";
 
     let armed = false;
     let revocation = null;
-    const commandA = new SqliteCommandStore({ db: dbA });
+    const commandA = sqliteStoreWithClock(dbA, 1000);
     const eventA = new SqliteEventStore({
       db: withBarrierAfterSelect(dbA, () => {
         if (!armed) return;
         armed = false;
         try {
-          revocation = storeB.revokeExpired({
+          revocation = at(storeB, 90_000).revokeExpired({
             commandId,
             expectedToken: 1,
-            now: 90_000,
             error: REVOKE_ERROR,
           });
         } catch (error) {
@@ -1021,13 +1030,12 @@ describe("Lease authority under SQLite concurrency", () => {
     });
 
     try {
-      commandA.reserve({
+      at(commandA, 1000).reserve({
         commandId,
         commandType: "CHECKOUT",
         payload: { ...PAYLOAD },
         workerId: "worker-A",
         leaseTtlMs: TTL,
-        now: 1000,
       });
       const first = createEvent({ commandId, sequence: 1 });
       eventA.append(first, { expectedVersion: 0, fencingToken: 1 });
@@ -1076,12 +1084,11 @@ describe("Lease authority under SQLite concurrency", () => {
     [
       "SQLITE-3: renew",
       (store, commandId) =>
-        store.renewLease({
+        at(store, 90_000).renewLease({
           commandId,
           workerId: "worker-A",
           fencingToken: 1,
           leaseTtlMs: TTL,
-          now: 90_000,
         }),
     ],
   ]) {
@@ -1089,37 +1096,36 @@ describe("Lease authority under SQLite concurrency", () => {
       const dbPath = join(tmpdir(), `rollback-lease-owner-${randomUUID()}.db`);
       const dbA = createSqliteDatabase({ path: dbPath, busyTimeout: 50 });
       const dbB = createSqliteDatabase({ path: dbPath, busyTimeout: 50 });
-      const storeB = new SqliteCommandStore({ db: dbB });
+      const storeB = new SqliteCommandStore({ db: dbB, now: () => 90_000 });
       const commandId = "sqlite-owner-vs-revoke";
 
       let armed = false;
       let revocation = null;
-      const storeA = new SqliteCommandStore({
-        db: withBarrierAfterSelect(dbA, () => {
+      const storeA = sqliteStoreWithClock(
+        withBarrierAfterSelect(dbA, () => {
           if (!armed) return;
           armed = false;
           try {
             revocation = storeB.revokeExpired({
               commandId,
               expectedToken: 1,
-              now: 90_000,
               error: REVOKE_ERROR,
             });
           } catch (error) {
             revocation = { success: false, reason: "BLOCKED", error };
           }
         }),
-      });
+        1000
+      );
       const eventA = new SqliteEventStore({ db: dbA, now: () => 90_000 });
 
       try {
-        storeA.reserve({
+        at(storeA, 1000).reserve({
           commandId,
           commandType: "CHECKOUT",
           payload: { ...PAYLOAD },
           workerId: "worker-A",
           leaseTtlMs: TTL,
-          now: 1000,
         });
         const seeded = createEvent({ commandId, sequence: 1 });
         eventA.append(seeded, { expectedVersion: 0, fencingToken: 1 });
@@ -1154,19 +1160,15 @@ describe("Lease authority under SQLite concurrency", () => {
   }
 });
 
+
 // ===========================================================================
 // D-1: a stable NOT_EXPIRED answer to a zero-event takeover must terminate.
 //
 // The Coordinator picks *which* challenge is meaningful from persisted facts;
-// the Store decides temporal eligibility. Those two can disagree the moment
-// they no longer read the same clock. When the Store keeps answering the same
-// stable NOT_EXPIRED, re-resolving the unchanged row cannot make progress, so
-// the answer has to terminate as COMMAND_IN_PROGRESS - exactly as the
-// has-events revocation path already does.
-//
-// The Store clock here is deliberately *earlier* than the Coordinator's. The
-// wrapper does not fake the answer: it hands the real store its own clock and
-// the real expiry logic produces the real NOT_EXPIRED.
+// the Store alone decides temporal eligibility, from its own clock. When the
+// Store keeps answering the same stable NOT_EXPIRED, re-resolving the unchanged
+// row cannot make progress, so the answer has to terminate as
+// COMMAND_IN_PROGRESS - exactly as the has-events revocation path does.
 // ===========================================================================
 for (const storeType of ["memory", "sqlite"]) {
   describe(`Zero-event takeover termination (${storeType})`, () => {
@@ -1182,23 +1184,20 @@ for (const storeType of ["memory", "sqlite"]) {
       });
       const before = adapters.commandStore.get(commandId);
 
-      // The Store reads its own clock, which still says the lease is live.
-      const storeNow = 1500;
       const challenges = [];
       const realTakeover = adapters.commandStore.takeOverExpired.bind(
         adapters.commandStore
       );
       adapters.commandStore.takeOverExpired = (args) => {
-        const outcome = realTakeover({ ...args, now: storeNow });
+        const outcome = realTakeover(args);
         challenges.push(outcome);
         return outcome;
       };
 
-      // The Coordinator believes the lease is long gone.
-      let clock = 60_000;
-      if (typeof adapters.eventStore.setNow === "function") {
-        adapters.eventStore.setNow(() => clock);
-      }
+      // The Store's clock still says the lease is live. The Coordinator has no
+      // lease clock of its own to disagree with it, so it must challenge and
+      // then act on the answer it gets.
+      adapters.leaseClock.ms = 1500;
       const engine = new RollbackEngine({
         eventStore: adapters.eventStore,
         commandStore: adapters.commandStore,
@@ -1206,8 +1205,7 @@ for (const storeType of ["memory", "sqlite"]) {
         stateRepository: adapters.stateRepository,
         workerId: "worker-B",
         leaseTtlMs: TTL,
-        now: () => clock,
-        clock: () => new Date(clock).toISOString(),
+        clock: () => new Date(adapters.leaseClock.ms).toISOString(),
       });
 
       assert.throws(

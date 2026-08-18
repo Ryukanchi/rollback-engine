@@ -6,7 +6,15 @@ const { classifyOutcome } = require("../failureClassifier");
 class MemoryProfileRunner {
   static runIteration({ seed, iteration, prng, generator, invariantSuite }) {
     const trace = new ExecutionTrace({ seed, iteration, profile: "memory" });
-    const adapters = createStorageAdapters({ type: "memory" });
+    // Lease time belongs to the command store, so the lease simulations below
+    // pin this value for the span of one operation instead of handing a chosen
+    // `now` to individual mutations. While it is null the store runs on host
+    // wall-clock time, which is what every other operation wants.
+    const leaseClock = { pinnedMs: null };
+    const adapters = createStorageAdapters({
+      type: "memory",
+      leaseNow: () => leaseClock.pinnedMs ?? Date.now(),
+    });
     const engine = new RollbackEngine({
       eventStore: adapters.eventStore,
       commandStore: adapters.commandStore,
@@ -40,9 +48,13 @@ class MemoryProfileRunner {
       let invariantsChecked = [];
 
       try {
-        outcome = executeOperation({ op, engine, adapters, context, stats, invariantSuite });
+        outcome = executeOperation({ op, engine, adapters, context, stats, invariantSuite, leaseClock });
       } catch (err) {
         outcome = { success: false, result: null, error: err };
+      } finally {
+        // Any lease simulation that pinned the store clock owns it only for the
+        // duration of its own operation; everything else runs on host time.
+        leaseClock.pinnedMs = null;
       }
 
       const classification = classifyOutcome({
@@ -102,7 +114,7 @@ class MemoryProfileRunner {
   }
 }
 
-function executeOperation({ op, engine, adapters, context, stats, invariantSuite }) {
+function executeOperation({ op, engine, adapters, context, stats, invariantSuite, leaseClock }) {
   switch (op.type) {
     case "CHECKOUT": {
       const { payload, options } = op.params;
@@ -341,6 +353,7 @@ function executeOperation({ op, engine, adapters, context, stats, invariantSuite
     case "LEASE_TAKEOVER_SIMULATION": {
       const { commandId } = op.params;
       const leaseBase = Date.now();
+      leaseClock.pinnedMs = leaseBase;
       const rawPayload = { item: "LeaseItem", quantity: 1, amount: 150 };
       adapters.commandStore.reserve({
         commandId,
@@ -348,8 +361,8 @@ function executeOperation({ op, engine, adapters, context, stats, invariantSuite
         payload: { ...rawPayload, simulateFailureAt: null },
         workerId: "chaos-worker-1",
         leaseTtlMs: 10,
-        now: leaseBase,
       });
+      leaseClock.pinnedMs = leaseBase + 1000;
       const engineWorker2 = new RollbackEngine({
         eventStore: adapters.eventStore,
         commandStore: adapters.commandStore,
@@ -357,7 +370,6 @@ function executeOperation({ op, engine, adapters, context, stats, invariantSuite
         stateRepository: adapters.stateRepository,
         workerId: "chaos-worker-2",
         leaseTtlMs: 60000,
-        now: () => leaseBase + 1000,
       });
       try {
         const res = engineWorker2.checkout(rawPayload, { commandId });
@@ -374,6 +386,7 @@ function executeOperation({ op, engine, adapters, context, stats, invariantSuite
     case "ZOMBIE_FENCING_SIMULATION": {
       const { commandId } = op.params;
       const leaseBase = Date.now();
+      leaseClock.pinnedMs = leaseBase;
       const rawPayload = { item: "ZombieItem", quantity: 1, amount: 200 };
       adapters.commandStore.reserve({
         commandId,
@@ -381,13 +394,12 @@ function executeOperation({ op, engine, adapters, context, stats, invariantSuite
         payload: { ...rawPayload, simulateFailureAt: null },
         workerId: "chaos-worker-1",
         leaseTtlMs: 10,
-        now: leaseBase,
       });
+      leaseClock.pinnedMs = leaseBase + 1000;
       adapters.commandStore.takeOverExpired({
         commandId,
         workerId: "chaos-worker-2",
         leaseTtlMs: 60000,
-        now: leaseBase + 1000,
       });
       try {
         const { createDomainEvent, EVENT_TYPES } = require("../../domain/events");
@@ -414,6 +426,7 @@ function executeOperation({ op, engine, adapters, context, stats, invariantSuite
     case "MISSING_TOKEN_SIMULATION": {
       const { commandId } = op.params;
       const leaseBase = Date.now();
+      leaseClock.pinnedMs = leaseBase;
       const rawPayload = { item: "MissingTokenItem", quantity: 1, amount: 200 };
       adapters.commandStore.reserve({
         commandId,
@@ -421,7 +434,6 @@ function executeOperation({ op, engine, adapters, context, stats, invariantSuite
         payload: { ...rawPayload, simulateFailureAt: null },
         workerId: "chaos-worker-1",
         leaseTtlMs: 60000,
-        now: leaseBase,
       });
       try {
         const { createDomainEvent, EVENT_TYPES } = require("../../domain/events");
@@ -448,6 +460,7 @@ function executeOperation({ op, engine, adapters, context, stats, invariantSuite
     case "UNRECORDED_EVENT_TAKEOVER_SIMULATION": {
       const { commandId } = op.params;
       const leaseBase = Date.now();
+      leaseClock.pinnedMs = leaseBase;
       const rawPayload = { item: "UnrecordedItem", quantity: 1, amount: 200 };
       adapters.commandStore.reserve({
         commandId,
@@ -455,7 +468,6 @@ function executeOperation({ op, engine, adapters, context, stats, invariantSuite
         payload: { ...rawPayload, simulateFailureAt: null },
         workerId: "chaos-worker-1",
         leaseTtlMs: 60000,
-        now: leaseBase,
       });
       const { createDomainEvent, EVENT_TYPES } = require("../../domain/events");
       const unrecordedEvent = createDomainEvent({
@@ -471,11 +483,11 @@ function executeOperation({ op, engine, adapters, context, stats, invariantSuite
       if (!context.knownAggregates.includes(777)) {
         context.knownAggregates.push(777);
       }
+      leaseClock.pinnedMs = leaseBase + 3600000;
       const takeover = adapters.commandStore.takeOverExpired({
         commandId,
         workerId: "chaos-worker-2",
         leaseTtlMs: 60000,
-        now: leaseBase + 3600000,
       });
       const blocked = takeover.success === false && takeover.reason === "HAS_EVENTS";
       // The counter is only raised once the assertion has actually been evaluated.

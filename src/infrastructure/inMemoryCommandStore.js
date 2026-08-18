@@ -67,6 +67,18 @@ class InMemoryCommandStore {
   #commands = new Map();
   #eventStore = null;
 
+  #now;
+
+  /**
+   * The lease clock belongs to the Store, not to the caller of a mutation.
+   * Creating, extending, transferring and revoking a lease are all decided
+   * against this clock, so a caller can choose *which* challenge to attempt but
+   * never *when* it is allowed to succeed (TA-3).
+   */
+  constructor({ now = () => Date.now() } = {}) {
+    this.#now = typeof now === "function" ? now : () => Date.now();
+  }
+
   setEventStore(eventStore) {
     this.#eventStore = eventStore;
   }
@@ -77,11 +89,12 @@ class InMemoryCommandStore {
     payload,
     workerId = null,
     leaseTtlMs = 5000,
-    now = Date.now(),
   } = {}) {
     assertNonEmptyString(commandId, "commandId");
     assertNonEmptyString(commandType, "commandType");
     assertPayload(payload);
+
+    const now = this.#now();
 
     const existing = this.#commands.get(commandId);
 
@@ -156,11 +169,12 @@ class InMemoryCommandStore {
     commandId,
     workerId,
     leaseTtlMs = 5000,
-    now = Date.now(),
     expectedToken,
   } = {}) {
     assertNonEmptyString(commandId, "commandId");
     assertNonEmptyString(workerId, "workerId");
+
+    const now = this.#now();
 
     const record = this.#commands.get(commandId);
 
@@ -214,7 +228,7 @@ class InMemoryCommandStore {
    * unwired adapter therefore cannot answer this question and is rejected rather
    * than silently answered from lagging bookkeeping.
    */
-  revokeExpired({ commandId, expectedToken, now = Date.now(), error } = {}) {
+  revokeExpired({ commandId, expectedToken, error } = {}) {
     assertNonEmptyString(commandId, "commandId");
 
     if (!Number.isSafeInteger(expectedToken) || expectedToken <= 0) {
@@ -224,6 +238,8 @@ class InMemoryCommandStore {
     if (!error || typeof error !== "object" || Array.isArray(error)) {
       throw new TypeError("error must be an object");
     }
+
+    const now = this.#now();
 
     const record = this.#commands.get(commandId);
 
@@ -239,7 +255,8 @@ class InMemoryCommandStore {
       return { success: false, reason: "TOKEN_MISMATCH" };
     }
 
-    // LA-13: the caller observed expiry earlier; only this read decides.
+    // LA-13/TA-2: the caller observed expiry earlier and against some other
+    // clock; only this read, against the Store clock, decides.
     if (record.leaseExpiresAt !== null && record.leaseExpiresAt > now) {
       return { success: false, reason: "NOT_EXPIRED" };
     }
@@ -280,10 +297,11 @@ class InMemoryCommandStore {
     workerId,
     fencingToken,
     leaseTtlMs = 5000,
-    now = Date.now(),
   } = {}) {
     assertNonEmptyString(commandId, "commandId");
     assertNonEmptyString(workerId, "workerId");
+
+    const now = this.#now();
 
     const record = this.#commands.get(commandId);
 

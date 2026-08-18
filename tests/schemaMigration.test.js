@@ -87,7 +87,13 @@ test("schema migration: upgrades legacy v1 database to v2 with lease columns and
   }
 
   // Step 2: Open database with standard adapters (runs initializeSchema migration)
-  const adapters = createStorageAdapters({ type: "sqlite", dbPath });
+  // The reservation deadline below is the property under test, so the store
+  // that computes it is given the clock that fixes it.
+  const adapters = createStorageAdapters({
+    type: "sqlite",
+    dbPath,
+    leaseNow: () => 10000,
+  });
 
   try {
     // Verify user_version is now 2
@@ -116,7 +122,6 @@ test("schema migration: upgrades legacy v1 database to v2 with lease columns and
       payload: { item: "Pen", quantity: 2, amount: 10 },
       workerId: "worker-migrated",
       leaseTtlMs: 5000,
-      now: 10000,
     });
     assert.equal(newReservation.created, true);
     assert.equal(newReservation.record.leaseOwner, "worker-migrated");

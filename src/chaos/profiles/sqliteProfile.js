@@ -12,7 +12,19 @@ class SqliteProfileRunner {
     const dbFileName = `rollback-chaos-${seed}-${iteration}-${prng.nextString(6)}.db`;
     const dbPath = path.join(os.tmpdir(), dbFileName);
 
-    let adapters = createStorageAdapters({ type: "sqlite", dbPath });
+    // Lease time belongs to the command store, so the lease simulations below
+    // pin this value for the span of one operation instead of handing a chosen
+    // `now` to individual mutations. While it is null the store runs on host
+    // wall-clock time, which is what every other operation wants.
+    const leaseClock = { pinnedMs: null };
+    const createAdapters = () =>
+      createStorageAdapters({
+        type: "sqlite",
+        dbPath,
+        leaseNow: () => leaseClock.pinnedMs ?? Date.now(),
+      });
+
+    let adapters = createAdapters();
     let engine = new RollbackEngine({
       eventStore: adapters.eventStore,
       commandStore: adapters.commandStore,
@@ -45,7 +57,7 @@ class SqliteProfileRunner {
         // Occasionally inject a database close & reopen across connection boundary
         if (step > 0 && prng.nextBoolean(0.2)) {
           adapters.close();
-          adapters = createStorageAdapters({ type: "sqlite", dbPath });
+          adapters = createAdapters();
           engine = new RollbackEngine({
             eventStore: adapters.eventStore,
             commandStore: adapters.commandStore,
@@ -69,9 +81,13 @@ class SqliteProfileRunner {
         let invariantsChecked = [];
 
         try {
-          outcome = executeSqliteOperation({ op, engine, adapters, context, stats, invariantSuite });
+          outcome = executeSqliteOperation({ op, engine, adapters, context, stats, invariantSuite, leaseClock });
         } catch (err) {
           outcome = { success: false, result: null, error: err };
+        } finally {
+          // Any lease simulation that pinned the store clock owns it only for
+          // the duration of its own operation; everything else runs on host time.
+          leaseClock.pinnedMs = null;
         }
 
         const classification = classifyOutcome({
@@ -138,7 +154,7 @@ class SqliteProfileRunner {
   }
 }
 
-function executeSqliteOperation({ op, engine, adapters, context, stats, invariantSuite }) {
+function executeSqliteOperation({ op, engine, adapters, context, stats, invariantSuite, leaseClock }) {
   switch (op.type) {
     case "CHECKOUT": {
       const { payload, options } = op.params;
@@ -375,6 +391,7 @@ function executeSqliteOperation({ op, engine, adapters, context, stats, invarian
     case "LEASE_TAKEOVER_SIMULATION": {
       const { commandId } = op.params;
       const leaseBase = Date.now();
+      leaseClock.pinnedMs = leaseBase;
       const rawPayload = { item: "LeaseSqliteItem", quantity: 1, amount: 250 };
       adapters.commandStore.reserve({
         commandId,
@@ -382,8 +399,8 @@ function executeSqliteOperation({ op, engine, adapters, context, stats, invarian
         payload: { ...rawPayload, simulateFailureAt: null },
         workerId: "chaos-sqlite-worker-1",
         leaseTtlMs: 10,
-        now: leaseBase,
       });
+      leaseClock.pinnedMs = leaseBase + 1000;
       const engineWorker2 = new RollbackEngine({
         eventStore: adapters.eventStore,
         commandStore: adapters.commandStore,
@@ -391,7 +408,6 @@ function executeSqliteOperation({ op, engine, adapters, context, stats, invarian
         stateRepository: adapters.stateRepository,
         workerId: "chaos-sqlite-worker-2",
         leaseTtlMs: 60000,
-        now: () => leaseBase + 1000,
       });
       try {
         const res = engineWorker2.checkout(rawPayload, { commandId });
@@ -408,6 +424,7 @@ function executeSqliteOperation({ op, engine, adapters, context, stats, invarian
     case "ZOMBIE_FENCING_SIMULATION": {
       const { commandId } = op.params;
       const leaseBase = Date.now();
+      leaseClock.pinnedMs = leaseBase;
       const rawPayload = { item: "ZombieSqliteItem", quantity: 1, amount: 300 };
       adapters.commandStore.reserve({
         commandId,
@@ -415,13 +432,12 @@ function executeSqliteOperation({ op, engine, adapters, context, stats, invarian
         payload: { ...rawPayload, simulateFailureAt: null },
         workerId: "chaos-sqlite-worker-1",
         leaseTtlMs: 10,
-        now: leaseBase,
       });
+      leaseClock.pinnedMs = leaseBase + 1000;
       adapters.commandStore.takeOverExpired({
         commandId,
         workerId: "chaos-sqlite-worker-2",
         leaseTtlMs: 60000,
-        now: leaseBase + 1000,
       });
       try {
         const { createDomainEvent, EVENT_TYPES } = require("../../domain/events");
@@ -448,6 +464,7 @@ function executeSqliteOperation({ op, engine, adapters, context, stats, invarian
     case "MISSING_TOKEN_SIMULATION": {
       const { commandId } = op.params;
       const leaseBase = Date.now();
+      leaseClock.pinnedMs = leaseBase;
       const rawPayload = { item: "MissingTokenSqliteItem", quantity: 1, amount: 200 };
       adapters.commandStore.reserve({
         commandId,
@@ -455,7 +472,6 @@ function executeSqliteOperation({ op, engine, adapters, context, stats, invarian
         payload: { ...rawPayload, simulateFailureAt: null },
         workerId: "chaos-sqlite-worker-1",
         leaseTtlMs: 60000,
-        now: leaseBase,
       });
       try {
         const { createDomainEvent, EVENT_TYPES } = require("../../domain/events");
@@ -482,6 +498,7 @@ function executeSqliteOperation({ op, engine, adapters, context, stats, invarian
     case "UNRECORDED_EVENT_TAKEOVER_SIMULATION": {
       const { commandId } = op.params;
       const leaseBase = Date.now();
+      leaseClock.pinnedMs = leaseBase;
       const rawPayload = { item: "UnrecordedSqliteItem", quantity: 1, amount: 200 };
       adapters.commandStore.reserve({
         commandId,
@@ -489,7 +506,6 @@ function executeSqliteOperation({ op, engine, adapters, context, stats, invarian
         payload: { ...rawPayload, simulateFailureAt: null },
         workerId: "chaos-sqlite-worker-1",
         leaseTtlMs: 60000,
-        now: leaseBase,
       });
       const { createDomainEvent, EVENT_TYPES } = require("../../domain/events");
       const unrecordedEvent = createDomainEvent({
@@ -505,11 +521,11 @@ function executeSqliteOperation({ op, engine, adapters, context, stats, invarian
       if (!context.knownAggregates.includes(777)) {
         context.knownAggregates.push(777);
       }
+      leaseClock.pinnedMs = leaseBase + 3600000;
       const takeover = adapters.commandStore.takeOverExpired({
         commandId,
         workerId: "chaos-sqlite-worker-2",
         leaseTtlMs: 60000,
-        now: leaseBase + 3600000,
       });
       const blocked = takeover.success === false && takeover.reason === "HAS_EVENTS";
       // The counter is only raised once the assertion has actually been evaluated.

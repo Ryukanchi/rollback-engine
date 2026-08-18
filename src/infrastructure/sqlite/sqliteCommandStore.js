@@ -86,6 +86,8 @@ function rowToRecord(row) {
 class SqliteCommandStore {
   #db;
 
+  #now;
+
   #stmtGetCommand;
 
   #stmtInsertCommand;
@@ -114,12 +116,20 @@ class SqliteCommandStore {
 
   #stmtRevokeExpired;
 
-  constructor({ db } = {}) {
+  /**
+   * The lease clock belongs to the Store, not to the caller of a mutation.
+   * Creating, extending, transferring and revoking a lease are all decided
+   * against this clock, so a caller can choose *which* challenge to attempt but
+   * never *when* it is allowed to succeed (TA-3). Every authority mutation
+   * reads it inside its own write transaction, next to the state it validates.
+   */
+  constructor({ db, now = () => Date.now() } = {}) {
     if (!db || typeof db.prepare !== "function") {
       throw new TypeError("db must be a valid SQLite database instance");
     }
 
     this.#db = db;
+    this.#now = typeof now === "function" ? now : () => Date.now();
 
     this.#stmtGetCommand = this.#db.prepare(`
       SELECT command_id, command_type, payload, status, aggregate_id, event_range, result, error, lease_owner, lease_token, lease_expires_at
@@ -221,7 +231,6 @@ class SqliteCommandStore {
     payload,
     workerId = null,
     leaseTtlMs = 5000,
-    now = Date.now(),
   } = {}) {
     assertNonEmptyString(commandId, "commandId");
     assertNonEmptyString(commandType, "commandType");
@@ -230,6 +239,7 @@ class SqliteCommandStore {
     // G5: reading the row and claiming the next generation must be one atomic
     // step, otherwise two workers can derive the same successor token.
     return this.#transaction(() => {
+      const now = this.#now();
       const existingRow = this.#stmtGetCommand.get(commandId);
 
       if (existingRow) {
@@ -335,7 +345,6 @@ class SqliteCommandStore {
     commandId,
     workerId,
     leaseTtlMs = 5000,
-    now = Date.now(),
     expectedToken,
   } = {}) {
     assertNonEmptyString(commandId, "commandId");
@@ -344,6 +353,10 @@ class SqliteCommandStore {
     this.#db.exec("BEGIN IMMEDIATE;");
 
     try {
+      // Read the Store clock inside the write transaction, alongside the state
+      // it is compared against, so eligibility is decided on one consistent
+      // observation of both.
+      const now = this.#now();
       const row = this.#stmtGetCommand.get(commandId);
 
       if (!row) {
@@ -415,7 +428,7 @@ class SqliteCommandStore {
    * which the row is terminal but its bookkeeping is not yet authoritative
    * (LA-10).
    */
-  revokeExpired({ commandId, expectedToken, now = Date.now(), error } = {}) {
+  revokeExpired({ commandId, expectedToken, error } = {}) {
     assertNonEmptyString(commandId, "commandId");
 
     if (!Number.isSafeInteger(expectedToken) || expectedToken <= 0) {
@@ -427,6 +440,7 @@ class SqliteCommandStore {
     }
 
     return this.#transaction(() => {
+      const now = this.#now();
       const row = this.#stmtGetCommand.get(commandId);
 
       if (!row) {
@@ -443,7 +457,8 @@ class SqliteCommandStore {
         return { success: false, reason: "TOKEN_MISMATCH" };
       }
 
-      // LA-13: the caller observed expiry earlier; only this read decides.
+      // LA-13/TA-2: the caller observed expiry earlier and against some other
+      // clock; only this read, against the Store clock, decides.
       const expiresAt = row.lease_expires_at !== null ? Number(row.lease_expires_at) : null;
 
       if (expiresAt !== null && expiresAt > now) {
@@ -493,7 +508,6 @@ class SqliteCommandStore {
     workerId,
     fencingToken,
     leaseTtlMs = 5000,
-    now = Date.now(),
   } = {}) {
     assertNonEmptyString(commandId, "commandId");
     assertNonEmptyString(workerId, "workerId");
@@ -501,6 +515,7 @@ class SqliteCommandStore {
     this.#db.exec("BEGIN IMMEDIATE;");
 
     try {
+      const now = this.#now();
       const row = this.#stmtGetCommand.get(commandId);
 
       if (!row || row.status !== COMMAND_STATUSES.PROCESSING) {

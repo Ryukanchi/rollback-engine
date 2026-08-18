@@ -18,9 +18,15 @@ class ScenarioStore {
     const dbFileName = `rollback-lab-${scenarioId}.db`;
     const dbPath = join(tmpdir(), dbFileName);
 
+    // Lease time is owned by the command store. A session that wants to
+    // demonstrate expiry deterministically pins this value instead of handing a
+    // chosen `now` to individual mutations; while it is null the store simply
+    // runs on host wall-clock time.
+    const leaseClock = { pinnedMs: null };
     const adapters = createStorageAdapters({
       type: storageType,
       dbPath: storageType === "sqlite" ? dbPath : ":memory:",
+      leaseNow: () => leaseClock.pinnedMs ?? Date.now(),
       wal: true,
       busyTimeout: 5000,
     });
@@ -39,6 +45,7 @@ class ScenarioStore {
       dbFileName: storageType === "sqlite" ? dbFileName : "in-memory",
       dbPath,
       adapters,
+      leaseClock,
       engine,
       createdAt: new Date().toISOString(),
       lastAccessedAt: Date.now(),

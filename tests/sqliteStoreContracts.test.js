@@ -27,9 +27,9 @@ describe("Sqlite in-memory store contracts", () => {
 
   registerCommandStoreContract({
     adapterName: "SqliteCommandStore (memory)",
-    createStore: () => {
+    createStore: ({ now } = {}) => {
       const db = createSqliteDatabase({ path: ":memory:" });
-      return new SqliteCommandStore({ db });
+      return new SqliteCommandStore({ db, now });
     },
   });
 
@@ -67,9 +67,9 @@ describe("Sqlite file-backed store contracts", () => {
 
   registerCommandStoreContract({
     adapterName: "SqliteCommandStore (file-backed)",
-    createStore: () => {
+    createStore: ({ now } = {}) => {
       const { db } = createTempDb();
-      return new SqliteCommandStore({ db });
+      return new SqliteCommandStore({ db, now });
     },
   });
 
