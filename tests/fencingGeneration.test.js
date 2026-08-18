@@ -263,7 +263,7 @@ test("Z-4: re-reservation after release increments token preventing ABA", () => 
 
 // === Scenario F: healthy command exceeding TTL has defined safe behavior ===
 
-test("Z-5: event store rejects append when lease is exactly expired (boundary)", () => {
+test("Z-5: an uncontested current generation may append past the expiry boundary", () => {
   let currentTime = 1000;
   const { commandStore, eventStore } = createLeaseStores({ now: () => currentTime });
 
@@ -277,15 +277,65 @@ test("Z-5: event store rejects append when lease is exactly expired (boundary)",
     now: currentTime,
   });
 
-  // Advance to exactly the expiry boundary
-  currentTime = 2000; // leaseExpiresAt = 1000 + 1000 = 2000, now = 2000 → expired
+  // Past the expiry boundary: leaseExpiresAt = 2000, now = 5000.
+  currentTime = 5000;
 
-  const event = createTestEvent({ commandId, aggregateId: 1, sequence: 1 });
+  // Nobody took over and nobody revoked, so generation 1 is still the authority.
+  // Expiry alone must not stop it.
+  const stored = eventStore.append(
+    createTestEvent({ commandId, aggregateId: 1, sequence: 1 }),
+    { expectedVersion: 0, fencingToken: 1 }
+  );
+  assert.equal(eventStore.getByCommandId(commandId).length, 1);
+  assert.equal(stored.sequence, 1);
+
+  const record = commandStore.get(commandId);
+  assert.equal(record.status, COMMAND_STATUSES.PROCESSING);
+  assert.equal(record.leaseToken, 1, "no competitor advanced the generation");
+  assert.equal(record.leaseOwner, "worker-1");
+});
+
+test("Z-5: the same append past the boundary is rejected once the generation moved", () => {
+  let currentTime = 1000;
+  const { commandStore, eventStore } = createLeaseStores({ now: () => currentTime });
+
+  const commandId = "cmd-f-contested";
+  commandStore.reserve({
+    commandId,
+    commandType: "CHECKOUT",
+    payload: { item: "X", quantity: 1 },
+    workerId: "worker-1",
+    leaseTtlMs: 1000,
+    now: currentTime,
+  });
+
+  currentTime = 5000;
+
+  // Control for the test above: identical state, identical call, but this time a
+  // third party won the atomic transition first. The rejection is therefore the
+  // generation, not the clock.
+  const takeover = commandStore.takeOverExpired({
+    commandId,
+    workerId: "worker-2",
+    leaseTtlMs: 5000,
+    now: currentTime,
+    expectedToken: 1,
+  });
+  assert.equal(takeover.success, true);
 
   assert.throws(
-    () => eventStore.append(event, { expectedVersion: 0, fencingToken: 1 }),
-    (err) => err.code === "COMMAND_LEASE_EXPIRED"
+    () => eventStore.append(
+      createTestEvent({ commandId, aggregateId: 1, sequence: 1 }),
+      { expectedVersion: 0, fencingToken: 1 }
+    ),
+    (err) => {
+      assert.equal(err.code, "FENCING_TOKEN_STALE");
+      assert.equal(err.providedToken, 1);
+      assert.equal(err.currentToken, 2);
+      return true;
+    }
   );
+  assert.equal(eventStore.getByCommandId(commandId).length, 0);
 });
 
 // === Scenario G: lease expiry during compensation ===

@@ -21,7 +21,6 @@ const {
   createAppendCommitUnknownError,
   createCommandReconciliationError,
   createFencingTokenStaleError,
-  createCommandLeaseExpiredError,
   createFencingContextInvalidError,
   serializeCommandError,
   deserializeCommandError,
@@ -506,14 +505,46 @@ class CommandExecutionCoordinator {
         throw inconsistentError;
       }
 
+      // Third-party authority revocation. Our expiry observation above is only
+      // a reason to *try*: the store re-validates status, generation, expiry and
+      // the authoritative event history inside one transaction and is the sole
+      // decider. If the owner renewed in the meantime, it survives (LA-13).
       const interruptedError = createInterruptedCommandError(
         record.commandId,
         events
       );
-      this.#persistFailedCommand(record.commandId, interruptedError, events, {
-        fencingToken: record.leaseToken,
+      const revocation = this.#commandStore.revokeExpired({
+        commandId: record.commandId,
+        expectedToken: record.leaseToken,
+        now: nowMs,
+        error: serializeCommandError(interruptedError),
       });
-      throw interruptedError;
+
+      if (!revocation.success) {
+        if (revocation.reason === "NOT_EXPIRED") {
+          throw createCommandInProgressError(record);
+        }
+
+        // Status or generation moved underneath us; re-read and act on the
+        // state that actually exists now.
+        return this.#resolveExistingCommand(
+          this.#commandStore.get(record.commandId),
+          commandType,
+          payload,
+          normalizedOptions,
+          executeCommand
+        );
+      }
+
+      this.#emitDiagnostic({
+        type: DIAGNOSTIC_TYPES.COMMAND_LEASE,
+        status: DIAGNOSTIC_STATUSES.LEASE_REVOKED,
+        commandId: record.commandId,
+        fencingToken: record.leaseToken,
+        workerId: this.#workerId,
+      });
+
+      throw deserializeCommandError(revocation.record.error);
     }
 
     if (record.status === COMMAND_STATUSES.FAILED) {

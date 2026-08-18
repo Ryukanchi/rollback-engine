@@ -3,7 +3,6 @@ const { COMMAND_STATUSES } = require("../application/storeContracts");
 const {
   createFencingTokenStaleError,
   createFencingTokenRequiredError,
-  createCommandLeaseExpiredError,
 } = require("../application/errors");
 
 function assertNonEmptyString(value, fieldName) {
@@ -203,6 +202,79 @@ class InMemoryCommandStore {
     };
   }
 
+  /**
+   * Third-party authority revocation for a partially committed command. Logical
+   * mirror of takeOverExpired(); see the SQLite adapter for the transactional
+   * reasoning. In-memory mutation is synchronous and single-threaded, so this
+   * whole method is the atomic unit that BEGIN IMMEDIATE provides there.
+   *
+   * The authoritative event history is mandatory here: unlike takeOverExpired(),
+   * which can still fall back to the recorded eventRange, the 0-vs->=1 decision
+   * and the persisted range must both come from the Event Store (LA-14). An
+   * unwired adapter therefore cannot answer this question and is rejected rather
+   * than silently answered from lagging bookkeeping.
+   */
+  revokeExpired({ commandId, expectedToken, now = Date.now(), error } = {}) {
+    assertNonEmptyString(commandId, "commandId");
+
+    if (!Number.isSafeInteger(expectedToken) || expectedToken <= 0) {
+      throw new TypeError("expectedToken must be a positive safe integer");
+    }
+
+    if (!error || typeof error !== "object" || Array.isArray(error)) {
+      throw new TypeError("error must be an object");
+    }
+
+    const record = this.#commands.get(commandId);
+
+    if (!record) {
+      return { success: false, reason: "NOT_FOUND" };
+    }
+
+    if (record.status !== COMMAND_STATUSES.PROCESSING) {
+      return { success: false, reason: "NOT_PROCESSING" };
+    }
+
+    if (record.leaseToken !== expectedToken) {
+      return { success: false, reason: "TOKEN_MISMATCH" };
+    }
+
+    // LA-13: the caller observed expiry earlier; only this read decides.
+    if (record.leaseExpiresAt !== null && record.leaseExpiresAt > now) {
+      return { success: false, reason: "NOT_EXPIRED" };
+    }
+
+    // LA-14: authoritative event history, never the recorded eventRange. The
+    // dependency is only required once the decision actually needs it, so the
+    // cheap eligibility answers stay identical to the SQLite adapter.
+    if (!this.#eventStore) {
+      throw new TypeError(
+        "revokeExpired requires a wired Event Store to read authoritative events"
+      );
+    }
+
+    const events = this.#eventStore.getByCommandId(commandId) || [];
+
+    if (events.length === 0) {
+      return { success: false, reason: "NO_EVENTS" };
+    }
+
+    const eventRange = buildEventRange(events, commandId);
+
+    record.status = COMMAND_STATUSES.FAILED;
+    record.aggregateId = eventRange.aggregateId;
+    record.eventRange = eventRange;
+    record.error = {
+      ...clone(error),
+      aggregateId: eventRange.aggregateId,
+      eventIds: [...eventRange.eventIds],
+    };
+    record.leaseOwner = null;
+    record.leaseExpiresAt = null;
+
+    return { success: true, record: clone(record) };
+  }
+
   renewLease({
     commandId,
     workerId,
@@ -236,16 +308,9 @@ class InMemoryCommandStore {
       });
     }
 
-    if (record.leaseExpiresAt !== null && record.leaseExpiresAt <= now) {
-      throw createCommandLeaseExpiredError({
-        commandId,
-        fencingToken: record.leaseToken,
-        leaseExpiresAt: record.leaseExpiresAt,
-        now,
-        workerId,
-      });
-    }
-
+    // Lease expiry is a promise to third parties, not a self-permission. A
+    // worker that still holds the current generation may renew after the
+    // nominal TTL; only a committed takeover or revocation removes authority.
     record.leaseExpiresAt = now + leaseTtlMs;
     return { renewed: true, leaseExpiresAt: record.leaseExpiresAt };
   }

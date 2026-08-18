@@ -1,0 +1,1155 @@
+const test = require("node:test");
+const { describe } = require("node:test");
+const assert = require("node:assert/strict");
+const { join } = require("node:path");
+const { tmpdir } = require("node:os");
+const { randomUUID } = require("node:crypto");
+
+const { createStorageAdapters } = require("../src/infrastructure/storageFactory");
+const {
+  createSqliteDatabase,
+} = require("../src/infrastructure/sqlite/sqliteDatabase");
+const {
+  SqliteCommandStore,
+} = require("../src/infrastructure/sqlite/sqliteCommandStore");
+const {
+  SqliteEventStore,
+} = require("../src/infrastructure/sqlite/sqliteEventStore");
+const { RollbackEngine } = require("../src/application/rollbackEngine");
+const { COMMAND_STATUSES } = require("../src/application/storeContracts");
+const { createDomainEvent, EVENT_TYPES } = require("../src/domain/events");
+
+const TTL = 5000;
+const LONG_STEP = 12000;
+const PAYLOAD = { item: "Widget", quantity: 1, amount: 100 };
+const REVOKE_ERROR = {
+  code: "COMMAND_EXECUTION_INTERRUPTED_AFTER_COMMIT",
+  message: "Committed command events were found without a completed command result.",
+  eventCommitted: true,
+  retrySafe: false,
+  retryAction: "MANUAL_RESOLUTION_REQUIRED",
+};
+
+function createEvent({ commandId, aggregateId = 1, sequence = 1, eventId }) {
+  return createDomainEvent({
+    eventId: eventId || `evt-${randomUUID()}`,
+    eventType:
+      sequence === 1 ? EVENT_TYPES.ORDER_CREATED : EVENT_TYPES.INVENTORY_RESERVED,
+    aggregateId,
+    sequence,
+    timestamp: "2026-08-15T12:00:00.000Z",
+    payload:
+      sequence === 1
+        ? { item: PAYLOAD.item, quantity: PAYLOAD.quantity }
+        : { reservationId: 1, item: PAYLOAD.item, quantity: PAYLOAD.quantity },
+    metadata: {
+      schemaVersion: 1,
+      commandId,
+      correlationId: commandId,
+      causationId: commandId,
+    },
+  });
+}
+
+function createAdapters(type) {
+  return type === "sqlite"
+    ? createStorageAdapters({
+        type: "sqlite",
+        dbPath: join(tmpdir(), `rollback-lease-${randomUUID()}.db`),
+      })
+    : createStorageAdapters({ type: "memory" });
+}
+
+function reserve(
+  store,
+  commandId,
+  { workerId = "worker-A", leaseTtlMs = TTL, now = 1000, payload = { ...PAYLOAD } } = {}
+) {
+  return store.reserve({
+    commandId,
+    commandType: "CHECKOUT",
+    payload,
+    workerId,
+    leaseTtlMs,
+    now,
+  });
+}
+
+/** The payload shape the engine itself normalises a checkout command into. */
+const ENGINE_PAYLOAD = { ...PAYLOAD, simulateFailureAt: null };
+
+/** Reserves a command and makes one authoritative event durable for it. */
+function seedPartialCommit(
+  adapters,
+  commandId,
+  { now = 1000, workerId = "worker-A", payload = { ...PAYLOAD } } = {}
+) {
+  reserve(adapters.commandStore, commandId, { workerId, now, payload });
+  const event = createEvent({ commandId, sequence: 1 });
+  adapters.eventStore.append(event, { expectedVersion: 0, fencingToken: 1 });
+  adapters.commandStore.recordEvent(commandId, event, { fencingToken: 1 });
+  return event;
+}
+
+// ===========================================================================
+// Healthy slow worker: an uncontested generation survives its nominal TTL.
+// ===========================================================================
+for (const storeType of ["memory", "sqlite"]) {
+  describe(`Healthy slow worker (${storeType})`, () => {
+    /**
+     * Runs a full checkout while burning more than the whole TTL at a chosen
+     * checkpoint, and records the command row at every append so the test can
+     * prove the generation was never touched during the slow interval.
+     */
+    function runSlowCheckout({ slowAt, command = PAYLOAD, commandId }) {
+      const adapters = createAdapters(storeType);
+      let clock = 1_000_000;
+      const now = () => clock;
+      if (typeof adapters.eventStore.setNow === "function") {
+        adapters.eventStore.setNow(now);
+      }
+
+      const observations = [];
+      let appends = 0;
+      const realAppend = adapters.eventStore.append.bind(adapters.eventStore);
+      adapters.eventStore.append = (event, options) => {
+        appends += 1;
+        if (slowAt === `before-event-${appends}`) {
+          clock += LONG_STEP;
+        }
+        observations.push({
+          at: `append-${appends}`,
+          expired: adapters.commandStore.get(commandId).leaseExpiresAt <= now(),
+          row: adapters.commandStore.get(commandId),
+        });
+        return realAppend(event, options);
+      };
+
+      const takeovers = [];
+      const revocations = [];
+      const realTakeover = adapters.commandStore.takeOverExpired.bind(adapters.commandStore);
+      adapters.commandStore.takeOverExpired = (args) => {
+        const outcome = realTakeover(args);
+        takeovers.push(outcome);
+        return outcome;
+      };
+      const realRevoke = adapters.commandStore.revokeExpired.bind(adapters.commandStore);
+      adapters.commandStore.revokeExpired = (args) => {
+        const outcome = realRevoke(args);
+        revocations.push(outcome);
+        return outcome;
+      };
+
+      const engine = new RollbackEngine({
+        eventStore: adapters.eventStore,
+        commandStore: adapters.commandStore,
+        snapshotStore: adapters.snapshotStore,
+        stateRepository: adapters.stateRepository,
+        workerId: "worker-A",
+        leaseTtlMs: TTL,
+        now,
+        clock: () => new Date(clock).toISOString(),
+      });
+
+      const result = engine.checkout(command, { commandId });
+      return { adapters, result, observations, takeovers, revocations, commandId };
+    }
+
+    function assertUncontestedThroughout({ adapters, observations, takeovers, revocations, commandId }) {
+      assert.equal(takeovers.length, 0, "no takeover may occur");
+      assert.equal(revocations.length, 0, "no revocation may occur");
+      assert.ok(
+        observations.some((o) => o.expired),
+        "the test must actually cross the expiry boundary, otherwise it proves nothing"
+      );
+      for (const observation of observations) {
+        assert.equal(observation.row.status, COMMAND_STATUSES.PROCESSING, `${observation.at}: status`);
+        assert.equal(observation.row.leaseToken, 1, `${observation.at}: generation must not move`);
+        assert.equal(observation.row.leaseOwner, "worker-A", `${observation.at}: owner must not move`);
+      }
+      const final = adapters.commandStore.get(commandId);
+      assert.equal(final.status, COMMAND_STATUSES.COMPLETED);
+      assert.equal(final.leaseToken, 1);
+    }
+
+    test("HSL-1: a slow step before the first event does not self-fence", () => {
+      const run = runSlowCheckout({ slowAt: "before-event-1", commandId: "hsl-1" });
+      assert.equal(run.result.status, "completed");
+      assert.equal(run.adapters.eventStore.getByCommandId("hsl-1").length, 3);
+      assertUncontestedThroughout(run);
+      run.adapters.close();
+    });
+
+    test("HSL-2: a slow step between committed events does not self-fence", () => {
+      const run = runSlowCheckout({ slowAt: "before-event-2", commandId: "hsl-2" });
+      assert.equal(run.result.status, "completed");
+      assert.equal(run.adapters.eventStore.getByCommandId("hsl-2").length, 3);
+      assertUncontestedThroughout(run);
+      run.adapters.close();
+    });
+
+    test("HSL-3: a slow compensation step does not self-fence", () => {
+      const run = runSlowCheckout({
+        slowAt: "before-event-5",
+        command: { ...PAYLOAD, simulateFailureAt: "after_payment" },
+        commandId: "hsl-3",
+      });
+      assert.equal(run.result.status, "rolled_back");
+      assert.deepEqual(
+        run.result.events.map((event) => event.eventType),
+        [
+          EVENT_TYPES.ORDER_CREATED,
+          EVENT_TYPES.INVENTORY_RESERVED,
+          EVENT_TYPES.PAYMENT_CHARGED,
+          EVENT_TYPES.PAYMENT_REFUNDED,
+          EVENT_TYPES.INVENTORY_RELEASED,
+          EVENT_TYPES.ORDER_ROLLED_BACK,
+        ],
+        "compensation must run to completion, in order"
+      );
+      assertUncontestedThroughout(run);
+      run.adapters.close();
+    });
+  });
+}
+
+// ===========================================================================
+// revokeExpired: eligibility, atomicity and the races against owner mutations.
+// ===========================================================================
+for (const storeType of ["memory", "sqlite"]) {
+  describe(`Authority revocation (${storeType})`, () => {
+    test("revokes a partially committed expired generation in one transition", () => {
+      const adapters = createAdapters(storeType);
+      const event = seedPartialCommit(adapters, "rev-ok");
+
+      const outcome = adapters.commandStore.revokeExpired({
+        commandId: "rev-ok",
+        expectedToken: 1,
+        now: 60_000,
+        error: REVOKE_ERROR,
+      });
+
+      assert.equal(outcome.success, true);
+      const row = adapters.commandStore.get("rev-ok");
+      assert.equal(row.status, COMMAND_STATUSES.FAILED);
+      assert.equal(row.leaseToken, 1, "revocation must not advance the generation");
+      assert.equal(row.leaseOwner, null);
+      assert.equal(row.leaseExpiresAt, null);
+      assert.equal(row.error.code, "COMMAND_EXECUTION_INTERRUPTED_AFTER_COMMIT");
+      assert.equal(row.aggregateId, 1);
+      assert.deepEqual(row.eventRange.eventIds, [event.eventId]);
+      assert.deepEqual(row.error.eventIds, [event.eventId]);
+      adapters.close();
+    });
+
+    test("CE-12: a stale expiry observation cannot revoke a renewed owner", () => {
+      const adapters = createAdapters(storeType);
+      seedPartialCommit(adapters, "rev-ce12");
+
+      // A third party observes the lease as expired at t = 60_000 ...
+      const observed = adapters.commandStore.get("rev-ce12");
+      assert.ok(observed.leaseExpiresAt <= 60_000, "precondition: observed as expired");
+
+      // ... but the healthy owner renews before the revocation is attempted.
+      adapters.commandStore.renewLease({
+        commandId: "rev-ce12",
+        workerId: "worker-A",
+        fencingToken: 1,
+        leaseTtlMs: TTL,
+        now: 60_000,
+      });
+
+      const outcome = adapters.commandStore.revokeExpired({
+        commandId: "rev-ce12",
+        expectedToken: 1,
+        now: 60_000,
+        error: REVOKE_ERROR,
+      });
+
+      assert.equal(outcome.success, false);
+      assert.equal(outcome.reason, "NOT_EXPIRED", "expiry must be revalidated at mutation time");
+
+      const row = adapters.commandStore.get("rev-ce12");
+      assert.equal(row.status, COMMAND_STATUSES.PROCESSING, "the healthy owner survives");
+      assert.equal(row.leaseToken, 1);
+      assert.equal(row.leaseOwner, "worker-A");
+      assert.equal(row.error, null);
+
+      // Control: without the renewal the very same call succeeds, so the
+      // rejection above was the expiry revalidation and nothing else.
+      const control = createAdapters(storeType);
+      seedPartialCommit(control, "rev-ce12");
+      const controlOutcome = control.commandStore.revokeExpired({
+        commandId: "rev-ce12",
+        expectedToken: 1,
+        now: 60_000,
+        error: REVOKE_ERROR,
+      });
+      assert.equal(controlOutcome.success, true);
+      control.close();
+      adapters.close();
+    });
+
+    test("LA-14: eligibility comes from the event history, not from eventRange", () => {
+      const adapters = createAdapters(storeType);
+      reserve(adapters.commandStore, "rev-hist");
+
+      // Bookkeeping says "no events". The event history says otherwise.
+      const event = createEvent({ commandId: "rev-hist", sequence: 1 });
+      adapters.eventStore.append(event, { expectedVersion: 0, fencingToken: 1 });
+      assert.equal(adapters.commandStore.get("rev-hist").eventRange, null);
+
+      const outcome = adapters.commandStore.revokeExpired({
+        commandId: "rev-hist",
+        expectedToken: 1,
+        now: 60_000,
+        error: REVOKE_ERROR,
+      });
+
+      assert.equal(outcome.success, true, "a lagging eventRange must not hide a committed event");
+      const row = adapters.commandStore.get("rev-hist");
+      assert.deepEqual(row.eventRange.eventIds, [event.eventId]);
+      adapters.close();
+    });
+
+    test("Phase 8: revocation persists the FULL authoritative range in one step", () => {
+      const adapters = createAdapters(storeType);
+      const first = seedPartialCommit(adapters, "rev-atomic");
+
+      // A second event is durable but was never recorded in the bookkeeping.
+      const second = createEvent({ commandId: "rev-atomic", sequence: 2 });
+      adapters.eventStore.append(second, { expectedVersion: 1, fencingToken: 1 });
+      assert.equal(adapters.commandStore.get("rev-atomic").eventRange.eventIds.length, 1);
+      assert.equal(adapters.eventStore.getByCommandId("rev-atomic").length, 2);
+
+      const outcome = adapters.commandStore.revokeExpired({
+        commandId: "rev-atomic",
+        expectedToken: 1,
+        now: 60_000,
+        error: REVOKE_ERROR,
+      });
+
+      assert.equal(outcome.success, true);
+      const row = adapters.commandStore.get("rev-atomic");
+      assert.equal(row.status, COMMAND_STATUSES.FAILED);
+      assert.deepEqual(
+        row.eventRange.eventIds,
+        [first.eventId, second.eventId],
+        "the terminal row must never be durable with a stale range"
+      );
+      assert.equal(row.eventRange.lastSequence, 2);
+      assert.deepEqual(row.error.eventIds, [first.eventId, second.eventId]);
+      adapters.close();
+    });
+
+    test("refuses a zero-event command so takeover stays the only route", () => {
+      const adapters = createAdapters(storeType);
+      reserve(adapters.commandStore, "rev-zero");
+
+      const outcome = adapters.commandStore.revokeExpired({
+        commandId: "rev-zero",
+        expectedToken: 1,
+        now: 60_000,
+        error: REVOKE_ERROR,
+      });
+
+      assert.equal(outcome.success, false);
+      assert.equal(outcome.reason, "NO_EVENTS");
+      assert.equal(adapters.commandStore.get("rev-zero").status, COMMAND_STATUSES.PROCESSING);
+      adapters.close();
+    });
+
+    test("refuses a stale generation", () => {
+      const adapters = createAdapters(storeType);
+      seedPartialCommit(adapters, "rev-gen");
+
+      const outcome = adapters.commandStore.revokeExpired({
+        commandId: "rev-gen",
+        expectedToken: 99,
+        now: 60_000,
+        error: REVOKE_ERROR,
+      });
+
+      assert.equal(outcome.success, false);
+      assert.equal(outcome.reason, "TOKEN_MISMATCH");
+      assert.equal(adapters.commandStore.get("rev-gen").status, COMMAND_STATUSES.PROCESSING);
+      adapters.close();
+    });
+
+    // --- RACE-3..8 -------------------------------------------------------
+
+    test("RACE-3/4: append vs revoke has one winner in each direction", () => {
+      // Append first: the revocation reads the newly committed event.
+      const first = createAdapters(storeType);
+      const seeded = seedPartialCommit(first, "race-append");
+      const late = createEvent({ commandId: "race-append", sequence: 2 });
+      first.eventStore.append(late, { expectedVersion: 1, fencingToken: 1 });
+      const afterAppend = first.commandStore.revokeExpired({
+        commandId: "race-append",
+        expectedToken: 1,
+        now: 60_000,
+        error: REVOKE_ERROR,
+      });
+      assert.equal(afterAppend.success, true);
+      assert.deepEqual(
+        first.commandStore.get("race-append").eventRange.eventIds,
+        [seeded.eventId, late.eventId],
+        "a revocation that lost the race still records what actually happened"
+      );
+      first.close();
+
+      // Revoke first: the owner's append is rejected.
+      const second = createAdapters(storeType);
+      seedPartialCommit(second, "race-append");
+      second.commandStore.revokeExpired({
+        commandId: "race-append",
+        expectedToken: 1,
+        now: 60_000,
+        error: REVOKE_ERROR,
+      });
+      assert.throws(
+        () =>
+          second.eventStore.append(createEvent({ commandId: "race-append", sequence: 2 }), {
+            expectedVersion: 1,
+            fencingToken: 1,
+          }),
+        (error) => {
+          assert.equal(error.code, "FENCING_TOKEN_STALE");
+          return true;
+        }
+      );
+      assert.equal(second.eventStore.getByCommandId("race-append").length, 1);
+      second.close();
+    });
+
+    test("RACE-5/6: complete vs revoke yields exactly one terminal truth", () => {
+      const completeFirst = createAdapters(storeType);
+      seedPartialCommit(completeFirst, "race-complete");
+      completeFirst.commandStore.complete("race-complete", { ok: true }, { fencingToken: 1 });
+      const revokeAfter = completeFirst.commandStore.revokeExpired({
+        commandId: "race-complete",
+        expectedToken: 1,
+        now: 60_000,
+        error: REVOKE_ERROR,
+      });
+      assert.equal(revokeAfter.success, false);
+      assert.equal(revokeAfter.reason, "NOT_PROCESSING");
+      assert.equal(
+        completeFirst.commandStore.get("race-complete").status,
+        COMMAND_STATUSES.COMPLETED
+      );
+      completeFirst.close();
+
+      const revokeFirst = createAdapters(storeType);
+      seedPartialCommit(revokeFirst, "race-complete");
+      assert.equal(
+        revokeFirst.commandStore.revokeExpired({
+          commandId: "race-complete",
+          expectedToken: 1,
+          now: 60_000,
+          error: REVOKE_ERROR,
+        }).success,
+        true
+      );
+      assert.throws(
+        () => revokeFirst.commandStore.complete("race-complete", { ok: true }, { fencingToken: 1 }),
+        /is not processing/
+      );
+      assert.equal(
+        revokeFirst.commandStore.get("race-complete").status,
+        COMMAND_STATUSES.FAILED
+      );
+      revokeFirst.close();
+    });
+
+    test("RACE-7/8: renew vs revoke has one winner in each direction", () => {
+      // Renew first -> revocation is refused as not expired (this is CE-12).
+      const renewFirst = createAdapters(storeType);
+      seedPartialCommit(renewFirst, "race-renew");
+      renewFirst.commandStore.renewLease({
+        commandId: "race-renew",
+        workerId: "worker-A",
+        fencingToken: 1,
+        leaseTtlMs: TTL,
+        now: 60_000,
+      });
+      assert.equal(
+        renewFirst.commandStore.revokeExpired({
+          commandId: "race-renew",
+          expectedToken: 1,
+          now: 60_000,
+          error: REVOKE_ERROR,
+        }).reason,
+        "NOT_EXPIRED"
+      );
+      assert.equal(
+        renewFirst.commandStore.get("race-renew").status,
+        COMMAND_STATUSES.PROCESSING
+      );
+      renewFirst.close();
+
+      // Revoke first -> the owner's renewal is refused because it is terminal.
+      const revokeFirst = createAdapters(storeType);
+      seedPartialCommit(revokeFirst, "race-renew");
+      assert.equal(
+        revokeFirst.commandStore.revokeExpired({
+          commandId: "race-renew",
+          expectedToken: 1,
+          now: 60_000,
+          error: REVOKE_ERROR,
+        }).success,
+        true
+      );
+      assert.throws(
+        () =>
+          revokeFirst.commandStore.renewLease({
+            commandId: "race-renew",
+            workerId: "worker-A",
+            fencingToken: 1,
+            leaseTtlMs: TTL,
+            now: 60_000,
+          }),
+        /is not processing/
+      );
+      revokeFirst.close();
+    });
+
+    test("Phase 9: a repeated revocation is idempotent and mutates nothing", () => {
+      const adapters = createAdapters(storeType);
+      const event = seedPartialCommit(adapters, "rev-ack");
+
+      const first = adapters.commandStore.revokeExpired({
+        commandId: "rev-ack",
+        expectedToken: 1,
+        now: 60_000,
+        error: REVOKE_ERROR,
+      });
+      assert.equal(first.success, true);
+      const afterFirst = adapters.commandStore.get("rev-ack");
+
+      const second = adapters.commandStore.revokeExpired({
+        commandId: "rev-ack",
+        expectedToken: 1,
+        now: 60_000,
+        error: REVOKE_ERROR,
+      });
+      assert.equal(second.success, false);
+      assert.equal(second.reason, "NOT_PROCESSING");
+
+      assert.deepEqual(adapters.commandStore.get("rev-ack"), afterFirst, "no second transition");
+      assert.equal(adapters.commandStore.get("rev-ack").leaseToken, 1, "no new generation");
+      assert.equal(adapters.eventStore.getByCommandId("rev-ack").length, 1, "history untouched");
+      assert.deepEqual(afterFirst.eventRange.eventIds, [event.eventId]);
+      adapters.close();
+    });
+
+    // --- Suspend / resume -------------------------------------------------
+
+    test("SUSPEND-1: an expired uncontested owner may still renew, append and complete", () => {
+      const adapters = createAdapters(storeType);
+      seedPartialCommit(adapters, "suspend-1");
+
+      assert.equal(
+        adapters.commandStore.renewLease({
+          commandId: "suspend-1",
+          workerId: "worker-A",
+          fencingToken: 1,
+          leaseTtlMs: TTL,
+          now: 60_000,
+        }).renewed,
+        true
+      );
+      const appended = adapters.eventStore.append(
+        createEvent({ commandId: "suspend-1", sequence: 2 }),
+        { expectedVersion: 1, fencingToken: 1 }
+      );
+      assert.equal(appended.sequence, 2);
+      assert.equal(
+        adapters.commandStore.complete("suspend-1", { ok: true }, { fencingToken: 1 }).status,
+        COMMAND_STATUSES.COMPLETED
+      );
+      adapters.close();
+    });
+
+    test("SUSPEND-2: after a zero-event takeover the old generation is rejected", () => {
+      const adapters = createAdapters(storeType);
+      reserve(adapters.commandStore, "suspend-2");
+      const takeover = adapters.commandStore.takeOverExpired({
+        commandId: "suspend-2",
+        workerId: "worker-B",
+        leaseTtlMs: TTL,
+        now: 60_000,
+        expectedToken: 1,
+      });
+      assert.equal(takeover.success, true);
+      assert.equal(takeover.record.leaseToken, 2);
+
+      assert.throws(
+        () =>
+          adapters.commandStore.renewLease({
+            commandId: "suspend-2",
+            workerId: "worker-A",
+            fencingToken: 1,
+            leaseTtlMs: TTL,
+            now: 60_000,
+          }),
+        (error) => error.code === "FENCING_TOKEN_STALE"
+      );
+      assert.throws(
+        () =>
+          adapters.eventStore.append(createEvent({ commandId: "suspend-2", sequence: 1 }), {
+            expectedVersion: 0,
+            fencingToken: 1,
+          }),
+        (error) => error.code === "FENCING_TOKEN_STALE"
+      );
+      assert.throws(
+        () => adapters.commandStore.complete("suspend-2", {}, { fencingToken: 1 }),
+        (error) => error.code === "FENCING_TOKEN_STALE"
+      );
+      adapters.close();
+    });
+
+    test("SUSPEND-3: after revocation the old execution path is rejected by status", () => {
+      const adapters = createAdapters(storeType);
+      seedPartialCommit(adapters, "suspend-3");
+      adapters.commandStore.revokeExpired({
+        commandId: "suspend-3",
+        expectedToken: 1,
+        now: 60_000,
+        error: REVOKE_ERROR,
+      });
+
+      assert.throws(
+        () =>
+          adapters.commandStore.renewLease({
+            commandId: "suspend-3",
+            workerId: "worker-A",
+            fencingToken: 1,
+            leaseTtlMs: TTL,
+            now: 60_000,
+          }),
+        /is not processing/
+      );
+      assert.throws(
+        () =>
+          adapters.eventStore.append(createEvent({ commandId: "suspend-3", sequence: 2 }), {
+            expectedVersion: 1,
+            fencingToken: 1,
+          }),
+        (error) => error.code === "FENCING_TOKEN_STALE"
+      );
+      assert.throws(
+        () => adapters.commandStore.complete("suspend-3", {}, { fencingToken: 1 }),
+        /is not processing/
+      );
+      adapters.close();
+    });
+
+    test("OWNER-1: the same owner across generations is still fenced", () => {
+      const adapters = createAdapters(storeType);
+      reserve(adapters.commandStore, "owner-1", { workerId: "worker-A" });
+      const takeover = adapters.commandStore.takeOverExpired({
+        commandId: "owner-1",
+        workerId: "worker-A", // same identity, new generation
+        leaseTtlMs: TTL,
+        now: 60_000,
+        expectedToken: 1,
+      });
+      assert.equal(takeover.record.leaseToken, 2);
+      assert.equal(takeover.record.leaseOwner, "worker-A");
+
+      assert.throws(
+        () =>
+          adapters.commandStore.renewLease({
+            commandId: "owner-1",
+            workerId: "worker-A",
+            fencingToken: 1,
+            leaseTtlMs: TTL,
+            now: 60_000,
+          }),
+        (error) => {
+          assert.equal(error.code, "FENCING_TOKEN_STALE");
+          assert.equal(error.providedToken, 1);
+          assert.equal(error.currentToken, 2);
+          return true;
+        }
+      );
+      // Control: the identical call from the live generation succeeds.
+      assert.equal(
+        adapters.commandStore.renewLease({
+          commandId: "owner-1",
+          workerId: "worker-A",
+          fencingToken: 2,
+          leaseTtlMs: TTL,
+          now: 60_000,
+        }).renewed,
+        true
+      );
+      adapters.close();
+    });
+  });
+}
+
+// ===========================================================================
+// Coordinator level: post-first-event death and zero-event boundaries.
+// ===========================================================================
+for (const storeType of ["memory", "sqlite"]) {
+  describe(`Lease authority end to end (${storeType})`, () => {
+    function engineOn(adapters, workerId, now) {
+      return new RollbackEngine({
+        eventStore: adapters.eventStore,
+        commandStore: adapters.commandStore,
+        snapshotStore: adapters.snapshotStore,
+        stateRepository: adapters.stateRepository,
+        workerId,
+        leaseTtlMs: TTL,
+        now,
+        clock: () => new Date(now()).toISOString(),
+      });
+    }
+
+    test("post-first-event death: retry revokes once and then stays stable", () => {
+      const adapters = createAdapters(storeType);
+      // A real epoch base keeps engine-generated timestamps after the seeded one.
+      const base = Date.parse("2026-08-15T12:00:00.000Z");
+      let clock = base;
+      if (typeof adapters.eventStore.setNow === "function") {
+        adapters.eventStore.setNow(() => clock);
+      }
+      const event = seedPartialCommit(adapters, "death-1", {
+        now: base,
+        payload: ENGINE_PAYLOAD,
+      });
+
+      // The owner is gone. Its lease is still valid, so a retry must wait.
+      clock = base + 1000;
+      const engine = engineOn(adapters, "worker-B", () => clock);
+      assert.throws(
+        () => engine.checkout(PAYLOAD, { commandId: "death-1" }),
+        (error) => error.code === "COMMAND_IN_PROGRESS"
+      );
+
+      clock = base + 90_000;
+      const outcomes = [];
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          engine.checkout(PAYLOAD, { commandId: "death-1" });
+          outcomes.push("SUCCEEDED");
+        } catch (error) {
+          outcomes.push(error.code);
+        }
+      }
+      assert.deepEqual(outcomes, [
+        "COMMAND_EXECUTION_INTERRUPTED_AFTER_COMMIT",
+        "COMMAND_EXECUTION_INTERRUPTED_AFTER_COMMIT",
+        "COMMAND_EXECUTION_INTERRUPTED_AFTER_COMMIT",
+      ]);
+
+      const row = adapters.commandStore.get("death-1");
+      assert.equal(row.status, COMMAND_STATUSES.FAILED);
+      assert.equal(row.leaseToken, 1, "revocation keeps the generation");
+      assert.equal(row.error.code, "COMMAND_EXECUTION_INTERRUPTED_AFTER_COMMIT");
+      assert.deepEqual(row.eventRange.eventIds, [event.eventId]);
+      assert.equal(adapters.eventStore.getByCommandId("death-1").length, 1, "no duplicates");
+
+      // Takeover of a partially committed command stays forbidden.
+      assert.equal(
+        adapters.commandStore.takeOverExpired({
+          commandId: "death-1",
+          workerId: "worker-C",
+          leaseTtlMs: TTL,
+          now: clock,
+        }).success,
+        false
+      );
+
+      // Explicit compensation through a NEW command remains possible.
+      const compensation = engine.compensate(1, "operator cleanup", { commandId: "death-1-fix" });
+      assert.equal(compensation.status, "rolled_back");
+      adapters.close();
+    });
+
+    test("ZERO-2: a zero-event command completes after expiry when uncontested", () => {
+      const adapters = createAdapters(storeType);
+      let clock = 1_000_000;
+      if (typeof adapters.eventStore.setNow === "function") {
+        adapters.eventStore.setNow(() => clock);
+      }
+      const engine = engineOn(adapters, "worker-A", () => clock);
+
+      engine.checkout({ ...PAYLOAD, simulateFailureAt: "after_payment" }, { commandId: "zero-setup" });
+      assert.equal(engine.replay(1).lifecycle, "rolled_back");
+
+      clock += 10 * LONG_STEP;
+      const compensation = engine.compensate(1, "already compensated", { commandId: "zero-2" });
+      assert.equal(compensation.events.length, 0, "this path never reaches commitEvent()");
+      assert.equal(adapters.commandStore.get("zero-2").status, COMMAND_STATUSES.COMPLETED);
+      adapters.close();
+    });
+
+    test("ZERO-1/3: an expired zero-event command is taken over, old generation rejected", () => {
+      const adapters = createAdapters(storeType);
+      reserve(adapters.commandStore, "zero-1");
+      const takeover = adapters.commandStore.takeOverExpired({
+        commandId: "zero-1",
+        workerId: "worker-B",
+        leaseTtlMs: TTL,
+        now: 60_000,
+        expectedToken: 1,
+      });
+      assert.equal(takeover.success, true);
+      assert.equal(takeover.record.leaseToken, 2);
+      assert.throws(
+        () => adapters.commandStore.complete("zero-1", {}, { fencingToken: 1 }),
+        (error) => error.code === "FENCING_TOKEN_STALE"
+      );
+      adapters.close();
+    });
+  });
+}
+
+// ===========================================================================
+// Real multi-connection SQLite interleavings.
+// ===========================================================================
+describe("Lease authority under SQLite concurrency", () => {
+  /** Fires a barrier immediately after a command SELECT resolves. */
+  function withBarrierAfterSelect(db, onAfterSelect) {
+    return {
+      prepare(sql) {
+        const statement = db.prepare(sql);
+        const isCommandSelect = /SELECT[\s\S]*FROM commands[\s\S]*WHERE command_id/i.test(sql);
+        return {
+          get(...args) {
+            const row = statement.get(...args);
+            if (isCommandSelect) onAfterSelect();
+            return row;
+          },
+          all: (...args) => statement.all(...args),
+          run: (...args) => statement.run(...args),
+        };
+      },
+      exec: (sql) => db.exec(sql),
+      close: () => db.close(),
+    };
+  }
+
+  test("SQLITE-0: no connection ever observes a terminal row with a stale range", () => {
+    const dbPath = join(tmpdir(), `rollback-lease-atomic-${randomUUID()}.db`);
+    const dbA = createSqliteDatabase({ path: dbPath, busyTimeout: 50 });
+    const dbB = createSqliteDatabase({ path: dbPath, busyTimeout: 50 });
+    const observer = new SqliteCommandStore({ db: dbB });
+    const commandId = "sqlite-revoke-atomicity";
+
+    // Every write connection A performs during the revocation is sampled from a
+    // second connection. A split revoke/reconcile design would expose a durable
+    // "failed with a lagging range" row to that observer; an atomic one cannot.
+    const samples = [];
+    let sampling = false;
+    function samplingDb(db) {
+      return {
+        prepare(sql) {
+          const statement = db.prepare(sql);
+          const isWrite = /^\s*(UPDATE|INSERT|DELETE)/i.test(sql);
+          return {
+            get: (...args) => statement.get(...args),
+            all: (...args) => statement.all(...args),
+            run(...args) {
+              const result = statement.run(...args);
+              if (sampling && isWrite) samples.push(observer.get(commandId));
+              return result;
+            },
+          };
+        },
+        exec: (sql) => db.exec(sql),
+        close: () => db.close(),
+      };
+    }
+
+    const storeA = new SqliteCommandStore({ db: samplingDb(dbA) });
+    const eventA = new SqliteEventStore({ db: dbA, now: () => 90_000 });
+
+    try {
+      storeA.reserve({
+        commandId,
+        commandType: "CHECKOUT",
+        payload: { ...PAYLOAD },
+        workerId: "worker-A",
+        leaseTtlMs: TTL,
+        now: 1000,
+      });
+      const first = createEvent({ commandId, sequence: 1 });
+      eventA.append(first, { expectedVersion: 0, fencingToken: 1 });
+      storeA.recordEvent(commandId, first, { fencingToken: 1 });
+
+      // A second event is durable but deliberately not recorded, so a split
+      // design would have a genuinely stale range to expose.
+      const second = createEvent({ commandId, sequence: 2 });
+      eventA.append(second, { expectedVersion: 1, fencingToken: 1 });
+      const authoritative = [first.eventId, second.eventId];
+
+      sampling = true;
+      const outcome = storeA.revokeExpired({
+        commandId,
+        expectedToken: 1,
+        now: 90_000,
+        error: REVOKE_ERROR,
+      });
+      sampling = false;
+
+      assert.equal(outcome.success, true);
+      assert.ok(samples.length > 0, "the revocation must have been sampled mid-flight");
+
+      for (const sample of samples) {
+        const staleTerminal =
+          sample.status === COMMAND_STATUSES.FAILED &&
+          (sample.eventRange === null ||
+            sample.eventRange.eventIds.length !== authoritative.length);
+        assert.equal(
+          staleTerminal,
+          false,
+          `observer saw a terminal row with a stale range: ${JSON.stringify(sample)}`
+        );
+      }
+
+      const final = observer.get(commandId);
+      assert.equal(final.status, COMMAND_STATUSES.FAILED);
+      assert.deepEqual(final.eventRange.eventIds, authoritative);
+    } finally {
+      dbA.close();
+      dbB.close();
+    }
+  });
+
+  test("SQLITE-0b: a generation change inside the revocation window matches no row", () => {
+    const dbPath = join(tmpdir(), `rollback-lease-cas-${randomUUID()}.db`);
+    const db = createSqliteDatabase({ path: dbPath });
+    const commandId = "sqlite-revoke-cas";
+
+    let armed = false;
+    const store = new SqliteCommandStore({
+      db: {
+        prepare(sql) {
+          const statement = db.prepare(sql);
+          const isCommandSelect = /SELECT[\s\S]*FROM commands[\s\S]*WHERE command_id/i.test(sql);
+          return {
+            get(...args) {
+              const row = statement.get(...args);
+              if (isCommandSelect && armed) {
+                armed = false;
+                // The generation moves after revokeExpired validated it but
+                // before it writes.
+                db.prepare(
+                  "UPDATE commands SET lease_token = lease_token + 1 WHERE command_id = ?"
+                ).run(commandId);
+              }
+              return row;
+            },
+            all: (...args) => statement.all(...args),
+            run: (...args) => statement.run(...args),
+          };
+        },
+        exec: (sql) => db.exec(sql),
+        close: () => db.close(),
+      },
+    });
+    const eventStore = new SqliteEventStore({ db, now: () => 90_000 });
+
+    try {
+      store.reserve({
+        commandId,
+        commandType: "CHECKOUT",
+        payload: { ...PAYLOAD },
+        workerId: "worker-A",
+        leaseTtlMs: TTL,
+        now: 1000,
+      });
+      const event = createEvent({ commandId, sequence: 1 });
+      eventStore.append(event, { expectedVersion: 0, fencingToken: 1 });
+      store.recordEvent(commandId, event, { fencingToken: 1 });
+
+      armed = true;
+      assert.throws(
+        () =>
+          store.revokeExpired({
+            commandId,
+            expectedToken: 1,
+            now: 90_000,
+            error: REVOKE_ERROR,
+          }),
+        (error) => {
+          assert.equal(error.code, "FENCING_TOKEN_STALE");
+          return true;
+        }
+      );
+
+      // Nothing the stale revoker attempted survived.
+      const row = store.get(commandId);
+      assert.equal(row.status, COMMAND_STATUSES.PROCESSING);
+      assert.equal(row.error, null);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("SQLITE-1: revoke cannot commit between append's validation and its insert", () => {
+    const dbPath = join(tmpdir(), `rollback-lease-append-${randomUUID()}.db`);
+    const dbA = createSqliteDatabase({ path: dbPath, busyTimeout: 50 });
+    const dbB = createSqliteDatabase({ path: dbPath, busyTimeout: 50 });
+    const storeB = new SqliteCommandStore({ db: dbB });
+    const commandId = "sqlite-append-vs-revoke";
+
+    let armed = false;
+    let revocation = null;
+    const commandA = new SqliteCommandStore({ db: dbA });
+    const eventA = new SqliteEventStore({
+      db: withBarrierAfterSelect(dbA, () => {
+        if (!armed) return;
+        armed = false;
+        try {
+          revocation = storeB.revokeExpired({
+            commandId,
+            expectedToken: 1,
+            now: 90_000,
+            error: REVOKE_ERROR,
+          });
+        } catch (error) {
+          revocation = { success: false, reason: "BLOCKED", error };
+        }
+      }),
+      now: () => 90_000,
+    });
+
+    try {
+      commandA.reserve({
+        commandId,
+        commandType: "CHECKOUT",
+        payload: { ...PAYLOAD },
+        workerId: "worker-A",
+        leaseTtlMs: TTL,
+        now: 1000,
+      });
+      const first = createEvent({ commandId, sequence: 1 });
+      eventA.append(first, { expectedVersion: 0, fencingToken: 1 });
+      commandA.recordEvent(commandId, first, { fencingToken: 1 });
+
+      armed = true;
+      let appendError = null;
+      try {
+        eventA.append(createEvent({ commandId, sequence: 2 }), {
+          expectedVersion: 1,
+          fencingToken: 1,
+        });
+      } catch (error) {
+        appendError = error;
+      }
+
+      assert.notEqual(revocation, null, "the barrier must have run inside the append window");
+      assert.notEqual(
+        revocation.success,
+        true,
+        "a revocation must never commit inside an append transaction"
+      );
+
+      // Whichever way contention resolved, the row is never terminal while its
+      // range disagrees with the authoritative history.
+      const row = storeB.get(commandId);
+      const events = eventA.getByCommandId(commandId);
+      if (row.status === COMMAND_STATUSES.FAILED) {
+        assert.deepEqual(
+          row.eventRange.eventIds,
+          events.map((event) => event.eventId)
+        );
+      } else {
+        assert.equal(row.status, COMMAND_STATUSES.PROCESSING);
+        assert.equal(appendError, null, "an uncontested append must succeed");
+        assert.equal(events.length, 2);
+      }
+    } finally {
+      dbA.close();
+      dbB.close();
+    }
+  });
+
+  for (const [label, ownerMutation] of [
+    ["SQLITE-2: complete", (store, commandId) => store.complete(commandId, { ok: true }, { fencingToken: 1 })],
+    [
+      "SQLITE-3: renew",
+      (store, commandId) =>
+        store.renewLease({
+          commandId,
+          workerId: "worker-A",
+          fencingToken: 1,
+          leaseTtlMs: TTL,
+          now: 90_000,
+        }),
+    ],
+  ]) {
+    test(`${label} vs revoke across two connections has one winner`, () => {
+      const dbPath = join(tmpdir(), `rollback-lease-owner-${randomUUID()}.db`);
+      const dbA = createSqliteDatabase({ path: dbPath, busyTimeout: 50 });
+      const dbB = createSqliteDatabase({ path: dbPath, busyTimeout: 50 });
+      const storeB = new SqliteCommandStore({ db: dbB });
+      const commandId = "sqlite-owner-vs-revoke";
+
+      let armed = false;
+      let revocation = null;
+      const storeA = new SqliteCommandStore({
+        db: withBarrierAfterSelect(dbA, () => {
+          if (!armed) return;
+          armed = false;
+          try {
+            revocation = storeB.revokeExpired({
+              commandId,
+              expectedToken: 1,
+              now: 90_000,
+              error: REVOKE_ERROR,
+            });
+          } catch (error) {
+            revocation = { success: false, reason: "BLOCKED", error };
+          }
+        }),
+      });
+      const eventA = new SqliteEventStore({ db: dbA, now: () => 90_000 });
+
+      try {
+        storeA.reserve({
+          commandId,
+          commandType: "CHECKOUT",
+          payload: { ...PAYLOAD },
+          workerId: "worker-A",
+          leaseTtlMs: TTL,
+          now: 1000,
+        });
+        const seeded = createEvent({ commandId, sequence: 1 });
+        eventA.append(seeded, { expectedVersion: 0, fencingToken: 1 });
+        storeA.recordEvent(commandId, seeded, { fencingToken: 1 });
+
+        armed = true;
+        let ownerError = null;
+        try {
+          ownerMutation(storeA, commandId);
+        } catch (error) {
+          ownerError = error;
+        }
+
+        assert.notEqual(revocation, null, "the barrier must have run inside the owner transaction");
+        assert.notEqual(
+          revocation.success,
+          true,
+          "a revocation must never commit inside an owner transaction"
+        );
+
+        const row = storeB.get(commandId);
+        assert.notEqual(
+          row.status === COMMAND_STATUSES.FAILED && ownerError === null,
+          true,
+          "the owner and the revoker must not both report success"
+        );
+      } finally {
+        dbA.close();
+        dbB.close();
+      }
+    });
+  }
+});

@@ -3,7 +3,6 @@ const { COMMAND_STATUSES } = require("../../application/storeContracts");
 const {
   createFencingTokenStaleError,
   createFencingTokenRequiredError,
-  createCommandLeaseExpiredError,
 } = require("../../application/errors");
 
 function assertNonEmptyString(value, fieldName) {
@@ -111,6 +110,10 @@ class SqliteCommandStore {
 
   #stmtCountEvents;
 
+  #stmtEventsByCommandId;
+
+  #stmtRevokeExpired;
+
   constructor({ db } = {}) {
     if (!db || typeof db.prepare !== "function") {
       throw new TypeError("db must be a valid SQLite database instance");
@@ -191,6 +194,24 @@ class SqliteCommandStore {
 
     this.#stmtCountEvents = this.#db.prepare(`
       SELECT COUNT(*) as cnt FROM events WHERE command_id = ?
+    `);
+
+    // LA-14: the 0-vs->=1 decision and the persisted range are derived from the
+    // authoritative events table, never from the (possibly lagging) event_range.
+    this.#stmtEventsByCommandId = this.#db.prepare(`
+      SELECT event_id, aggregate_id, sequence, command_id
+      FROM events
+      WHERE command_id = ?
+      ORDER BY rowid ASC
+    `);
+
+    // LA-10: revocation and the bookkeeping derived from authoritative history
+    // are one state transition, so there is no durable intermediate state.
+    this.#stmtRevokeExpired = this.#db.prepare(`
+      UPDATE commands
+      SET status = ?, error = ?, aggregate_id = ?, event_range = ?,
+          lease_owner = NULL, lease_expires_at = NULL, updated_at = CURRENT_TIMESTAMP
+      WHERE command_id = ? AND status = ? AND lease_token = ?
     `);
   }
 
@@ -382,6 +403,91 @@ class SqliteCommandStore {
     }
   }
 
+  /**
+   * Third-party authority revocation for a partially committed command. The
+   * mirror image of takeOverExpired(): that one advances the generation when no
+   * authoritative event exists, this one terminalises it when at least one does.
+   *
+   * Everything the decision rests on - status, generation, expiry and the
+   * authoritative event history - is read and acted upon inside a single
+   * BEGIN IMMEDIATE transaction, so a stale observation can never revoke a
+   * worker that renewed in the meantime (LA-13), and no durable state exists in
+   * which the row is terminal but its bookkeeping is not yet authoritative
+   * (LA-10).
+   */
+  revokeExpired({ commandId, expectedToken, now = Date.now(), error } = {}) {
+    assertNonEmptyString(commandId, "commandId");
+
+    if (!Number.isSafeInteger(expectedToken) || expectedToken <= 0) {
+      throw new TypeError("expectedToken must be a positive safe integer");
+    }
+
+    if (!error || typeof error !== "object" || Array.isArray(error)) {
+      throw new TypeError("error must be an object");
+    }
+
+    return this.#transaction(() => {
+      const row = this.#stmtGetCommand.get(commandId);
+
+      if (!row) {
+        return { success: false, reason: "NOT_FOUND" };
+      }
+
+      if (row.status !== COMMAND_STATUSES.PROCESSING) {
+        return { success: false, reason: "NOT_PROCESSING" };
+      }
+
+      const currentToken = row.lease_token !== null ? Number(row.lease_token) : 1;
+
+      if (currentToken !== expectedToken) {
+        return { success: false, reason: "TOKEN_MISMATCH" };
+      }
+
+      // LA-13: the caller observed expiry earlier; only this read decides.
+      const expiresAt = row.lease_expires_at !== null ? Number(row.lease_expires_at) : null;
+
+      if (expiresAt !== null && expiresAt > now) {
+        return { success: false, reason: "NOT_EXPIRED" };
+      }
+
+      // LA-14: authoritative event history, in this same write transaction.
+      const eventRows = this.#stmtEventsByCommandId.all(commandId);
+
+      if (eventRows.length === 0) {
+        return { success: false, reason: "NO_EVENTS" };
+      }
+
+      const eventRange = buildEventRange(
+        eventRows.map((eventRow) => ({
+          eventId: eventRow.event_id,
+          aggregateId: eventRow.aggregate_id,
+          sequence: Number(eventRow.sequence),
+          metadata: { commandId: eventRow.command_id },
+        })),
+        commandId
+      );
+
+      const persistedError = {
+        ...clone(error),
+        aggregateId: eventRange.aggregateId,
+        eventIds: [...eventRange.eventIds],
+      };
+
+      const applied = this.#stmtRevokeExpired.run(
+        COMMAND_STATUSES.FAILED,
+        JSON.stringify(persistedError),
+        eventRange.aggregateId,
+        JSON.stringify(eventRange),
+        commandId,
+        COMMAND_STATUSES.PROCESSING,
+        expectedToken
+      );
+      this.#assertApplied(commandId, expectedToken, applied);
+
+      return { success: true, record: this.get(commandId) };
+    });
+  }
+
   renewLease({
     commandId,
     workerId,
@@ -421,17 +527,9 @@ class SqliteCommandStore {
         });
       }
 
-      const expiresAt = row.lease_expires_at !== null ? Number(row.lease_expires_at) : null;
-      if (expiresAt !== null && expiresAt <= now) {
-        throw createCommandLeaseExpiredError({
-          commandId,
-          fencingToken: currentToken,
-          leaseExpiresAt: expiresAt,
-          now,
-          workerId,
-        });
-      }
-
+      // Lease expiry is a promise to third parties, not a self-permission. A
+      // worker that still holds the current generation may renew after the
+      // nominal TTL; only a committed takeover or revocation removes authority.
       const newExpiresAt = now + leaseTtlMs;
       const applied = this.#stmtRenewLease.run(
         newExpiresAt,

@@ -2,7 +2,6 @@ const { assertDomainEvent } = require("../../domain/events");
 const {
   createFencingTokenStaleError,
   createFencingTokenRequiredError,
-  createCommandLeaseExpiredError,
   createFencingContextInvalidError,
 } = require("../../application/errors");
 
@@ -199,17 +198,9 @@ class SqliteEventStore {
               });
             }
 
-            if (cmdRow.lease_expires_at !== null && cmdRow.lease_expires_at !== undefined) {
-              const nowMs = this.#now();
-              if (Number(cmdRow.lease_expires_at) <= nowMs) {
-                throw createCommandLeaseExpiredError({
-                  commandId: event.metadata.commandId,
-                  fencingToken: Number(fencingToken),
-                  leaseExpiresAt: Number(cmdRow.lease_expires_at),
-                  now: nowMs,
-                });
-              }
-            }
+            // No owner-side expiry rejection: holding the current generation
+            // of a processing command is the write authority. Expiry only makes
+            // the command challengeable by a third party.
           }
         } else if (fencingToken !== undefined && fencingToken !== null) {
           // Command row missing but fencing token was provided: fencing context is invalid

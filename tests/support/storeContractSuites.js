@@ -388,6 +388,46 @@ function registerCommandStoreContract({ adapterName, createStore }) {
       );
     });
 
+    test("revokes only a processing, correctly-generationed, still-expired command", () => {
+      const store = createStore();
+      const descriptor = commandDescriptor("revoke-cmd");
+      const error = { code: "COMMAND_EXECUTION_INTERRUPTED_AFTER_COMMIT" };
+
+      assert.deepEqual(
+        store.revokeExpired({ commandId: "absent-cmd", expectedToken: 1, now: 9000, error }),
+        { success: false, reason: "NOT_FOUND" }
+      );
+
+      store.reserve({ ...descriptor, workerId: "worker-a", leaseTtlMs: 1000, now: 1000 });
+
+      // Still inside the lease: a third party may not revoke yet.
+      assert.deepEqual(
+        store.revokeExpired({ commandId: descriptor.commandId, expectedToken: 1, now: 1500, error }),
+        { success: false, reason: "NOT_EXPIRED" }
+      );
+
+      // Expired, but naming a generation that is not the current one.
+      assert.deepEqual(
+        store.revokeExpired({ commandId: descriptor.commandId, expectedToken: 99, now: 9000, error }),
+        { success: false, reason: "TOKEN_MISMATCH" }
+      );
+
+      // A terminal command is no longer revocable.
+      store.complete(descriptor.commandId, { ok: true }, { fencingToken: 1 });
+      assert.deepEqual(
+        store.revokeExpired({ commandId: descriptor.commandId, expectedToken: 1, now: 9000, error }),
+        { success: false, reason: "NOT_PROCESSING" }
+      );
+
+      // Argument contract.
+      assert.throws(() =>
+        store.revokeExpired({ commandId: descriptor.commandId, now: 9000, error })
+      );
+      assert.throws(() =>
+        store.revokeExpired({ commandId: descriptor.commandId, expectedToken: 1, now: 9000 })
+      );
+    });
+
     test("allows safe takeover only when processing, expired, and without committed events", () => {
       const store = createStore();
       const descriptor = commandDescriptor("takeover-cmd");
