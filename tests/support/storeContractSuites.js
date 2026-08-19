@@ -781,6 +781,61 @@ function registerCommandStoreContract({ adapterName, createStore }) {
       assert.equal(refusing.get(bad.commandId), null, "no unreadable row may be written");
     });
 
+    // Re-reserving a released command is the one reserve path that rewrites an
+    // existing row in place rather than inserting a new one. A policy refused
+    // after that rewrite began would leave the command processing, with the
+    // generation already advanced and no deadline at all - the shape that is
+    // never challengeable again. The refusal therefore has to happen before the
+    // first field is touched, and this is what pins that ordering.
+    test("LT-6: a refused re-reservation leaves a released command untouched", () => {
+      const store = createClockedStore(createStore);
+      const descriptor = commandDescriptor("ttl-released-rereserve");
+
+      at(store, 1000).reserve({ ...descriptor, workerId: "worker-a", leaseTtlMs: 1000 });
+      assert.equal(store.release(descriptor.commandId, { fencingToken: 1 }), true);
+
+      const released = store.get(descriptor.commandId);
+      assert.equal(released.status, "released");
+      assert.equal(released.leaseToken, 1);
+      assert.equal(released.leaseExpiresAt, null);
+
+      for (const [label, leaseTtlMs] of [
+        // Refused by the duration check, before the store reads its clock.
+        ["a malformed duration", NaN],
+        // Refused only by the deadline check: the duration itself is a
+        // perfectly good positive safe integer, so this is the case that
+        // actually depends on where the deadline is built.
+        ["a duration whose deadline overflows", Number.MAX_SAFE_INTEGER - 1000 + 1],
+      ]) {
+        assert.throws(
+          () =>
+            at(store, 1000).reserve({
+              ...descriptor,
+              workerId: "worker-b",
+              leaseTtlMs,
+            }),
+          TypeError,
+          `re-reserving a released command with ${label} must be refused`
+        );
+        assert.deepEqual(
+          store.get(descriptor.commandId),
+          released,
+          `${label}: a refused re-reservation must not rewrite the released row`
+        );
+      }
+
+      // The row is still genuinely re-reservable, so the refusals above were
+      // about the policy and not about the command having become unusable.
+      const reReserved = at(store, 1000).reserve({
+        ...descriptor,
+        workerId: "worker-b",
+        leaseTtlMs: 1000,
+      });
+      assert.equal(reReserved.created, true);
+      assert.equal(reReserved.record.leaseToken, 2);
+      assert.equal(reReserved.record.leaseExpiresAt, 2000);
+    });
+
     test("LT-2: renewLease refuses a duration whose deadline is not a safe integer", () => {
       const now = 1000;
       const maxSafeTtl = Number.MAX_SAFE_INTEGER - now;
