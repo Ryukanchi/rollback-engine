@@ -1,5 +1,9 @@
 const { isDeepStrictEqual } = require("node:util");
-const { COMMAND_STATUSES } = require("../../application/storeContracts");
+const {
+  COMMAND_STATUSES,
+  assertLeaseTtlMs,
+  createLeaseDeadline,
+} = require("../../application/storeContracts");
 const {
   createFencingTokenStaleError,
   createFencingTokenRequiredError,
@@ -235,11 +239,17 @@ class SqliteCommandStore {
     assertNonEmptyString(commandId, "commandId");
     assertNonEmptyString(commandType, "commandType");
     assertPayload(payload);
+    // Shape only: this depends on caller data alone, so an unusable policy is
+    // refused without ever taking the write lock.
+    assertLeaseTtlMs(leaseTtlMs);
 
     // G5: reading the row and claiming the next generation must be one atomic
     // step, otherwise two workers can derive the same successor token.
     return this.#transaction(() => {
       const now = this.#now();
+      // The deadline needs the store clock, so it is built here and before any
+      // statement runs: an unrepresentable one must never reach the row.
+      const leaseExpiresAt = workerId ? createLeaseDeadline(now, leaseTtlMs) : null;
       const existingRow = this.#stmtGetCommand.get(commandId);
 
       if (existingRow) {
@@ -258,7 +268,6 @@ class SqliteCommandStore {
 
           const leaseOwner = workerId;
           const leaseToken = (existing.leaseToken || 1) + 1;
-          const leaseExpiresAt = workerId ? now + leaseTtlMs : null;
 
           const applied = this.#stmtReReserveCommand.run(
             commandType,
@@ -303,7 +312,6 @@ class SqliteCommandStore {
 
       const leaseOwner = workerId;
       const leaseToken = 1;
-      const leaseExpiresAt = workerId ? now + leaseTtlMs : null;
 
       const record = {
         commandId,
@@ -349,6 +357,7 @@ class SqliteCommandStore {
   } = {}) {
     assertNonEmptyString(commandId, "commandId");
     assertNonEmptyString(workerId, "workerId");
+    assertLeaseTtlMs(leaseTtlMs);
 
     this.#db.exec("BEGIN IMMEDIATE;");
 
@@ -357,6 +366,7 @@ class SqliteCommandStore {
       // it is compared against, so eligibility is decided on one consistent
       // observation of both.
       const now = this.#now();
+      const newExpiresAt = createLeaseDeadline(now, leaseTtlMs);
       const row = this.#stmtGetCommand.get(commandId);
 
       if (!row) {
@@ -402,7 +412,6 @@ class SqliteCommandStore {
       }
 
       const newToken = currentToken + 1;
-      const newExpiresAt = now + leaseTtlMs;
 
       this.#stmtTakeOver.run(workerId, newToken, newExpiresAt, commandId);
       this.#db.exec("COMMIT;");
@@ -511,11 +520,13 @@ class SqliteCommandStore {
   } = {}) {
     assertNonEmptyString(commandId, "commandId");
     assertNonEmptyString(workerId, "workerId");
+    assertLeaseTtlMs(leaseTtlMs);
 
     this.#db.exec("BEGIN IMMEDIATE;");
 
     try {
       const now = this.#now();
+      const newExpiresAt = createLeaseDeadline(now, leaseTtlMs);
       const row = this.#stmtGetCommand.get(commandId);
 
       if (!row || row.status !== COMMAND_STATUSES.PROCESSING) {
@@ -545,7 +556,6 @@ class SqliteCommandStore {
       // Lease expiry is a promise to third parties, not a self-permission. A
       // worker that still holds the current generation may renew after the
       // nominal TTL; only a committed takeover or revocation removes authority.
-      const newExpiresAt = now + leaseTtlMs;
       const applied = this.#stmtRenewLease.run(
         newExpiresAt,
         commandId,

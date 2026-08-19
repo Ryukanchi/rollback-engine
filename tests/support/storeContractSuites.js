@@ -612,6 +612,260 @@ function registerCommandStoreContract({ adapterName, createStore }) {
       assert.equal(completed.leaseOwner, null);
       assert.equal(completed.leaseExpiresAt, null);
     });
+
+    // =====================================================================
+    // Lease policy. A lease duration is caller-supplied execution policy, but
+    // a malformed one must never become a persisted deadline: the two
+    // adapters coerce stray JavaScript values differently, so a value that
+    // survives validation stops having one numeric meaning. Both adapters are
+    // therefore held to the identical contract here, and every refusal has to
+    // leave the command exactly as it was.
+    // =====================================================================
+    const INVALID_LEASE_TTLS = [
+      ["null", null],
+      ["0", 0],
+      ["-1", -1],
+      ["0.5", 0.5],
+      ["NaN", NaN],
+      ["Infinity", Infinity],
+      ["-Infinity", -Infinity],
+      ['"5000"', "5000"],
+      ['""', ""],
+      ["true", true],
+      ["{}", {}],
+      ["[]", []],
+    ];
+
+    test("LT-1: reserve refuses every malformed lease duration and creates nothing", () => {
+      for (const [label, leaseTtlMs] of INVALID_LEASE_TTLS) {
+        const store = createClockedStore(createStore);
+        const descriptor = commandDescriptor("ttl-reserve");
+
+        assert.throws(
+          () => at(store, 1000).reserve({ ...descriptor, workerId: "worker-a", leaseTtlMs }),
+          TypeError,
+          `reserve must refuse a lease duration of ${label}`
+        );
+        assert.equal(
+          store.get(descriptor.commandId),
+          null,
+          `a refused lease duration of ${label} must not create a command`
+        );
+      }
+    });
+
+    test("LT-1: renewLease refuses every malformed lease duration and changes nothing", () => {
+      for (const [label, leaseTtlMs] of INVALID_LEASE_TTLS) {
+        const store = createClockedStore(createStore);
+        const descriptor = commandDescriptor("ttl-renew");
+        at(store, 1000).reserve({ ...descriptor, workerId: "worker-a", leaseTtlMs: 1000 });
+        const before = store.get(descriptor.commandId);
+
+        assert.throws(
+          () =>
+            at(store, 1500).renewLease({
+              commandId: descriptor.commandId,
+              workerId: "worker-a",
+              fencingToken: 1,
+              leaseTtlMs,
+            }),
+          TypeError,
+          `renewLease must refuse a lease duration of ${label}`
+        );
+        assert.deepEqual(
+          store.get(descriptor.commandId),
+          before,
+          `a refused renewal of ${label} must leave the row untouched`
+        );
+      }
+    });
+
+    test("LT-1: takeOverExpired refuses every malformed lease duration and changes nothing", () => {
+      for (const [label, leaseTtlMs] of INVALID_LEASE_TTLS) {
+        const store = createClockedStore(createStore);
+        const descriptor = commandDescriptor("ttl-takeover");
+        // Processing, expired, zero authoritative events, generation 1: the
+        // takeover would otherwise be granted, so only the policy can stop it.
+        at(store, 1000).reserve({ ...descriptor, workerId: "worker-a", leaseTtlMs: 1000 });
+        const before = store.get(descriptor.commandId);
+
+        assert.throws(
+          () =>
+            at(store, 9000).takeOverExpired({
+              commandId: descriptor.commandId,
+              workerId: "worker-b",
+              leaseTtlMs,
+              expectedToken: 1,
+            }),
+          TypeError,
+          `takeOverExpired must refuse a lease duration of ${label}`
+        );
+        assert.deepEqual(
+          store.get(descriptor.commandId),
+          before,
+          `a refused takeover of ${label} must not move the generation, owner or deadline`
+        );
+      }
+    });
+
+    test("LT-1: an omitted lease duration takes the default, but null is refused", () => {
+      const store = createClockedStore(createStore);
+
+      // `undefined` is what a destructuring default is for; `null` is not.
+      const omitted = at(store, 1000).reserve({
+        ...commandDescriptor("ttl-omitted"),
+        workerId: "worker-a",
+      });
+      assert.equal(omitted.record.leaseExpiresAt, 6000, "the store default still applies");
+
+      assert.throws(
+        () =>
+          at(store, 1000).reserve({
+            ...commandDescriptor("ttl-null"),
+            workerId: "worker-a",
+            leaseTtlMs: null,
+          }),
+        TypeError
+      );
+      assert.equal(store.get("ttl-null"), null);
+    });
+
+    test("LT-1: one millisecond is a valid lease duration", () => {
+      const store = createClockedStore(createStore);
+      const descriptor = commandDescriptor("ttl-one-ms");
+
+      const reserved = at(store, 1000).reserve({
+        ...descriptor,
+        workerId: "worker-a",
+        leaseTtlMs: 1,
+      });
+
+      assert.equal(reserved.record.leaseExpiresAt, 1001);
+      assert.equal(store.get(descriptor.commandId).leaseExpiresAt, 1001);
+    });
+
+    // The load-bearing case: a duration can be a perfectly good positive safe
+    // integer while `now + duration` is not. Validating the duration alone
+    // lets an unrepresentable deadline reach persistence, where SQLite accepts
+    // the write and then cannot read the row back at all.
+    test("LT-2: reserve refuses a duration whose deadline is not a safe integer", () => {
+      const now = 1000;
+      const maxSafeTtl = Number.MAX_SAFE_INTEGER - now;
+      assert.ok(Number.isSafeInteger(maxSafeTtl + 1), "the refused duration is itself a safe integer");
+
+      const accepting = createClockedStore(createStore);
+      const ok = commandDescriptor("deadline-max-safe");
+      const reserved = at(accepting, now).reserve({
+        ...ok,
+        workerId: "worker-a",
+        leaseTtlMs: maxSafeTtl,
+      });
+      assert.equal(reserved.record.leaseExpiresAt, Number.MAX_SAFE_INTEGER);
+      assert.equal(
+        accepting.get(ok.commandId).leaseExpiresAt,
+        Number.MAX_SAFE_INTEGER,
+        "the largest representable deadline must survive a round trip"
+      );
+
+      const refusing = createClockedStore(createStore);
+      const bad = commandDescriptor("deadline-overflow");
+      assert.throws(
+        () =>
+          at(refusing, now).reserve({
+            ...bad,
+            workerId: "worker-a",
+            leaseTtlMs: maxSafeTtl + 1,
+          }),
+        TypeError
+      );
+      assert.equal(refusing.get(bad.commandId), null, "no unreadable row may be written");
+    });
+
+    test("LT-2: renewLease refuses a duration whose deadline is not a safe integer", () => {
+      const now = 1000;
+      const maxSafeTtl = Number.MAX_SAFE_INTEGER - now;
+      const store = createClockedStore(createStore);
+      const descriptor = commandDescriptor("deadline-renew");
+      at(store, now).reserve({ ...descriptor, workerId: "worker-a", leaseTtlMs: 1000 });
+      const before = store.get(descriptor.commandId);
+
+      assert.throws(
+        () =>
+          at(store, now).renewLease({
+            commandId: descriptor.commandId,
+            workerId: "worker-a",
+            fencingToken: 1,
+            leaseTtlMs: maxSafeTtl + 1,
+          }),
+        TypeError
+      );
+      assert.deepEqual(store.get(descriptor.commandId), before);
+
+      const renewed = at(store, now).renewLease({
+        commandId: descriptor.commandId,
+        workerId: "worker-a",
+        fencingToken: 1,
+        leaseTtlMs: maxSafeTtl,
+      });
+      assert.equal(renewed.leaseExpiresAt, Number.MAX_SAFE_INTEGER);
+    });
+
+    test("LT-2: takeOverExpired refuses a duration whose deadline is not a safe integer", () => {
+      const takeoverAt = 9000;
+      const maxSafeTtl = Number.MAX_SAFE_INTEGER - takeoverAt;
+      const store = createClockedStore(createStore);
+      const descriptor = commandDescriptor("deadline-takeover");
+      at(store, 1000).reserve({ ...descriptor, workerId: "worker-a", leaseTtlMs: 1000 });
+      const before = store.get(descriptor.commandId);
+
+      assert.throws(
+        () =>
+          at(store, takeoverAt).takeOverExpired({
+            commandId: descriptor.commandId,
+            workerId: "worker-b",
+            leaseTtlMs: maxSafeTtl + 1,
+            expectedToken: 1,
+          }),
+        TypeError
+      );
+      assert.deepEqual(store.get(descriptor.commandId), before);
+
+      const takeover = at(store, takeoverAt).takeOverExpired({
+        commandId: descriptor.commandId,
+        workerId: "worker-b",
+        leaseTtlMs: maxSafeTtl,
+        expectedToken: 1,
+      });
+      assert.equal(takeover.success, true);
+      assert.equal(takeover.record.leaseExpiresAt, Number.MAX_SAFE_INTEGER);
+    });
+
+    // The deadline contract has two operands, so it also protects the store
+    // from its own clock. This is not clock hardening: it is the same rule.
+    test("LT-2: a clock that cannot yield a safe deadline blocks the lease", () => {
+      for (const [label, reading] of [
+        ["NaN", NaN],
+        ["Infinity", Infinity],
+        ['the string "1000"', "1000"],
+        ["an unsafe integer", Number.MAX_SAFE_INTEGER + 10],
+        ["a fractional millisecond", 1000.5],
+      ]) {
+        const store = createClockedStore(createStore);
+        const descriptor = commandDescriptor("clock-guard");
+
+        assert.throws(
+          () =>
+            at(store, reading).reserve({
+              ...descriptor,
+              workerId: "worker-a",
+              leaseTtlMs: 5000,
+            }),
+          TypeError,
+          `a clock reading of ${label} must not become a deadline`
+        );
+        assert.equal(store.get(descriptor.commandId), null);
+      }
+    });
   });
 }
 

@@ -5,6 +5,7 @@ const {
   COMMAND_STATUSES,
   assertCommandStoreAdapter,
   assertEventStoreAdapter,
+  assertLeaseTtlMs,
 } = require("./storeContracts");
 const {
   DIAGNOSTIC_STATUSES,
@@ -119,7 +120,11 @@ class CommandExecutionCoordinator {
     this.#commandStore = assertCommandStoreAdapter(commandStore);
     this.#operationIdGenerator = operationIdGenerator;
     this.#workerId = String(workerId);
-    this.#leaseTtlMs = Number.isSafeInteger(leaseTtlMs) && leaseTtlMs > 0 ? leaseTtlMs : 30000;
+    // An invalid lease duration used to become 30000 here. Silently running a
+    // policy nobody configured is the same failure the lease clock had: the
+    // caller holds a setting that looks authoritative and decides nothing.
+    assertLeaseTtlMs(leaseTtlMs);
+    this.#leaseTtlMs = leaseTtlMs;
     this.#clock = typeof clock === "function" ? clock : () => new Date().toISOString();
     this.#emitDiagnostic =
       emitDiagnostic ?? createDiagnosticEmitter(diagnosticReporter);

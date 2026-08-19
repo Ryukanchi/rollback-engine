@@ -1,5 +1,9 @@
 const { isDeepStrictEqual } = require("node:util");
-const { COMMAND_STATUSES } = require("../application/storeContracts");
+const {
+  COMMAND_STATUSES,
+  assertLeaseTtlMs,
+  createLeaseDeadline,
+} = require("../application/storeContracts");
 const {
   createFencingTokenStaleError,
   createFencingTokenRequiredError,
@@ -93,8 +97,12 @@ class InMemoryCommandStore {
     assertNonEmptyString(commandId, "commandId");
     assertNonEmptyString(commandType, "commandType");
     assertPayload(payload);
+    assertLeaseTtlMs(leaseTtlMs);
 
     const now = this.#now();
+    // Built before the row is touched: a policy this store cannot turn into a
+    // deadline must not leave a half-reserved command behind.
+    const leaseExpiresAt = workerId ? createLeaseDeadline(now, leaseTtlMs) : null;
 
     const existing = this.#commands.get(commandId);
 
@@ -111,7 +119,6 @@ class InMemoryCommandStore {
 
         const leaseOwner = workerId;
         const leaseToken = (existing.leaseToken || 1) + 1;
-        const leaseExpiresAt = workerId ? now + leaseTtlMs : null;
 
         existing.commandType = commandType;
         existing.payload = clone(payload);
@@ -140,7 +147,6 @@ class InMemoryCommandStore {
 
     const leaseOwner = workerId;
     const leaseToken = 1;
-    const leaseExpiresAt = workerId ? now + leaseTtlMs : null;
 
     const record = {
       commandId,
@@ -173,8 +179,10 @@ class InMemoryCommandStore {
   } = {}) {
     assertNonEmptyString(commandId, "commandId");
     assertNonEmptyString(workerId, "workerId");
+    assertLeaseTtlMs(leaseTtlMs);
 
     const now = this.#now();
+    const leaseExpiresAt = createLeaseDeadline(now, leaseTtlMs);
 
     const record = this.#commands.get(commandId);
 
@@ -208,7 +216,7 @@ class InMemoryCommandStore {
 
     record.leaseOwner = workerId;
     record.leaseToken = (record.leaseToken || 1) + 1;
-    record.leaseExpiresAt = now + leaseTtlMs;
+    record.leaseExpiresAt = leaseExpiresAt;
 
     return {
       success: true,
@@ -300,8 +308,10 @@ class InMemoryCommandStore {
   } = {}) {
     assertNonEmptyString(commandId, "commandId");
     assertNonEmptyString(workerId, "workerId");
+    assertLeaseTtlMs(leaseTtlMs);
 
     const now = this.#now();
+    const leaseExpiresAt = createLeaseDeadline(now, leaseTtlMs);
 
     const record = this.#commands.get(commandId);
 
@@ -329,7 +339,7 @@ class InMemoryCommandStore {
     // Lease expiry is a promise to third parties, not a self-permission. A
     // worker that still holds the current generation may renew after the
     // nominal TTL; only a committed takeover or revocation removes authority.
-    record.leaseExpiresAt = now + leaseTtlMs;
+    record.leaseExpiresAt = leaseExpiresAt;
     return { renewed: true, leaseExpiresAt: record.leaseExpiresAt };
   }
 
