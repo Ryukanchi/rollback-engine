@@ -1,580 +1,419 @@
 # Rollback Engine
 
-Rollback Engine is a small event-sourced backend that explores the hard parts of
-reliable command processing: deterministic state reconstruction, saga
-compensation, idempotent retries, optimistic concurrency, uncertain commits and
-repairable read models.
+> An event-sourced reliability lab for commands that may have succeeded even
+> when the caller never received an answer.
 
-The project deliberately uses one Node.js process and in-memory adapters. Its
-purpose is not to simulate a large platform, but to make correctness boundaries
-explicit, executable and reviewable.
+Rollback Engine does not rewind time. It keeps the facts that already happened,
+reconstructs state from those facts, and uses explicit compensation when a
+multi-step operation cannot finish.
 
-## The problem
+The project is intentionally small enough to review in one repository, but it
+focuses on problems that show up in serious distributed systems: lost
+acknowledgements, partial execution, retries, stale workers, corrupted read
+models, schema evolution, and the uncomfortable state called “we do not know
+whether the write committed.”
 
-A checkout request can fail after some work was committed, an HTTP response can
-be lost, or a materialized view can become unavailable while the event stream
-remains intact. A safe system must answer three questions without guessing:
+Current reliability checkpoint:
 
-1. Which domain facts were committed?
-2. Can the command be retried without producing duplicate facts?
-3. Can current state be reconstructed exclusively from retained history?
+- **528 automated tests**
+- in-memory and SQLite reference adapters
+- deterministic replay, recovery, saga compensation, idempotency, leases and
+  fencing
+- completed authority-containment work for A-1, F-2, F-3, F-4 and F-6
 
-Rollback Engine treats the Event Store as the answer to the first and third
-questions. The Command Store records idempotency outcomes, but reconciliation
-always checks those records against the authoritative event history.
+## Why this exists
 
-## Architecture in five minutes
+Imagine a checkout flow:
+
+1. an order is created;
+2. inventory is reserved;
+3. a payment is charged;
+4. the worker times out before the response reaches the client.
+
+Did the payment happen? Can the request be retried? Is the command still owned
+by the old worker? Is the row shown by the read API current, stale, or simply
+wrong?
+
+A normal CRUD application is great when one database transaction contains the
+whole truth. It becomes less helpful when work crosses time, processes, stores,
+or external APIs. Updating a `status` column tells us the latest value someone
+wrote; it does not necessarily tell us which steps actually happened or how to
+recover after the writer disappeared.
+
+An idempotency table helps, but it is not enough on its own either. Its command
+row can say “processing” after events committed, its stored result can outlive
+the state it was derived from, and its completion write can fail after the
+domain write succeeded. If that table is treated as domain truth, uncertainty
+is hidden rather than resolved.
+
+Rollback Engine explores a stricter answer:
+
+> Preserve committed domain history, assign one authority to each kind of
+> decision, reconstruct before trusting derived state, and fail closed when the
+> truth cannot be established.
+
+## The idea in five minutes
 
 ```text
-HTTP routes
-    │ transport validation, headers, status codes
+HTTP request
+    │
     ▼
-RollbackEngine ───────────── CommandExecutionCoordinator
-    │ domain orchestration          │ idempotency and commit semantics
-    │                               │
-    ├── Checkout Saga               ├── Command Store
-    ├── Projection                  └── Event Store command index
-    ├── Replay / Recovery
-    ├── Snapshot validation
-    └── Timeline
-            │
-            ▼
-Store contracts ── In-memory adapters
+RollbackEngine ─────────────── CommandExecutionCoordinator
+    │ domain use cases              │ reservation, idempotency,
+    │                               │ commit uncertainty, retries
+    │                               ▼
+    │                          Command Store
+    │                          ownership + generation
+    │
+    ├── append raw fact ─────────▶ Event Store
+    │                                  │
+    │                                  │ raw history
+    │                                  ▼
+    │                               Upcaster
+    │                                  │ current representation
+    │                                  ▼
+    └── authoritative state ◀────── Projection
+                                       │
+                         ┌─────────────┴─────────────┐
+                         ▼                           ▼
+                  Materialized View              Snapshot
+                    derived cache            replay optimization
 ```
 
-| Component | Responsibility |
-| --- | --- |
-| Domain events | Immutable business facts with a separate technical metadata envelope |
-| Projection | Deterministic domain state machine and transition authority |
-| Checkout saga | Forward steps and state-aware reverse compensation |
-| `RollbackEngine` | Application use cases, event creation, replay, recovery, snapshots and view repair |
-| `CommandExecutionCoordinator` | Reservation, idempotency, command/event reconciliation and commit-aware errors |
-| Event Store | Append-only source of truth, aggregate ordering and command-ID index |
-| Command Store | Process-local command outcome cache; never authoritative for domain state |
-| State Repository | Disposable materialized view used by optimized reads |
-| Snapshot Store | Disposable replay optimization |
-| HTTP layer | Transport validation and stable public contracts only |
+The important part is not the boxes. It is which box is allowed to decide
+what.
 
-The implementation does not introduce a generic repository hierarchy or a
-service per method. `RollbackEngine` and `CommandExecutionCoordinator` are kept
-separate because the domain/replay boundary and the technical command boundary
-have different failure semantics.
+## Authority map
 
-## Core guarantees
-
-```text
-Authoritative State == Full Replay State
-Full Replay State == Valid Snapshot State + Events after Snapshot Version
-same command key + same normalized payload == no duplicate execution
-```
-
-The implementation enforces the following consequences:
-
-- Aggregate sequences are contiguous and are the canonical order. Timestamps
-  may be equal, but cannot move backwards within an aggregate.
-- The projection rejects invalid lifecycle transitions, mismatched inventory
-  data, incorrect compensation order and deletion before compensation.
-- Event append uses `expectedVersion`; a stale writer cannot extend a stream
-  based on an obsolete state assumption.
-- Recovery rebuilds only the materialized view and emits no domain events.
-- Snapshots are validated against their event-stream prefix. A missing,
-  malformed, ahead or inconsistent snapshot falls back to full replay.
-- Snapshot persistence is outside the domain commit boundary. Failure produces
-  a warning and a technical diagnostic, without changing command success.
-- If a view write fails after append, the engine immediately rebuilds it from
-  events. If repair also fails, the public error explicitly reports the event
-  as committed.
-- Recognized checkout failures are compensated. Infrastructure and programming
-  failures are propagated instead of triggering blind compensation.
-
-### Upcaster safety contract
-
-Upcasters translate one stored event into a newer representation; they do not
-produce events or correct history. Every registered edge advances exactly one
-schema version. After every edge, the registry preserves `eventId`,
-`aggregateId`, `sequence`, `timestamp`, `eventType`, `commandId`,
-`correlationId` and `causationId`, owns the resulting `schemaVersion`, and
-validates the complete event before returning it. A missing edge, invalid
-output or identity change fails closed before replay, snapshots, materialized
-view repair or command reconciliation can consume the result.
-
-Each edge is evaluated twice against independent immutable inputs. Different
-outputs reject common clock-, random- and mutable-state dependencies before the
-first result can reach projection. This is a detection aid, not a proof that
-arbitrary JavaScript is pure or that a deterministic payload migration is
-semantically correct. Migration review and stable golden fixtures remain part
-of the published schema contract; current configuration and external systems
-must never be migration inputs.
-
-### Exact read-state contract
-
-`GET /replay-state/:orderId` is authoritative because it rebuilds state from
-the Event Store. `GET /orders` reads the State Repository and is an optimized
-materialized-view read. It does not validate the view on every request.
-
-```text
-Materialized View == Full Replay State
-after every command whose view update or synchronous repair succeeds
-```
-
-After the explicit `EVENT_COMMITTED_VIEW_REPAIR_FAILED` error, the view may be
-stale or unavailable while authoritative replay remains correct. A subsequent
-`POST /replay-restore/:orderId` repairs the view from retained events.
-
-## Checkout flows
-
-A successful checkout appends:
-
-```text
-1  ORDER_CREATED
-2  INVENTORY_RESERVED
-3  PAYMENT_CHARGED
-```
-
-A recognized failure after payment appends the forward facts and compensates in
-reverse order:
-
-```text
-1  ORDER_CREATED
-2  INVENTORY_RESERVED
-3  PAYMENT_CHARGED
-4  PAYMENT_REFUNDED
-5  INVENTORY_RELEASED
-6  ORDER_ROLLED_BACK
-```
-
-There is intentionally no `COMMAND_FAILED` domain event. A technical command
-failure is not a business fact and is reported through the error contract and
-the diagnostic reporter.
-
-## API contract
-
-The complete OpenAPI 3.1 contract is stored in [`openapi.json`](./openapi.json)
-and served at `GET /openapi.json`. It documents request bodies, trace headers,
-response schemas, retry semantics and complete success/compensation examples.
-No Swagger UI or OpenAPI runtime dependency is required.
-
-| Method | Path | Contract |
+| Question | Authority | What must not decide it |
 | --- | --- | --- |
-| `GET` | `/` | Service status |
-| `GET` | `/openapi.json` | Machine-readable API contract |
-| `POST` | `/order` | Create an order |
-| `DELETE` | `/order/:id` | Delete an inactive or compensated order |
-| `POST` | `/checkout` | Execute checkout, including recognized compensation flows |
-| `GET` | `/orders` | Read the optimized materialized order list |
-| `GET` | `/history` | Read all committed events in global append order |
-| `GET` | `/timeline/:orderId` | Read a compact event/trace timeline |
-| `GET` | `/replay-state/:orderId` | Authoritative full replay |
-| `GET` | `/snapshot/:orderId` | Inspect the current snapshot optimization |
-| `POST` | `/replay-restore/:orderId` | Repair a materialized view from events |
-| `GET` | `/state-at/:orderId/:timestamp` | Replay a contiguous prefix at a point in time |
+| Does an event exist? | Event Store raw history | Materialized view, snapshot, command result |
+| In which aggregate order did it happen? | Event Store sequence | Timestamp or read-model version alone |
+| What does the history mean now? | Validated upcaster chain and deterministic projection | Cache contents |
+| Who may continue a command? | Command Store status, owner and generation | Coordinator-local memory or a worker clock |
+| Is a lease challenge valid? | Command Store and its lease clock | Coordinator-owned time |
+| What is the authoritative domain state? | Full replay of Event Store history | Materialized view or snapshot |
+| Did a lost append acknowledgement hide a commit? | Exact comparison with persisted raw history | Upcast output or identity fields alone |
 
-### Write headers
+### Event Store: domain history
 
-| Header | Meaning |
+The Event Store contains the retained facts. It enforces technical history
+invariants such as globally unique event IDs, contiguous aggregate sequences,
+non-decreasing aggregate timestamps and expected-version appends.
+
+Events are appended; they are not edited to make the present look tidy. A
+rollback is therefore represented by new compensation events, not by deleting
+the original events.
+
+### Projection: current domain meaning
+
+The projection folds an ordered stream into current state. It is also where the
+supported domain transition rules live: inventory must match the order,
+refunds precede inventory release, active resources block deletion, and a
+rolled-back order cannot silently reactivate.
+
+Same validated event stream plus the same projection must produce the same
+state.
+
+### Materialized views: fast, disposable state
+
+The State Repository stores a convenient read model. It can be stale,
+unavailable or corrupt without changing domain history.
+
+Writes use compare-and-swap so one repair cannot blindly overwrite another.
+CAS alone is not considered proof of correctness: after contention, a state is
+returned to an authoritative caller only when fresh replay validates it. If
+that cannot be established within the bounded reconciliation window, the
+operation fails closed.
+
+### Snapshots: a shortcut, never truth
+
+A snapshot avoids replaying an entire stream. Before use, it is checked against
+the corresponding event prefix. Missing, malformed, ahead or inconsistent
+snapshots fall back to full replay.
+
+Deleting every snapshot must affect performance, not meaning.
+
+### Command Store: command ownership
+
+The Command Store owns reservation status, lease ownership and monotonically
+increasing generations. That makes it the authority for who may continue a
+command, but not for what happened in the domain.
+
+The Coordinator uses it for idempotency and recovery bookkeeping, then checks
+command history against the Event Store. A command row cannot erase or invent a
+domain event.
+
+### Upcasters: interpretation without a new past
+
+Historical events remain stored in their original representation. Upcasters
+translate that representation for current code.
+
+They may migrate payload shape and advance schema versions, but they may not
+change historical identity:
+
+- `eventId`
+- `aggregateId`
+- `sequence`
+- `timestamp`
+- `eventType`
+- `commandId`
+- `correlationId`
+- `causationId`
+
+Upcaster output is materialized, deeply frozen and validated before projection.
+Each migration edge runs twice against independent immutable inputs to catch
+common clock-, randomness- and mutable-state dependencies. Missing migration
+steps, invalid output, identity mutation or observed non-determinism fail
+closed.
+
+## Reliability problems covered
+
+### Unknown commit after a lost acknowledgement
+
+An append can commit and still throw because its acknowledgement was lost. On
+that path, the Coordinator asks the Event Store for the persisted **raw** event
+and compares it with the original append intent.
+
+This boundary deliberately does not compare an upcast event with a raw event,
+and it does not accept matching identity as sufficient proof. Same ID plus a
+different raw payload is an inconsistency, not a successful reconciliation.
+
+### Partial multi-step execution
+
+Checkout is a small saga. Successful forward steps become events. Recognized
+business failures produce compensating facts in reverse order:
+
+```text
+ORDER_CREATED
+INVENTORY_RESERVED
+PAYMENT_CHARGED
+PAYMENT_REFUNDED
+INVENTORY_RELEASED
+ORDER_ROLLED_BACK
+```
+
+Infrastructure and programming failures do not trigger blind compensation.
+The engine compensates only when it understands the domain situation.
+
+### Retry and idempotency safety
+
+A stable command key identifies one normalized command. Reusing it with the
+same command does not append duplicate events; reusing it for different input
+is rejected.
+
+Errors expose whether a commit is known:
+
+| `eventCommitted` | Meaning |
 | --- | --- |
-| `Idempotency-Key` | Stable command identity. Reuse only for the same command type and normalized payload. |
-| `X-Correlation-Id` | Identifier shared by related commands in one business flow. |
-| `X-Causation-Id` | Cause of the first event; later events point to the preceding event. |
+| `true` | At least one event is proven committed. Do not execute as a new command. |
+| `false` | This failed attempt is proven to have committed no event. |
+| `null` | The outcome is still unknown. Reconcile with the same key; do not guess. |
 
-All headers are optional, but only a request with `Idempotency-Key` can replay a
-stored outcome after a lost HTTP response. A supplied key is echoed in the
-response header once command context has been accepted.
+### Expired workers and zombie writes
 
-Example:
+Leases answer when ownership may be challenged. Generations and fencing tokens
+answer whether the worker attempting a mutation still owns the current command
+generation.
+
+The clock used for lease expiry belongs to the Command Store. The Coordinator
+does not pre-judge expiry with its own clock, so it cannot suppress a legitimate
+takeover challenge before the authority is consulted.
+
+### Concurrent writers
+
+Event appends use aggregate `expectedVersion`. Stale writers fail instead of
+extending a stream based on an obsolete state assumption.
+
+Materialized-view writers use compare-and-swap, while replay remains the
+semantic validator after a race.
+
+### Derived-state corruption
+
+Materialized views and snapshots are useful precisely because they can be
+discarded and rebuilt. Command execution, compensation and newly completed
+command results use replay-validated state rather than trusting a cache.
+
+## Closed authority boundaries
+
+These labels come from the project’s adversarial architecture reviews:
+
+| Finding | Containment now enforced |
+| --- | --- |
+| **A-1** | Exhausted materialized-view CAS reconciliation cannot promote an unvalidated view into domain authority. |
+| **F-2** | Upcasters cannot mutate immutable event identity or supply unchecked event output. |
+| **F-3** | Callback-controlled accessors and proxies lose control after one-time output materialization; validated output is immutable. |
+| **F-4** | Normal command execution and completion are validated against authoritative replay rather than derived state. |
+| **F-6** | Lost-ACK reconciliation confirms the exact persisted raw event, independently of its upcast representation. |
+
+These are architecture boundaries backed by adversarial tests, not claims that
+every possible distributed-systems problem has been solved.
+
+## Guarantees inside the current model
+
+With commands going through `RollbackEngine` and the provided adapters:
+
+- the Event Store remains the retained domain history;
+- aggregate order is sequence-based and optimistic concurrency rejects stale
+  appends;
+- authoritative state is reconstructed by replay;
+- invalid supported domain transitions are rejected by projection;
+- materialized views and snapshots cannot become domain truth merely because
+  they contain a plausible version;
+- recovery repairs derived state without generating new domain events;
+- current command generation fences stale workers;
+- invalid upcasts fail before projection, snapshot creation, view repair or
+  normal command reconciliation consumes them;
+- a confirmed lost-ACK append cannot create a duplicate event on retry;
+- failure responses preserve known, absent and unknown commit outcomes instead
+  of collapsing them into one generic error.
+
+## Deliberate limits
+
+This repository is a reliability research project and reference
+implementation, not a distributed transaction manager.
+
+### No multi-node consensus guarantee
+
+SQLite mode exercises persistence, multi-process contention and fencing, but
+the project does not implement Raft, Paxos, quorum replication or a globally
+available consensus service. It does not claim linearizable command ownership
+across an arbitrary cluster or survive every network partition.
+
+### No atomic control over external side effects
+
+The engine cannot atomically commit its Event Store together with a payment
+provider, warehouse API or any other independent system. If an external API
+performs an irreversible action and loses its response, that external reality
+must be reconciled through the provider’s own idempotency keys, status API,
+receipts or manual resolution.
+
+Internal history can tell us what the engine knows. It cannot magically prove
+what happened beyond its trust boundary.
+
+### Upcasters are trusted versioned code
+
+Runtime checks protect identity, structure and several forms of observable
+non-determinism. They cannot prove that arbitrary JavaScript is pure or that a
+deterministic payload migration preserves the correct business meaning.
+Upcasters still require code review, versioned fixtures and controlled rollout.
+They must not depend on current configuration, mutable databases or external
+APIs.
+
+### Adapters and producers are trust boundaries
+
+The reference stores enforce their documented contracts, but there is no
+Byzantine adapter model. A custom adapter that lies about persisted history can
+invalidate the guarantees. Likewise, supported command paths use replay and
+projection for domain decisions; the Event Store is not a universal semantic
+firewall for arbitrary code that bypasses the engine and writes events directly.
+
+## Run it
+
+Use a current Node.js release. SQLite mode requires the built-in `node:sqlite`
+module.
+
+```bash
+npm install
+npm test
+npm start
+```
+
+The default server runs at `http://localhost:3000` with in-memory storage.
+
+Persistent SQLite mode:
+
+```bash
+STORAGE=sqlite DB_PATH=./rollback-engine.db npm start
+```
+
+Try a checkout with a stable command identity:
 
 ```bash
 curl --request POST http://localhost:3000/checkout \
   --header 'content-type: application/json' \
   --header 'Idempotency-Key: checkout-123' \
   --header 'X-Correlation-Id: customer-flow-456' \
-  --header 'X-Causation-Id: request-789' \
   --data '{"item":"Pizza","quantity":1,"amount":100}'
 ```
 
-Repeating that request with the same key and normalized payload returns the
-stored result without allocating IDs or appending events. Reusing the key with
-a different payload returns `IDEMPOTENCY_KEY_CONFLICT`.
+Repeat the same request with the same key to receive the stored outcome without
+appending the checkout events again. Reusing the key with different input is an
+idempotency conflict.
 
-### Public error and retry contract
+## Useful endpoints
 
-Every HTTP error has the same envelope. Internal causes and stack traces are
-never exposed.
+The complete OpenAPI 3.1 contract lives in [`openapi.json`](./openapi.json) and
+is also served by the application.
 
-```json
-{
-  "error": {
-    "code": "EVENT_APPEND_COMMIT_UNKNOWN",
-    "category": "technical",
-    "message": "The event store did not confirm whether the event was committed.",
-    "eventCommitted": null,
-    "retrySafe": false,
-    "retryAction": "RECONCILE_SAME_KEY",
-    "commandId": "checkout-123",
-    "aggregateId": 42,
-    "eventId": "event-123"
-  }
-}
-```
-
-`eventCommitted` is tri-state:
-
-- `true`: at least one event is proven committed. Do not repeat the command.
-- `false`: no event was committed for this failed attempt.
-- `null`: the Event Store outcome could not be proven. Never guess from the
-  HTTP status.
-
-`retrySafe` means that re-execution cannot duplicate a known commit; it does
-not promise that the unchanged request will succeed. `retryAction` is the
-client instruction:
-
-| Situation | Typical code | Required action |
+| Method | Path | Purpose |
 | --- | --- | --- |
-| Invalid request | `VALIDATION_ERROR` | `FIX_REQUEST` |
-| Domain requires compensation | `COMPENSATION_REQUIRED` | `COMPENSATE_THEN_RETRY` |
-| Same key, different command or payload | `IDEMPOTENCY_KEY_CONFLICT` | `USE_NEW_KEY` |
-| Existing command still processing | `COMMAND_IN_PROGRESS` | `WAIT_AND_RETRY_SAME_KEY` |
-| Proven pre-commit keyed failure | original technical code | `RETRY_SAME_KEY` |
-| Proven pre-commit unkeyed conflict | `OPTIMISTIC_CONCURRENCY_CONFLICT` | `RETRY_COMMAND` |
-| Stored deterministic rejection | original domain code | `REPLAY_SAME_KEY` |
-| Unknown commit or reconciliation lookup failure | `EVENT_APPEND_COMMIT_UNKNOWN`, `COMMAND_RECONCILIATION_FAILED` | `RECONCILE_SAME_KEY` |
-| Known partial commit, inconsistent history or failed view repair | corresponding stable code | `MANUAL_RESOLUTION_REQUIRED` |
-| Snapshot warning after success | `SNAPSHOT_SAVE_FAILED` | `DO_NOT_RETRY_COMMAND` |
+| `GET` | `/openapi.json` | Machine-readable API contract |
+| `POST` | `/order` | Create an order |
+| `GET` | `/order/:id?consistency=materialized` | Fast derived-state read |
+| `GET` | `/order/:id?consistency=authoritative` | Replay-validated read |
+| `DELETE` | `/order/:id` | Delete an inactive or compensated order |
+| `POST` | `/checkout` | Run checkout and supported compensation paths |
+| `GET` | `/orders` | List materialized orders |
+| `GET` | `/history` | Inspect committed events |
+| `GET` | `/diagnostics` | Inspect best-effort reliability diagnostics |
+| `GET` | `/timeline/:orderId` | Inspect event and trace relationships |
+| `GET` | `/replay-state/:orderId` | Rebuild authoritative state from history |
+| `GET` | `/snapshot/:orderId` | Inspect the current snapshot |
+| `POST` | `/replay-restore/:orderId` | Repair derived state from retained history |
+| `GET` | `/state-at/:orderId/:timestamp` | Replay state at a point in time |
+| `GET` | `/state-at/:orderId/sequence/:sequence` | Replay an exact sequence prefix |
 
-Clients must preserve and reuse the same idempotency key for every reconciliation
-attempt. A new key represents a new command.
+## Lab and chaos runner
 
-## Event metadata and debugging timeline
+The repository includes two ways to make failures visible rather than merely
+describe them.
 
-Every event contains business payload and a separate immutable metadata
-envelope:
+Start the guarded browser lab:
 
-```json
-{
-  "schemaVersion": 1,
-  "commandId": "checkout-123",
-  "correlationId": "customer-flow-456",
-  "causationId": "event-previous"
-}
+```bash
+npm run lab
 ```
 
-`GET /timeline/:orderId` derives a compact trace exclusively from committed
-events. It does not project state, duplicate domain rules or create new events.
+The `/lab` UI and scenario mutation endpoints exist only while `LAB_MODE` is
+enabled. Normal startup returns `404` for them.
 
-```json
-{
-  "aggregateId": 42,
-  "version": 3,
-  "eventCount": 3,
-  "commandIds": ["checkout-123"],
-  "correlationIds": ["customer-flow-456"],
-  "entries": [
-    {
-      "sequence": 1,
-      "eventId": "event-1",
-      "eventType": "ORDER_CREATED",
-      "timestamp": "2026-08-15T10:00:00.000Z",
-      "schemaVersion": 1,
-      "commandId": "checkout-123",
-      "correlationId": "customer-flow-456",
-      "causationId": "request-789"
-    }
-  ]
-}
+Run deterministic chaos campaigns:
+
+```bash
+npm run chaos -- --seed=42 --iterations=100 --profile=memory
 ```
 
-The endpoint shows domain facts and their causal chain. Technical failures do
-not appear as synthetic domain events; they belong to diagnostics.
+Campaigns exercise replay equality, compensation ordering, idempotency,
+materialized-view drift, restarts and concurrency with reproducible seeds.
 
-## Structured technical diagnostics
-
-`RollbackEngine` accepts an optional reporter callback:
-
-```js
-const engine = new RollbackEngine({
-  diagnosticReporter: (diagnostic) => console.log(JSON.stringify(diagnostic)),
-});
-```
-
-Diagnostics are immutable records with stable `type` and `status` values,
-normalized `occurredAt` and available command, aggregate and event identifiers.
-Current boundary outcomes are:
-
-| Type | Statuses |
-| --- | --- |
-| `COMMAND_RECONCILIATION` | `LOOKUP_FAILED` |
-| `EVENT_APPEND` | `COMMIT_UNKNOWN`, `COMMIT_CONFIRMED_AFTER_ERROR` |
-| `MATERIALIZED_VIEW_REPAIR` | `REPAIRED`, `REPAIR_FAILED` |
-| `SNAPSHOT_SAVE` | `SAVE_FAILED` |
-
-Example:
-
-```json
-{
-  "type": "MATERIALIZED_VIEW_REPAIR",
-  "status": "REPAIRED",
-  "occurredAt": "2026-08-15T10:00:00.000Z",
-  "commandId": "checkout-123",
-  "aggregateId": 42,
-  "eventId": "event-3"
-}
-```
-
-Reporting is best-effort and outside the command boundary. A reporter throw or
-rejected promise cannot change a successful command, committed event or public
-warning. The engine intentionally provides no log framework, persistence,
-delivery retry or sensitive internal error details; production composition can
-forward these records to its existing observability system.
-
-## Idempotency and command/event reconciliation
-
-For each key, the Command Store retains command type, normalized payload,
-status, aggregate and event range, plus the completed result or stable failure
-descriptor. Before replaying a stored result, the coordinator checks the range
-against the Event Store command-ID index.
-
-- `completed` returns its stored result only when the recorded range matches.
-- `failed` replays deterministic or committed failures without executing again.
-- `processing` with valid lease remains in progress (`COMMAND_IN_PROGRESS`).
-- `processing` with expired lease and 0 events allows safe atomic takeover by another worker with an incremented fencing token.
-- `processing` with $\ge 1$ committed events cannot be taken over; post-commit reconciliation handles it safely without re-execution.
-- An unknown append is reconciled with the same key. Events found means manual
-  resolution; no events found allows controlled re-execution.
-- Non-contiguous command events or events spanning aggregates are rejected as
-  `COMMAND_EVENT_HISTORY_INCONSISTENT`.
-
-The Command Store is therefore an idempotency and coordination record, not a second source of
-domain truth.
-
-## Command Lease Ownership, Safe Takeover & Fencing Tokens
-
-To close the crash recovery gap where a worker crashes before appending its first event (`processing + 0 committed events`), the engine implements multi-process **Lease Ownership** and **Fencing Tokens**.
+## Project layout
 
 ```text
-Worker A (PID 101)                 Shared SQLite Storage                  Worker B (PID 102)
-       │                                     │                                    │
-       ├─── Reserve command-1 ──────────────►│ (lease_owner: Worker A,            │
-       │    (TTL: 1000ms)                    │  lease_token: 1,                   │
-       │                                     │  lease_expires_at: T+1000)         │
-       │                                     │                                    │
-       │   [Worker A pauses / GC stall]      │                                    │
-       │   (Time advances past T+1000)       │                                    │
-       │                                     │◄── Takeover command-1 ─────────────┤
-       │                                     │    (Atomic BEGIN IMMEDIATE:        │
-       │                                     │     lease_token = 2,               │
-       │                                     │     lease_owner: Worker B)         │
-       │                                     │                                    │
-       │                                     │◄── Append Event 1..3 (token: 2) ───┤
-       │                                     │    [Events Committed & Cached]     │
-       │                                     │                                    │
-       │   [Worker A wakes up as Zombie]     │                                    │
-       ├─── Append Event 1 (stale token: 1) ─►│ Atomic Fencing Check in           │
-       │                                     │ SqliteEventStore.append():         │
-       │                                     │ token 1 !== current token 2        │
-       │◄── ROLLBACK & Reject ───────────────┤                                    │
-       │    FENCING_TOKEN_STALE              │                                    │
-       ▼                                     ▼                                    ▼
-Authoritative Event Store remains 100% pure — Zombie Worker cannot commit stale facts.
+src/
+  application/      command coordination, replay, recovery, diagnostics
+  domain/           events, projection, saga, upcasting
+  infrastructure/   in-memory and SQLite store adapters
+  chaos/            deterministic invariant campaigns
+  lab/              guarded failure scenarios and visual lab
+  routes/            HTTP transport layer
+tests/               contracts, regressions and adversarial scenarios
 ```
 
-### Core Lease & Fencing Semantics
+## Testing philosophy
 
-1. **Monotonic Fencing Tokens**: Initial command reservation allocates `lease_token = 1`. Each successful takeover strictly increments the token ($Token_{new} = Token_{old} + 1$).
-2. **Atomic In-Transaction Fencing Enforcement**: In `SqliteEventStore.append()`, the fencing check, expectedVersion check, and event insertion occur atomically within the **same `BEGIN IMMEDIATE ... COMMIT` transaction**. TOCTOU races between application-level lease validation and SQLite database commit are technically impossible.
-3. **Mandatory Fencing Token for Leased Commands**: When a command record exists in `status === 'processing'`, `EventStore.append()` requires a valid `fencingToken`. Omitting or passing `null`/`undefined` fencingToken is strictly rejected with `FENCING_TOKEN_REQUIRED` without committing events.
-4. **Authoritative Event Store Boundary for Takeover**: `takeOverExpired()` directly queries the authoritative `events` table inside its `BEGIN IMMEDIATE` write transaction. Even if command bookkeeping lags behind (`commands.event_range` not yet recorded), takeover is strictly blocked with `HAS_EVENTS`.
-5. **Deterministic Race Safety Outcomes**:
-   - **Append Wins**: Event committed in `events` table. Subsequent takeover attempts see $\ge 1$ committed events and abort with `HAS_EVENTS`.
-   - **Takeover Wins**: Lease token incremented to $N+1$. Stale worker's subsequent append presents token $N$ and is rejected with `FENCING_TOKEN_STALE` while the command is still `processing`.
-6. **Clock Semantics & Hygiene**: Lease expiration uses `Date.now()` representing **wall-clock epoch milliseconds** (NOT a monotonic hardware clock). It is subject to operating system NTP adjustments and host clock steps. Systems relying on leases must configure lease TTLs with appropriate safety margins against anticipated clock skew.
-7. **Defensive Mutation Guards**: `recordEvent()`, `complete()`, and `fail()` require and validate the worker's active `fencingToken`, preventing stale workers from modifying command status or releasing reservations.
-8. **Schema Migration via `PRAGMA user_version`**: Seamlessly migrates existing SQLite databases from v1 to v2 by adding `lease_owner`, `lease_token`, and `lease_expires_at` columns with automatic indexing.
-
-## Snapshots, recovery and time travel
-
-Snapshot state is accepted only when its aggregate, version, timestamp and
-projected event prefix agree. Replay then applies the suffix after the snapshot
-version. Otherwise it uses full replay.
-
-Time travel also respects sequence order. It selects the longest contiguous
-event prefix whose timestamps are not later than the requested instant. Events
-with equal timestamps become visible together; sequence replay is the precise
-ordering tool.
-
-Automatic snapshots after checkout and deletion are best-effort. A failure
-returns this warning inside the successful command result:
-
-```json
-{
-  "code": "SNAPSHOT_SAVE_FAILED",
-  "category": "technical",
-  "eventCommitted": true,
-  "retrySafe": false,
-  "retryAction": "DO_NOT_RETRY_COMMAND",
-  "aggregateId": 42
-}
-```
-
-## Persistence boundary
-
-Required adapter capabilities are declared in
-`src/application/storeContracts.js`; reusable semantic suites live in
-`tests/support/storeContractSuites.js`.
-
-The engine provides two storage implementations:
-1. **InMemory Adapters**: Fast, isolated, ideal for unit testing.
-2. **SQLite WAL Adapters (`src/infrastructure/sqlite/`)**: Persistent, file-backed or in-memory, using native `node:sqlite` (`DatabaseSync`).
-
-| Store | Critical semantics |
-| --- | --- |
-| Event Store | Atomic expected-version check, transactional lease fencing check, global event-ID uniqueness, explicit `command_id` index, aggregate ordering, read-after-write consistency |
-| Command Store | Atomic absent-key reservation, lease ownership, atomic expired takeover with monotonic fencing tokens, valid status transitions, atomic result/error persistence |
-| Snapshot Store | Atomic version comparison and replacement, equivalent same-version idempotency |
-| State Repository | Atomic whole-state save/replace and defensive materialized values |
-
-### Storage Configuration
-
-By default, the server runs with in-memory adapters. To run with persistent SQLite storage:
+The test suite is the executable architecture record. Happy-path examples are
+only the beginning; the interesting tests deliberately corrupt snapshots and
+views, lose append acknowledgements, race CAS writers, expire leases, revive
+zombie workers, mutate upcaster identity, simulate restarts and compare replay
+with every derived representation.
 
 ```bash
-# In-Memory (default)
-STORAGE=memory npm start
-
-# Persistent SQLite WAL Storage
-STORAGE=sqlite DB_PATH=./data/rollback.db npm start
-```
-
-## Interactive Reliability Lab
-
-The project includes an interactive engineering cockpit to inspect real event streams, replay historical sequences, inject faults, test self-healing, and verify post-crash reconciliation.
-
-### Starting the Lab
-
-```bash
-# Start server with Lab Mode enabled
-npm run lab
-
-# Alternatively:
-LAB_MODE=1 npm start
-```
-
-Open `http://localhost:3000/lab` in your browser.
-
-### Safety & Isolation Boundary
-
-- **`LAB_MODE` Guard**: When `LAB_MODE` is disabled (default in production), `/lab` and destructive scenario APIs are completely disabled (HTTP 404), ensuring standard API endpoints are never exposed to test faults.
-- **Disposable SQLite Databases**: Every scenario run operates in a dedicated, isolated temporary SQLite database file (e.g. `rollback-lab-<id>.db`). The primary application database is never touched.
-
-### Demonstrable Scenarios
-
-1. **Successful Checkout Saga**: Executes standard 3-step forward saga (`ORDER_CREATED`, `INVENTORY_RESERVED`, `PAYMENT_CHARGED`), committing contiguous sequences and verifying state projection.
-2. **Compensation After Payment**: Injects fault at `simulateFailureAt: 'after_payment'`, demonstrating automatic reverse compensation (`PAYMENT_REFUNDED`, `INVENTORY_RELEASED`, `ORDER_ROLLED_BACK`) to safely roll back state.
-3. **Sequence Time Travel & State Diff**: Interactive sequence scrubber allowing deterministic state inspection at any point in history (`replayAtSequence()`) with highlighted delta diffs ($\Delta$ from $N-1$).
-4. **Logical Read-Model Drift & Self-Healing**: Deliberately mutates the SQLite materialized cache row. The UI displays the drift against the authoritative event log and provides a button to trigger authoritative self-healing.
-5. **Post-Commit Reconciliation**: Simulates a process crash after Event Store append but before completion ACK. On retry with the same `Idempotency-Key`, existing events are reconciled via indexed `command_id` without executing duplicate side-effects.
-6. **`processing + 0 events` Boundary**: Demonstrates the safety boundary refusing automatic takeover while a lease is active, returning `COMMAND_IN_PROGRESS`.
-7. **Lease Recovery & Zombie Fencing**: Demonstrates safe takeover of an expired lease by Worker B ($Token \rightarrow 2$) and atomic rejection of Worker A's stale append with `FENCING_TOKEN_STALE`.
-8. **Process Restart Durability**: Spawns two real independent OS child processes. Process A commits the event stream to disk and terminates; Process B opens the database file from scratch and reconstructs the exact domain state via replay.
-
-## Deterministic Chaos & Invariant Fuzzing
-
-The repository includes a deterministic chaos and invariant fuzzing harness designed to explore thousands of interleaved operations, real saga fault injections, command retries, logical read-model view drifts, snapshot corruptions, lease takeovers, zombie fencing, and connection reopen cycles against both In-Memory and persistent SQLite storage adapters.
-
-### Design Principles
-
-- **Seed-Deterministic Operation Generation**: Built with a custom 32-bit Mulberry32 PRNG. Zero calls to unseeded `Math.random()`. Every execution sequence and logical trace is 100% reproducible by providing the exact seed.
-- **Real Engine & Real Stores**: The harness exercises the actual `RollbackEngine`, `CommandExecutionCoordinator`, projections, sagas, leases, fencing checks, and SQLite/in-memory store contracts without mock semantics.
-- **Real Saga Fault Injection Coverage**: Directly exercises all supported saga failure points (`after_order`, `after_inventory`, `after_payment`) and validates that partial and full reverse compensation streams are executed in strict inverse order.
-- **Granular Single-Iteration Reproduction**: Any discovered failure or invariant violation can be reproduced directly on its specific iteration index:
-  ```bash
-  npm run chaos -- --seed=482971 --iteration=7312 --profile=memory
-  ```
-- **Per-Invariant Coverage Counting**: Aggregates and reports the exact number of times each invariant and failure path was evaluated during a campaign.
-
-### Invariant Catalog (21 Checked Invariants)
-
-| Invariant | Description | Verification Method |
-| :--- | :--- | :--- |
-| **Replay Stability** | Pure repeatability of event replay | Asserts that repeated `replay(agg)` on the same immutable event stream produces identical state |
-| **Snapshot Equivalence** | Snapshot + suffix equals full replay | Compares `replayFromSnapshot(agg)` against `replay(agg)` |
-| **Event Sequence Contiguity** | $1..N$ contiguous sequence without gaps | Verifies $Sequence_i == i + 1$ for all aggregate streams |
-| **Global Event ID Uniqueness** | Unique event IDs across all aggregates | Tracks global set of event IDs across store |
-| **Timestamp Monotonicity** | Non-decreasing timestamps per stream | Asserts $Timestamp_n \ge Timestamp_{n-1}$ |
-| **Projection Determinism** | Pure state machine behavior | Projects identical event stream multiple times and asserts equality |
-| **Materialized View Consistency** | Synchronized derived read model | Compares `getState('materialized')` with `replay(agg)` (skips intentional unrepaired drift) |
-| **Idempotent Retry Safety** | Re-execution produces $\Delta events = 0$ | Verifies stable outcome without duplicate event appends |
-| **Idempotency Conflict Detection** | Same ID with altered payload rejected | Asserts conflict error without aggregate state mutation |
-| **Post-Commit Retry Safety** | Interrupted commit cannot duplicate side effects | Verifies reconciliation prevents re-execution |
-| **`processing + 0` Boundary** | Uncompleted commands without events not stolen | Confirms `COMMAND_IN_PROGRESS` while lease is unexpired |
-| **Lease Ownership Consistency** | Monotonic tokens and clean lease release | Verifies `leaseToken \ge 1` and `leaseOwner === null` upon completion/failure |
-| **Fencing Safety** | Stale workers cannot mutate Event Store | Validates atomic rejection with `FENCING_TOKEN_STALE` |
-| **Compensation Ordering** | Correct forward and inverse saga steps | Asserts refund precedes release and rollback in saga history depending on completed forward steps |
-| **No Impossible Final State** | Domain state machine invariants | Prevents invalid states (e.g. `rolled_back` with active charges or `deleted` with reservations) |
-| **Commit Boundary** | Persistence of committed events is final | Derived store errors or stale attempts do not remove committed event log entries |
-| **Command Range Consistency** | Recorded range matches Event Store | Validates `firstSequence` and `lastSequence` against store |
-| **Aggregate Isolation** | Streams do not leak across aggregate IDs | Replay of Aggregate A depends exclusively on Events of Aggregate A |
-| **Time Travel Prefix** | `replayAtSequence(N)` equals prefix projection | Projects $Events[0..N]$ and compares with time-travel query |
-| **Defensive Copies** | External mutations do not corrupt store | Validates immutability / defensive copies on retrieved objects |
-| **Schema Upcasting** | Historical events read compatibly | Verifies `EventUpcasterRegistry` transformation without store mutation |
-
-### Running Chaos Campaigns
-
-```bash
-# Run standard campaign (5,000 in-memory + 250 persistent SQLite iterations)
-npm run chaos
-
-# Run smoke test (100 in-memory + 10 SQLite iterations)
-npm run chaos -- --campaign=smoke
-
-# Run high-volume in-memory campaign with specific seed
-npm run chaos -- --profile=memory --iterations=10000 --seed=482971
-
-# Run persistent SQLite campaign with specific seed (with connection reopen cycles)
-npm run chaos -- --profile=sqlite --iterations=500 --seed=6006
-
-# Reproduce a specific single iteration
-npm run chaos -- --seed=482971 --iteration=7312 --profile=memory
-```
-
-### Claim Hygiene
-
-- **Single-Machine Multi-Process Coordination vs. Distributed Multi-Node Consensus**: Command Leases and Fencing Tokens coordinate independent OS processes accessing shared SQLite storage on a single host. This prevents stale workers from corrupting the authoritative event log. It is an ordering and stale-writer protection mechanism, not distributed multi-node consensus (Raft/Paxos) across network partitions.
-- **Empirical Fuzzing vs. Formal Proof**: The chaos harness provides strong empirical verification for the system's core invariants under local interleaving and single-machine crash/reopen boundaries. It is an empirical testing tool, not a formal mathematical verification.
-- **Partial-Commit Reconciliation Takes Precedence**: The system deliberately does not allow lease takeover when $\ge 1$ events have been committed. Expired lease takeover is strictly constrained to `processing + 0 events`.
-
-## Run and verify
-
-```bash
-npm install
-npm start
-```
-
-The server listens on `http://localhost:3000`.
-
-```bash
-npm test
-npm run check
+npm test       # 528 tests at the current checkpoint
+npm run check  # syntax checks for application entry points
 git diff --check
 ```
 
-The 248 tests cover domain transitions, compensation order, replay equivalence,
-snapshot fallback, time-travel prefixes, commit uncertainty, view repair,
-idempotency reconciliation, optimistic concurrency, store contracts (both In-Memory and SQLite),
-file-backed restart durability across separate Node processes, lost ACK reconciliation,
-multi-process optimistic concurrency, multi-process zombie worker fencing, schema migration, the `LAB_MODE` security boundary, scenario runners,
-deterministic chaos regression tests, reproduction tests, and representative API flows.
-
-## Deliberate limits
-
-- **Synchronous SQLite I/O**: SQLite runs synchronously via `node:sqlite` `DatabaseSync`. While this guarantees zero async race conditions and preserves existing contracts, synchronous I/O can block the Node.js event loop under high concurrent loads.
-- **Single-Host Shared Storage**: Multi-process leases and fencing tokens coordinate processes on a shared storage medium; multi-node network partitions and distributed clustering are not modeled.
-- One command event range currently belongs to one aggregate.
-- Aggregate, reservation and payment IDs are allocated in process.
-- Requests without `Idempotency-Key` cannot replay an outcome after a lost HTTP response.
-- OpenAPI is a reviewed static contract, not runtime request/response validation.
-
-## Sensible next steps
-
-1. **Async Storage Adapter Boundary**: Introducing non-blocking async store adapters with connection pooling for high-throughput multi-tenant deployments.
-2. **Distributed Cluster Consensus**: Exploring Raft/Paxos-based multi-node replication and distributed state machine replication.
-3. **Cross-Aggregate Saga Coordination**: Supporting multi-aggregate transactional workflows.
+The goal is not to make failure disappear. It is to make uncertainty explicit,
+keep authority in the component that owns the truth, and leave enough history
+to recover without guessing.
