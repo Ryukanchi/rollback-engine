@@ -44,7 +44,7 @@ const {
 /**
  * How many times a losing writer re-observes and retries before giving up.
  * Small on purpose: this is a convergence aid, not a mutual-exclusion device,
- * and read repair converges anything left behind.
+ * and exhaustion is surfaced rather than promoting an unvalidated view.
  */
 const MATERIALIZED_VIEW_RECONCILE_ATTEMPTS = 3;
 
@@ -105,6 +105,25 @@ function createCompensationRequiredError(aggregateId) {
     `Aggregate ${aggregateId} must be compensated before it can be deleted`
   );
   error.code = "COMPENSATION_REQUIRED";
+  return error;
+}
+
+function createMaterializedViewReconciliationError(aggregateId) {
+  const error = new Error(
+    `Materialized view reconciliation for aggregate ${aggregateId} exhausted without establishing an authoritative state`
+  );
+  error.code = "MATERIALIZED_VIEW_RECONCILIATION_EXHAUSTED";
+  error.aggregateId = aggregateId;
+  error.attempts = MATERIALIZED_VIEW_RECONCILE_ATTEMPTS;
+  return error;
+}
+
+function createCommandResultAuthorityError(aggregateId) {
+  const error = new Error(
+    `Command result state for aggregate ${aggregateId} does not match authoritative replay`
+  );
+  error.code = "COMMAND_RESULT_STATE_NOT_AUTHORITATIVE";
+  error.aggregateId = aggregateId;
   return error;
 }
 
@@ -203,6 +222,7 @@ class RollbackEngine {
       now,
       diagnosticReporter,
       emitDiagnostic: this.#emitDiagnostic,
+      validateResult: (result) => this.#validateCommandResult(result),
     });
     this.#nextAggregateId = startingIds.aggregateId ?? 1;
     this.#nextReservationId = startingIds.reservationId ?? 1;
@@ -242,10 +262,10 @@ class RollbackEngine {
               payload,
               commandContext
             ),
-          getState: () => this.#stateRepository.getByAggregateId(aggregateId),
+          getState: () => this.#getAuthoritativeState(aggregateId),
         });
 
-        const state = this.getLiveState(aggregateId);
+        const state = this.#getAuthoritativeState(aggregateId);
         const { snapshot, warnings } = this.#createSnapshotBestEffort(
           aggregateId,
           commandContext.eventCommandId
@@ -286,7 +306,7 @@ class RollbackEngine {
         return {
           aggregateId,
           event,
-          state: this.getLiveState(aggregateId),
+          state: this.#getAuthoritativeState(aggregateId),
         };
       }
     );
@@ -302,7 +322,7 @@ class RollbackEngine {
       { aggregateId, reason },
       options,
       (commandContext) => {
-        const currentState = this.#ensureLiveState(aggregateId);
+        const currentState = this.#getAuthoritativeState(aggregateId);
 
         if (!currentState || currentState.deleted || !currentState.order) {
           throw createAggregateNotFoundError(aggregateId);
@@ -322,7 +342,7 @@ class RollbackEngine {
           { reason },
           commandContext
         );
-        const state = this.getLiveState(aggregateId);
+        const state = this.#getAuthoritativeState(aggregateId);
         const { snapshot, warnings } = this.#createSnapshotBestEffort(
           aggregateId,
           commandContext.eventCommandId
@@ -349,7 +369,7 @@ class RollbackEngine {
 
   getOrder(aggregateId, { consistency = "materialized" } = {}) {
     if (consistency === "authoritative") {
-      const state = this.#ensureLiveState(aggregateId);
+      const state = this.#getAuthoritativeState(aggregateId);
       if (!state || state.deleted || !state.order) {
         return null;
       }
@@ -369,7 +389,7 @@ class RollbackEngine {
 
   getState(aggregateId, { consistency = "materialized" } = {}) {
     if (consistency === "authoritative") {
-      return this.#ensureLiveState(aggregateId);
+      return this.#getAuthoritativeState(aggregateId);
     }
 
     if (consistency === "materialized") {
@@ -389,7 +409,7 @@ class RollbackEngine {
       { aggregateId, reason },
       options,
       (commandContext) => {
-        const currentState = this.#ensureLiveState(aggregateId);
+        const currentState = this.#getAuthoritativeState(aggregateId);
 
         if (!currentState) {
           throw createAggregateNotFoundError(aggregateId);
@@ -405,11 +425,11 @@ class RollbackEngine {
                 payload,
                 commandContext
               ),
-            getState: () => this.#stateRepository.getByAggregateId(aggregateId),
+            getState: () => this.#getAuthoritativeState(aggregateId),
           }
         );
 
-        const state = this.getLiveState(aggregateId);
+        const state = this.#getAuthoritativeState(aggregateId);
 
         return {
           aggregateId,
@@ -601,6 +621,31 @@ class RollbackEngine {
     return currentState;
   }
 
+  #getAuthoritativeState(aggregateId) {
+    // #ensureLiveState may observe the view for conditional repair, but it can
+    // return it only after full replay proves semantic equality. Saga and
+    // command code use this named boundary so a materialized-only read cannot
+    // accidentally acquire domain authority again.
+    return this.#ensureLiveState(aggregateId);
+  }
+
+  #validateCommandResult(result) {
+    if (
+      !result ||
+      typeof result !== "object" ||
+      Array.isArray(result) ||
+      !Object.prototype.hasOwnProperty.call(result, "state")
+    ) {
+      throw createCommandResultAuthorityError(result?.aggregateId);
+    }
+
+    const authoritativeState = this.#getAuthoritativeState(result.aggregateId);
+
+    if (!isDeepStrictEqual(result.state, authoritativeState)) {
+      throw createCommandResultAuthorityError(result.aggregateId);
+    }
+  }
+
   #recordEvent(aggregateId, eventType, payload, commandContext) {
     const lastSequence = this.#eventStore.getLastSequence(aggregateId);
     const sequence = lastSequence + 1;
@@ -619,7 +664,7 @@ class RollbackEngine {
           commandContext.lastEventId ?? commandContext.initialCausationId,
       },
     });
-    const observedState = this.#ensureLiveState(aggregateId);
+    const observedState = this.#getAuthoritativeState(aggregateId);
     const currentState = observedState || createInitialState(aggregateId);
 
     const nextState = applyEvent(currentState, event);
@@ -751,21 +796,21 @@ class RollbackEngine {
 
   /**
    * Re-observe, replay, and try again - bounded. Each attempt either wins or
-   * proves another writer got there first, and under sustained concurrency
-   * giving up is correct: nothing stale is written, event history is untouched,
-   * and the next authoritative read converges the view.
+   * proves another writer got there first. Under sustained concurrency the
+   * caller fails closed: a losing CAS says nothing about whether the winning
+   * materialized state is semantically correct.
    */
   #reconcileMaterializedState(aggregateId) {
     for (let attempt = 0; attempt < MATERIALIZED_VIEW_RECONCILE_ATTEMPTS; attempt += 1) {
       const observedState = this.#stateRepository.getByAggregateId(aggregateId);
       const replayedState = this.replay(aggregateId);
 
-      if (!replayedState) {
+      if (isDeepStrictEqual(observedState, replayedState)) {
         return observedState;
       }
 
-      if (observedState && isDeepStrictEqual(observedState, replayedState)) {
-        return observedState;
+      if (!replayedState) {
+        throw createMaterializedViewReconciliationError(aggregateId);
       }
 
       const outcome = this.#stateRepository.compareAndSwap({
@@ -779,7 +824,16 @@ class RollbackEngine {
       }
     }
 
-    return this.#stateRepository.getByAggregateId(aggregateId);
+    // The final CAS may have lost to a correct writer. Re-observe once so that
+    // case can still succeed, but only after validating it against fresh replay.
+    const observedState = this.#stateRepository.getByAggregateId(aggregateId);
+    const replayedState = this.replay(aggregateId);
+
+    if (isDeepStrictEqual(observedState, replayedState)) {
+      return observedState;
+    }
+
+    throw createMaterializedViewReconciliationError(aggregateId);
   }
 }
 

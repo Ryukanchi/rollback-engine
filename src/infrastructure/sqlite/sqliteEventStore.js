@@ -317,6 +317,21 @@ class SqliteEventStore {
     return rows.map((row) => this.#transform(rowToEvent(row)));
   }
 
+  /**
+   * Returns the persisted representation for exact append reconciliation.
+   * Domain replay must use the upcast read methods above instead.
+   */
+  getRawByCommandIdForReconciliation(commandId) {
+    if (!isIdentifier(commandId)) {
+      throw new TypeError(
+        "commandId must be a non-empty string or a positive safe integer"
+      );
+    }
+
+    const rows = this.#stmtEventsByCommandId.all(commandId);
+    return rows.map((row) => rowToEvent(row));
+  }
+
   getAll() {
     const rows = this.#stmtAllEvents.all();
     return rows.map((row) => this.#transform(rowToEvent(row)));

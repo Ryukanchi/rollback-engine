@@ -91,6 +91,8 @@ class CommandExecutionCoordinator {
 
   #emitDiagnostic;
 
+  #validateResult;
+
   constructor({
     eventStore,
     commandStore,
@@ -101,9 +103,14 @@ class CommandExecutionCoordinator {
     now = null,
     diagnosticReporter,
     emitDiagnostic,
+    validateResult = () => {},
   }) {
     if (typeof operationIdGenerator !== "function") {
       throw new TypeError("operationIdGenerator must be a function");
+    }
+
+    if (typeof validateResult !== "function") {
+      throw new TypeError("validateResult must be a function");
     }
 
     // Lease time is the Command Store's, not the Coordinator's (TA-2/TA-3).
@@ -128,6 +135,7 @@ class CommandExecutionCoordinator {
     this.#clock = typeof clock === "function" ? clock : () => new Date().toISOString();
     this.#emitDiagnostic =
       emitDiagnostic ?? createDiagnosticEmitter(diagnosticReporter);
+    this.#validateResult = validateResult;
   }
 
   execute(commandType, payload, options, executeCommand) {
@@ -181,6 +189,8 @@ class CommandExecutionCoordinator {
 
     try {
       const result = executeCommand(commandContext);
+
+      this.#validateResult(result);
 
       if (commandId) {
         this.#commandStore.complete(commandId, result, { fencingToken: currentFencingToken });
@@ -476,6 +486,7 @@ class CommandExecutionCoordinator {
 
           try {
             const result = executeCommand(commandContext);
+            this.#validateResult(result);
             this.#commandStore.complete(record.commandId, result, { fencingToken: newToken });
             return result;
           } catch (caughtError) {
@@ -781,7 +792,14 @@ class CommandExecutionCoordinator {
       let commandEvents;
 
       try {
-        commandEvents = this.#eventStore.getByCommandId(event.metadata.commandId);
+        // Append reconciliation asks whether this exact raw write reached the
+        // authoritative history. Upcast reads answer a different question -
+        // how that history is interpreted by the current domain code - and
+        // therefore cannot prove or disprove the original commit intent.
+        commandEvents =
+          this.#eventStore.getRawByCommandIdForReconciliation(
+            event.metadata.commandId
+          );
       } catch (lookupError) {
         this.#emitDiagnostic({
           type: DIAGNOSTIC_TYPES.EVENT_APPEND,

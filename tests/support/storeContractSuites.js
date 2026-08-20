@@ -192,13 +192,24 @@ function registerEventStoreContract({ adapterName, createStore }) {
 
       const aggregateRead = store.getByAggregateId(1);
       const commandRead = store.getByCommandId("command-a");
+      const reconciliationRead =
+        store.getRawByCommandIdForReconciliation("command-a");
 
       aggregateRead.length = 0;
       commandRead[0].payload.item = "Changed output";
+      reconciliationRead[0].payload.item = "Changed raw output";
 
       assert.equal(store.getByAggregateId(1)[0].payload.item, "Pizza");
       assert.equal(store.getByCommandId("command-a")[0].payload.item, "Pizza");
+      assert.equal(
+        store.getRawByCommandIdForReconciliation("command-a")[0].payload.item,
+        "Pizza"
+      );
       assert.deepEqual(store.getByCommandId("missing-command"), []);
+      assert.deepEqual(
+        store.getRawByCommandIdForReconciliation("missing-command"),
+        []
+      );
     });
 
     test("accepts equal but rejects decreasing aggregate timestamps", () => {

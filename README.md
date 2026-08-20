@@ -87,6 +87,25 @@ The implementation enforces the following consequences:
 - Recognized checkout failures are compensated. Infrastructure and programming
   failures are propagated instead of triggering blind compensation.
 
+### Upcaster safety contract
+
+Upcasters translate one stored event into a newer representation; they do not
+produce events or correct history. Every registered edge advances exactly one
+schema version. After every edge, the registry preserves `eventId`,
+`aggregateId`, `sequence`, `timestamp`, `eventType`, `commandId`,
+`correlationId` and `causationId`, owns the resulting `schemaVersion`, and
+validates the complete event before returning it. A missing edge, invalid
+output or identity change fails closed before replay, snapshots, materialized
+view repair or command reconciliation can consume the result.
+
+Each edge is evaluated twice against independent immutable inputs. Different
+outputs reject common clock-, random- and mutable-state dependencies before the
+first result can reach projection. This is a detection aid, not a proof that
+arbitrary JavaScript is pure or that a deterministic payload migration is
+semantically correct. Migration review and stable golden fixtures remain part
+of the published schema contract; current configuration and external systems
+must never be migration inputs.
+
 ### Exact read-state contract
 
 `GET /replay-state/:orderId` is authoritative because it rebuilds state from

@@ -212,6 +212,19 @@ class InMemoryEventStore {
     return events.map((event) => this.#transform(event));
   }
 
+  /**
+   * Returns the persisted representation for exact append reconciliation.
+   * Domain replay must use the upcast read methods above instead.
+   */
+  getRawByCommandIdForReconciliation(commandId) {
+    if (!isIdentifier(commandId)) {
+      throw new TypeError("commandId must be a non-empty string or a positive safe integer");
+    }
+
+    const events = this.#eventsByCommandId.get(commandId) || [];
+    return events.map((event) => cloneAndFreeze(event));
+  }
+
   getAll() {
     return this.#events.map((event) => this.#transform(event));
   }

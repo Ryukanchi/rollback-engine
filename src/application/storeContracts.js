@@ -11,6 +11,7 @@ const STORE_ADAPTER_METHODS = Object.freeze({
     "getByAggregateId",
     "getByAggregateIdAfter",
     "getByCommandId",
+    "getRawByCommandIdForReconciliation",
     "getAll",
     "getLastSequence",
   ]),

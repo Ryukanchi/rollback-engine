@@ -844,8 +844,6 @@ test("keeps an unknown append outcome non-retryable until it can be reconciled",
   class TemporarilyUnreconcilableEventStore extends InMemoryEventStore {
     shouldLoseAcknowledgement = true;
 
-    lookupCalls = 0;
-
     append(event, options) {
       const storedEvent = super.append(event, options);
 
@@ -857,14 +855,13 @@ test("keeps an unknown append outcome non-retryable until it can be reconciled",
       return storedEvent;
     }
 
-    getByCommandId(commandId) {
-      this.lookupCalls += 1;
-
-      if (this.lookupCalls === 2) {
+    getRawByCommandIdForReconciliation(commandId) {
+      if (!this.rawLookupFailed) {
+        this.rawLookupFailed = true;
         throw new Error("Command event index unavailable");
       }
 
-      return super.getByCommandId(commandId);
+      return super.getRawByCommandIdForReconciliation(commandId);
     }
   }
 
@@ -899,8 +896,6 @@ test("retries only after an unknown append is proven uncommitted", () => {
   class UnknownThenUncommittedEventStore extends InMemoryEventStore {
     shouldFailAppend = true;
 
-    lookupCalls = 0;
-
     append(event, options) {
       if (this.shouldFailAppend) {
         this.shouldFailAppend = false;
@@ -910,14 +905,13 @@ test("retries only after an unknown append is proven uncommitted", () => {
       return super.append(event, options);
     }
 
-    getByCommandId(commandId) {
-      this.lookupCalls += 1;
-
-      if (this.lookupCalls === 2) {
+    getRawByCommandIdForReconciliation(commandId) {
+      if (!this.rawLookupFailed) {
+        this.rawLookupFailed = true;
         throw new Error("Command event index unavailable");
       }
 
-      return super.getByCommandId(commandId);
+      return super.getRawByCommandIdForReconciliation(commandId);
     }
   }
 
