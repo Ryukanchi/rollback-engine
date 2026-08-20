@@ -32,10 +32,25 @@ const STORE_ADAPTER_METHODS = Object.freeze({
   stateRepository: Object.freeze([
     "save",
     "replace",
+    "compareAndSwap",
     "getByAggregateId",
     "getAll",
   ]),
 });
+
+/**
+ * The identity a materialized-view write is conditioned on.
+ *
+ * This is deliberately not a claim that JSON.stringify is a canonical encoding.
+ * The narrower contract that holds here is enough: a projection state written
+ * by a state repository and read back through it re-serialises to the same
+ * text, so comparing this representation answers exactly one question - "is the
+ * stored view still the one this writer observed?". Version is never consulted,
+ * because authoritative repair has to stay free to move the view backwards.
+ */
+function materializedStateIdentity(state) {
+  return state === null || state === undefined ? null : JSON.stringify(state);
+}
 
 /**
  * A lease duration is caller-supplied execution policy, and deliberately stays
@@ -135,6 +150,7 @@ module.exports = {
   STORE_ADAPTER_METHODS,
   assertLeaseTtlMs,
   createLeaseDeadline,
+  materializedStateIdentity,
   assertCommandStoreAdapter,
   assertEventStoreAdapter,
   assertSnapshotStoreAdapter,

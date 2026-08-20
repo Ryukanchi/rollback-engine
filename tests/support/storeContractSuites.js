@@ -1001,6 +1001,110 @@ function registerSnapshotStoreContract({ adapterName, createStore }) {
 
 function registerStateRepositoryContract({ adapterName, createRepository }) {
   describe(`${adapterName} State Repository contract`, () => {
+    // =====================================================================
+    // Materialized view write fencing. Every engine write to the view is a
+    // conditional replace against the state that writer actually observed, so
+    // a writer that fell behind loses instead of overwriting. The condition is
+    // the observed state's identity, never its version: authoritative repair
+    // must stay free to move the view backwards when replay says so.
+    // =====================================================================
+    test("MV-C2: compareAndSwap applies only when the view still matches the observed state", () => {
+      const repository = createRepository();
+      const observed = state(1, 1, "Pizza");
+      const next = state(1, 2, "Pasta");
+      repository.save(observed);
+
+      assert.deepEqual(
+        repository.compareAndSwap({ aggregateId: 1, expectedState: observed, nextState: next }),
+        { applied: true }
+      );
+      assert.deepEqual(repository.getByAggregateId(1), next);
+    });
+
+    test("MV-C2: compareAndSwap loses when the view changed after observation", () => {
+      const repository = createRepository();
+      const observed = state(1, 1, "Pizza");
+      repository.save(observed);
+      const advancedByAnotherWriter = state(1, 2, "Pasta");
+      repository.replace(advancedByAnotherWriter);
+
+      const outcome = repository.compareAndSwap({
+        aggregateId: 1,
+        expectedState: observed,          // what the losing writer saw
+        nextState: state(1, 2, "Stale"),
+      });
+
+      assert.deepEqual(outcome, { applied: false }, "a stale writer must lose");
+      assert.deepEqual(
+        repository.getByAggregateId(1),
+        advancedByAnotherWriter,
+        "and must not have written anything"
+      );
+    });
+
+    test("MV-C2: compareAndSwap inserts only while the view is still absent", () => {
+      const repository = createRepository();
+      const first = state(1, 1, "Pizza");
+
+      assert.deepEqual(
+        repository.compareAndSwap({ aggregateId: 1, expectedState: null, nextState: first }),
+        { applied: true }
+      );
+      assert.deepEqual(repository.getByAggregateId(1), first);
+
+      assert.deepEqual(
+        repository.compareAndSwap({ aggregateId: 1, expectedState: null, nextState: state(1, 9, "Late") }),
+        { applied: false },
+        "a second insert-if-absent must lose"
+      );
+      assert.deepEqual(repository.getByAggregateId(1), first);
+    });
+
+    test("MV-C3: compareAndSwap allows authoritative downward repair", () => {
+      const repository = createRepository();
+      const corrupt = state(1, 8, "CORRUPT");
+      repository.save(corrupt);
+
+      // Replay says the truth is v3. Moving the view backwards is exactly what
+      // repair is for, so nothing here may consult version ordering.
+      const truth = state(1, 3, "Pizza");
+      assert.deepEqual(
+        repository.compareAndSwap({ aggregateId: 1, expectedState: corrupt, nextState: truth }),
+        { applied: true }
+      );
+      assert.deepEqual(repository.getByAggregateId(1), truth);
+    });
+
+    test("MV-C6: compareAndSwap repairs an equal-version, different-state corruption", () => {
+      const repository = createRepository();
+      const corrupt = state(1, 4, "CORRUPT");
+      repository.save(corrupt);
+
+      const truth = state(1, 4, "Pizza");   // same version, deterministic replay says this
+      assert.deepEqual(
+        repository.compareAndSwap({ aggregateId: 1, expectedState: corrupt, nextState: truth }),
+        { applied: true }
+      );
+      assert.deepEqual(repository.getByAggregateId(1).order.item, "Pizza");
+    });
+
+    test("MV-C2: a lost compareAndSwap is an outcome, not an error", () => {
+      const repository = createRepository();
+      repository.save(state(1, 1, "Pizza"));
+
+      // Losing a race is ordinary concurrency, so it must not throw. Malformed
+      // arguments still must.
+      assert.doesNotThrow(() =>
+        repository.compareAndSwap({ aggregateId: 1, expectedState: state(1, 1, "Other"), nextState: state(1, 2) })
+      );
+      assert.throws(() =>
+        repository.compareAndSwap({ aggregateId: 1, expectedState: null, nextState: { aggregateId: 1 } })
+      );
+      assert.throws(() =>
+        repository.compareAndSwap({ aggregateId: 2, expectedState: null, nextState: state(1, 1) })
+      );
+    });
+
     test("separates save from replace and returns null for missing state", () => {
       const repository = createRepository();
       const initial = state(1, 1);

@@ -1,3 +1,5 @@
+const { materializedStateIdentity } = require("../../application/storeContracts");
+
 function isIdentifier(value) {
   return (
     (typeof value === "string" && value.trim().length > 0) ||
@@ -25,8 +27,18 @@ function assertState(state) {
   }
 }
 
+function assertOwnedBy(aggregateId, state, fieldName) {
+  if (state.aggregateId !== aggregateId) {
+    throw new TypeError(`${fieldName} must belong to aggregate ${aggregateId}`);
+  }
+}
+
 class SqliteStateRepository {
   #db;
+
+  #stmtCompareAndSwap;
+
+  #stmtInsertIfAbsent;
 
   #stmtGetState;
 
@@ -64,6 +76,23 @@ class SqliteStateRepository {
 
     this.#stmtReset = this.#db.prepare(`
       DELETE FROM materialized_states
+    `);
+
+    // One statement decides the winner. A SELECT followed by an unconditional
+    // UPDATE would put the decision before the write and reopen the very gap
+    // this exists to close. `version` is redundant with the version inside the
+    // serialised state and is matched anyway, so the predicate covers the whole
+    // persisted row rather than one column of it.
+    this.#stmtCompareAndSwap = this.#db.prepare(`
+      UPDATE materialized_states
+      SET version = ?, state = ?
+      WHERE aggregate_id = ? AND version = ? AND state = ?
+    `);
+
+    this.#stmtInsertIfAbsent = this.#db.prepare(`
+      INSERT INTO materialized_states (aggregate_id, version, state)
+      VALUES (?, ?, ?)
+      ON CONFLICT DO NOTHING
     `);
   }
 
@@ -107,6 +136,43 @@ class SqliteStateRepository {
     );
 
     return this.getByAggregateId(state.aggregateId);
+  }
+
+  /**
+   * Conditional write: store `nextState` only while the persisted row is still
+   * exactly the one the caller observed. `expectedState === null` means the
+   * caller observed no row and wants an insert-if-absent, which the aggregate
+   * primary key decides atomically.
+   *
+   * Losing is ordinary concurrency, so it is returned rather than thrown.
+   */
+  compareAndSwap({ aggregateId, expectedState = null, nextState } = {}) {
+    assertAggregateId(aggregateId);
+    assertState(nextState);
+    assertOwnedBy(aggregateId, nextState, "nextState");
+
+    if (expectedState === null || expectedState === undefined) {
+      const inserted = this.#stmtInsertIfAbsent.run(
+        aggregateId,
+        nextState.version,
+        materializedStateIdentity(nextState)
+      );
+
+      return { applied: inserted.changes === 1 };
+    }
+
+    assertState(expectedState);
+    assertOwnedBy(aggregateId, expectedState, "expectedState");
+
+    const applied = this.#stmtCompareAndSwap.run(
+      nextState.version,
+      materializedStateIdentity(nextState),
+      aggregateId,
+      expectedState.version,
+      materializedStateIdentity(expectedState)
+    );
+
+    return { applied: applied.changes === 1 };
   }
 
   getAll() {

@@ -41,6 +41,13 @@ const {
   InMemoryStateRepository,
 } = require("../infrastructure/inMemoryStateRepository");
 
+/**
+ * How many times a losing writer re-observes and retries before giving up.
+ * Small on purpose: this is a convergence aid, not a mutual-exclusion device,
+ * and read repair converges anything left behind.
+ */
+const MATERIALIZED_VIEW_RECONCILE_ATTEMPTS = 3;
+
 function assertFunction(value, name) {
   if (typeof value !== "function") {
     throw new TypeError(`${name} must be a function`);
@@ -526,6 +533,7 @@ class RollbackEngine {
   }
 
   recover(aggregateId, { useSnapshot = true } = {}) {
+    const observedState = this.#stateRepository.getByAggregateId(aggregateId);
     const state = useSnapshot
       ? this.replayFromSnapshot(aggregateId)
       : this.replay(aggregateId);
@@ -534,7 +542,7 @@ class RollbackEngine {
       return null;
     }
 
-    return this.#writeMaterializedState(state);
+    return this.#writeMaterializedState(observedState, state);
   }
 
   getLiveState(aggregateId) {
@@ -576,16 +584,18 @@ class RollbackEngine {
   }
 
   #ensureLiveState(aggregateId) {
+    // Observed before the replay on purpose: this is the state the repair is
+    // conditioned on, so anything that changes the view afterwards has to make
+    // the write lose rather than be silently overwritten.
+    const currentState = this.#stateRepository.getByAggregateId(aggregateId);
     const replayedState = this.replay(aggregateId);
 
     if (!replayedState) {
       return null;
     }
 
-    const currentState = this.#stateRepository.getByAggregateId(aggregateId);
-
     if (!currentState || !isDeepStrictEqual(currentState, replayedState)) {
-      return this.#writeMaterializedState(replayedState);
+      return this.#writeMaterializedState(currentState, replayedState);
     }
 
     return currentState;
@@ -609,8 +619,8 @@ class RollbackEngine {
           commandContext.lastEventId ?? commandContext.initialCausationId,
       },
     });
-    const currentState =
-      this.#ensureLiveState(aggregateId) || createInitialState(aggregateId);
+    const observedState = this.#ensureLiveState(aggregateId);
+    const currentState = observedState || createInitialState(aggregateId);
 
     const nextState = applyEvent(currentState, event);
     const storedEvent = this.#commandCoordinator.commitEvent(
@@ -620,12 +630,12 @@ class RollbackEngine {
     );
 
     try {
-      this.#writeMaterializedState(nextState);
+      this.#writeMaterializedState(observedState, nextState);
     } catch (updateError) {
       try {
-        const repairedState = this.#writeMaterializedState(this.replay(aggregateId));
+        const repairedState = this.#reconcileMaterializedState(aggregateId);
 
-        if (!isDeepStrictEqual(repairedState, nextState)) {
+        if (!isDeepStrictEqual(repairedState, this.replay(aggregateId))) {
           throw new Error(
             `Repaired materialized view does not match replay for aggregate ${aggregateId}`
           );
@@ -710,28 +720,66 @@ class RollbackEngine {
     }
   }
 
-  #writeMaterializedState(state) {
-    const currentState = this.#stateRepository.getByAggregateId(state.aggregateId);
-
-    if (currentState && isDeepStrictEqual(currentState, state)) {
-      return currentState;
+  /**
+   * The one place the materialized view is written, by publication and repair
+   * alike - they are the same operation with different sources for `nextState`.
+   *
+   * Every write is conditional on the state the writer actually observed, so a
+   * writer that fell behind loses instead of overwriting. The condition is that
+   * observed state's identity and never its version, which is what keeps
+   * authoritative repair free to move the view backwards (v8 corrupt -> v3).
+   */
+  #writeMaterializedState(expectedState, nextState) {
+    if (expectedState && isDeepStrictEqual(expectedState, nextState)) {
+      return expectedState;
     }
 
-    if (currentState) {
-      this.#stateRepository.replace(state);
-    } else {
-      this.#stateRepository.save(state);
+    const outcome = this.#stateRepository.compareAndSwap({
+      aggregateId: nextState.aggregateId,
+      expectedState: expectedState ?? null,
+      nextState,
+    });
+
+    if (outcome.applied) {
+      return nextState;
     }
 
-    const storedState = this.#stateRepository.getByAggregateId(state.aggregateId);
+    // The view moved after we looked. The candidate is stale by definition and
+    // must never be forced through; converge on replay instead.
+    return this.#reconcileMaterializedState(nextState.aggregateId);
+  }
 
-    if (!isDeepStrictEqual(storedState, state)) {
-      throw new Error(
-        `Materialized view for aggregate ${state.aggregateId} does not match replay`
-      );
+  /**
+   * Re-observe, replay, and try again - bounded. Each attempt either wins or
+   * proves another writer got there first, and under sustained concurrency
+   * giving up is correct: nothing stale is written, event history is untouched,
+   * and the next authoritative read converges the view.
+   */
+  #reconcileMaterializedState(aggregateId) {
+    for (let attempt = 0; attempt < MATERIALIZED_VIEW_RECONCILE_ATTEMPTS; attempt += 1) {
+      const observedState = this.#stateRepository.getByAggregateId(aggregateId);
+      const replayedState = this.replay(aggregateId);
+
+      if (!replayedState) {
+        return observedState;
+      }
+
+      if (observedState && isDeepStrictEqual(observedState, replayedState)) {
+        return observedState;
+      }
+
+      const outcome = this.#stateRepository.compareAndSwap({
+        aggregateId,
+        expectedState: observedState ?? null,
+        nextState: replayedState,
+      });
+
+      if (outcome.applied) {
+        return replayedState;
+      }
     }
 
-    return storedState;
+    return this.#stateRepository.getByAggregateId(aggregateId);
   }
 }
 
