@@ -79,6 +79,23 @@ function commandDescriptor(commandId = "command-1") {
   };
 }
 
+function receiptMetadata({
+  domainEffect = "events",
+  aggregateId = 1,
+  sequence = 1,
+  lastEventId = "event-1-1",
+} = {}) {
+  return {
+    contractVersion: 1,
+    domainEffect,
+    stateAnchor: {
+      aggregateId,
+      sequence,
+      lastEventId,
+    },
+  };
+}
+
 function snapshot(aggregateId, version, item = "Pizza") {
   return {
     aggregateId,
@@ -255,6 +272,7 @@ function registerCommandStoreContract({ adapterName, createStore }) {
 
       assert.equal(first.created, true);
       assert.equal(first.record.status, "processing");
+      assert.equal(first.record.receiptMetadata, null);
       assert.equal(repeated.created, false);
       assert.equal(repeated.conflict, false);
       assert.equal(conflicting.created, false);
@@ -292,18 +310,27 @@ function registerCommandStoreContract({ adapterName, createStore }) {
       const completedStore = createStore();
       const failedStore = createStore();
       const result = { aggregateId: 1, state: { lifecycle: "completed" } };
+      const metadata = receiptMetadata();
       const failure = { code: "DOMAIN_REJECTION", message: "Rejected" };
 
       completedStore.reserve(commandDescriptor("completed-command"));
       failedStore.reserve(commandDescriptor("failed-command"));
-      completedStore.complete("completed-command", result, { fencingToken: 1 });
+      completedStore.complete("completed-command", result, {
+        fencingToken: 1,
+        receiptMetadata: metadata,
+      });
       failedStore.fail("failed-command", failure, { fencingToken: 1 });
       result.state.lifecycle = "Changed input";
+      metadata.stateAnchor.lastEventId = "Changed input";
       failure.code = "Changed input";
 
-      assert.equal(
-        completedStore.get("completed-command").result.state.lifecycle,
-        "completed"
+      const completed = completedStore.get("completed-command");
+      assert.equal(completed.result.state.lifecycle, "completed");
+      assert.deepEqual(completed.receiptMetadata, receiptMetadata());
+      completed.receiptMetadata.stateAnchor.lastEventId = "Changed output";
+      assert.deepEqual(
+        completedStore.get("completed-command").receiptMetadata,
+        receiptMetadata()
       );
       assert.equal(failedStore.get("failed-command").error.code, "DOMAIN_REJECTION");
       assert.throws(() =>
@@ -323,11 +350,38 @@ function registerCommandStoreContract({ adapterName, createStore }) {
         store.complete(
           "command-1",
           { uncloneable: () => {} },
-          { fencingToken: 1 }
+          { fencingToken: 1, receiptMetadata: receiptMetadata() }
         )
       );
       assert.equal(store.get("command-1").status, "processing");
       assert.equal(store.get("command-1").result, null);
+      assert.equal(store.get("command-1").receiptMetadata, null);
+    });
+
+    test("requires a structurally valid receipt contract before completion", () => {
+      const store = createStore();
+      store.reserve(commandDescriptor("receipt-contract"));
+
+      const invalidMetadata = [
+        undefined,
+        { ...receiptMetadata(), contractVersion: 2 },
+        { ...receiptMetadata(), domainEffect: "unknown" },
+        { ...receiptMetadata(), stateAnchor: { aggregateId: 1, sequence: -1, lastEventId: null } },
+        { ...receiptMetadata(), stateAnchor: { aggregateId: 1, sequence: 1, lastEventId: null } },
+      ];
+
+      for (const receiptMetadata of invalidMetadata) {
+        assert.throws(() =>
+          store.complete(
+            "receipt-contract",
+            { aggregateId: 1, state: { version: 1 } },
+            { fencingToken: 1, receiptMetadata }
+          )
+        );
+        assert.equal(store.get("receipt-contract").status, "processing");
+        assert.equal(store.get("receipt-contract").result, null);
+        assert.equal(store.get("receipt-contract").receiptMetadata, null);
+      }
     });
 
     test("releases only commands proven to have no committed event range", () => {
@@ -449,7 +503,10 @@ function registerCommandStoreContract({ adapterName, createStore }) {
       );
 
       // A terminal command is no longer revocable.
-      store.complete(descriptor.commandId, { ok: true }, { fencingToken: 1 });
+      store.complete(descriptor.commandId, { ok: true }, {
+        fencingToken: 1,
+        receiptMetadata: receiptMetadata(),
+      });
       assert.deepEqual(
         at(store, 9000).revokeExpired({ commandId: descriptor.commandId, expectedToken: 1, error }),
         { success: false, reason: "NOT_PROCESSING" }
@@ -617,7 +674,7 @@ function registerCommandStoreContract({ adapterName, createStore }) {
       const completed = store.complete(
         descriptor.commandId,
         { status: "completed" },
-        { fencingToken: 2 }
+        { fencingToken: 2, receiptMetadata: receiptMetadata() }
       );
       assert.equal(completed.status, "completed");
       assert.equal(completed.leaseOwner, null);

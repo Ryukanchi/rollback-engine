@@ -1,6 +1,7 @@
 const { isDeepStrictEqual } = require("node:util");
 const {
   COMMAND_STATUSES,
+  assertCommandReceiptMetadata,
   assertLeaseTtlMs,
   createLeaseDeadline,
 } = require("../application/storeContracts");
@@ -126,6 +127,7 @@ class InMemoryCommandStore {
         existing.aggregateId = null;
         existing.eventRange = null;
         existing.result = null;
+        existing.receiptMetadata = null;
         existing.error = null;
         existing.leaseOwner = leaseOwner;
         existing.leaseToken = leaseToken;
@@ -156,6 +158,7 @@ class InMemoryCommandStore {
       aggregateId: null,
       eventRange: null,
       result: null,
+      receiptMetadata: null,
       error: null,
       leaseOwner,
       leaseToken,
@@ -386,14 +389,17 @@ class InMemoryCommandStore {
     return clone(record);
   }
 
-  complete(commandId, result, { fencingToken } = {}) {
+  complete(commandId, result, { fencingToken, receiptMetadata } = {}) {
     const record = this.#requireProcessing(commandId);
     this.#assertGeneration(commandId, record, fencingToken);
 
     const clonedResult = clone(result);
+    const clonedReceiptMetadata = clone(receiptMetadata);
+    assertCommandReceiptMetadata(clonedReceiptMetadata);
 
     record.status = COMMAND_STATUSES.COMPLETED;
     record.result = clonedResult;
+    record.receiptMetadata = clonedReceiptMetadata;
     record.leaseOwner = null;
     record.leaseExpiresAt = null;
 

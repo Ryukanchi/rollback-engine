@@ -1,6 +1,7 @@
 const { isDeepStrictEqual } = require("node:util");
 const {
   COMMAND_STATUSES,
+  assertCommandReceiptMetadata,
   assertLeaseTtlMs,
   createLeaseDeadline,
 } = require("../../application/storeContracts");
@@ -80,6 +81,9 @@ function rowToRecord(row) {
     aggregateId: row.aggregate_id ?? null,
     eventRange: row.event_range ? JSON.parse(row.event_range) : null,
     result: row.result ? JSON.parse(row.result) : null,
+    receiptMetadata: row.receipt_metadata
+      ? JSON.parse(row.receipt_metadata)
+      : null,
     error: row.error ? JSON.parse(row.error) : null,
     leaseOwner: row.lease_owner ?? null,
     leaseToken: row.lease_token !== null && row.lease_token !== undefined ? Number(row.lease_token) : 1,
@@ -136,15 +140,15 @@ class SqliteCommandStore {
     this.#now = typeof now === "function" ? now : () => Date.now();
 
     this.#stmtGetCommand = this.#db.prepare(`
-      SELECT command_id, command_type, payload, status, aggregate_id, event_range, result, error, lease_owner, lease_token, lease_expires_at
+      SELECT command_id, command_type, payload, status, aggregate_id, event_range, result, receipt_metadata, error, lease_owner, lease_token, lease_expires_at
       FROM commands
       WHERE command_id = ?
     `);
 
     this.#stmtInsertCommand = this.#db.prepare(`
       INSERT INTO commands (
-        command_id, command_type, payload, status, aggregate_id, event_range, result, error, lease_owner, lease_token, lease_expires_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        command_id, command_type, payload, status, aggregate_id, event_range, result, receipt_metadata, error, lease_owner, lease_token, lease_expires_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     // G5: every status/bookkeeping mutation is a compare-and-swap on
@@ -159,7 +163,7 @@ class SqliteCommandStore {
 
     this.#stmtCompleteCommand = this.#db.prepare(`
       UPDATE commands
-      SET status = ?, result = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = CURRENT_TIMESTAMP
+      SET status = ?, result = ?, receipt_metadata = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = CURRENT_TIMESTAMP
       WHERE command_id = ? AND status = ? AND lease_token = ?
     `);
 
@@ -183,7 +187,7 @@ class SqliteCommandStore {
 
     this.#stmtReReserveCommand = this.#db.prepare(`
       UPDATE commands
-      SET command_type = ?, payload = ?, status = ?, aggregate_id = NULL, event_range = NULL, result = NULL, error = NULL,
+      SET command_type = ?, payload = ?, status = ?, aggregate_id = NULL, event_range = NULL, result = NULL, receipt_metadata = NULL, error = NULL,
           lease_owner = ?, lease_token = ?, lease_expires_at = ?, updated_at = CURRENT_TIMESTAMP
       WHERE command_id = ? AND status = ? AND lease_token = ?
     `);
@@ -290,6 +294,7 @@ class SqliteCommandStore {
             aggregateId: null,
             eventRange: null,
             result: null,
+            receiptMetadata: null,
             error: null,
             leaseOwner,
             leaseToken,
@@ -321,6 +326,7 @@ class SqliteCommandStore {
         aggregateId: null,
         eventRange: null,
         result: null,
+        receiptMetadata: null,
         error: null,
         leaseOwner,
         leaseToken,
@@ -332,6 +338,7 @@ class SqliteCommandStore {
         commandType,
         JSON.stringify(payload),
         COMMAND_STATUSES.PROCESSING,
+        null,
         null,
         null,
         null,
@@ -627,22 +634,26 @@ class SqliteCommandStore {
     });
   }
 
-  complete(commandId, result, { fencingToken } = {}) {
+  complete(commandId, result, { fencingToken, receiptMetadata } = {}) {
     return this.#transaction(() => {
       const record = this.#requireProcessing(commandId);
       this.#assertGeneration(commandId, record, fencingToken);
 
       const clonedResult = clone(result);
+      const clonedReceiptMetadata = clone(receiptMetadata);
+      assertCommandReceiptMetadata(clonedReceiptMetadata);
       const expectedToken = record.leaseToken;
 
       record.status = COMMAND_STATUSES.COMPLETED;
       record.result = clonedResult;
+      record.receiptMetadata = clonedReceiptMetadata;
       record.leaseOwner = null;
       record.leaseExpiresAt = null;
 
       const applied = this.#stmtCompleteCommand.run(
         COMMAND_STATUSES.COMPLETED,
         JSON.stringify(clonedResult),
+        JSON.stringify(clonedReceiptMetadata),
         commandId,
         COMMAND_STATUSES.PROCESSING,
         expectedToken

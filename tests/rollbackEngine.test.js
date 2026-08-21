@@ -14,6 +14,9 @@ const {
 const {
   InMemoryStateRepository,
 } = require("../src/infrastructure/inMemoryStateRepository");
+const {
+  commandReceiptMetadata,
+} = require("./support/commandReceiptFixtures");
 
 function createEngineHarness() {
   const eventStore = new InMemoryEventStore();
@@ -1064,7 +1067,10 @@ test("does not trust a completed command whose events are missing", () => {
   commandStore.complete(
     commandId,
     { aggregateId: 99, status: "completed", events: [] },
-    { fencingToken: 1 }
+    {
+      fencingToken: 1,
+      receiptMetadata: commandReceiptMetadata({ domainEffect: "events" }),
+    }
   );
   const engine = new RollbackEngine({ commandStore, eventStore });
 

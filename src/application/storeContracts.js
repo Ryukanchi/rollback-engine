@@ -5,6 +5,13 @@ const COMMAND_STATUSES = Object.freeze({
   RELEASED: "released",
 });
 
+const CURRENT_COMMAND_RECEIPT_CONTRACT_VERSION = 1;
+
+const COMMAND_RECEIPT_DOMAIN_EFFECTS = Object.freeze({
+  EVENTS: "events",
+  NONE: "none",
+});
+
 const STORE_ADAPTER_METHODS = Object.freeze({
   eventStore: Object.freeze([
     "append",
@@ -97,6 +104,85 @@ function createLeaseDeadline(now, leaseTtlMs) {
   return leaseExpiresAt;
 }
 
+/**
+ * Validates only the persisted receipt shape introduced by F-12 phase 1.
+ * Whether an anchor still agrees with Event History is deliberately outside
+ * this Store contract and belongs to the later completed-receipt read boundary.
+ */
+function assertCommandReceiptMetadata(receiptMetadata) {
+  if (
+    !receiptMetadata ||
+    typeof receiptMetadata !== "object" ||
+    Array.isArray(receiptMetadata)
+  ) {
+    throw new TypeError("receiptMetadata must be an object");
+  }
+
+  if (
+    receiptMetadata.contractVersion !==
+    CURRENT_COMMAND_RECEIPT_CONTRACT_VERSION
+  ) {
+    throw new TypeError(
+      `receiptMetadata.contractVersion must be ${CURRENT_COMMAND_RECEIPT_CONTRACT_VERSION}`
+    );
+  }
+
+  if (
+    !Object.values(COMMAND_RECEIPT_DOMAIN_EFFECTS).includes(
+      receiptMetadata.domainEffect
+    )
+  ) {
+    throw new TypeError(
+      'receiptMetadata.domainEffect must be "events" or "none"'
+    );
+  }
+
+  const { stateAnchor } = receiptMetadata;
+
+  if (stateAnchor === null) {
+    return receiptMetadata;
+  }
+
+  if (!stateAnchor || typeof stateAnchor !== "object" || Array.isArray(stateAnchor)) {
+    throw new TypeError("receiptMetadata.stateAnchor must be an object or null");
+  }
+
+  if (
+    !(
+      (typeof stateAnchor.aggregateId === "string" &&
+        stateAnchor.aggregateId.trim().length > 0) ||
+      (Number.isSafeInteger(stateAnchor.aggregateId) && stateAnchor.aggregateId > 0)
+    )
+  ) {
+    throw new TypeError(
+      "receiptMetadata.stateAnchor.aggregateId must be a non-empty string or a positive safe integer"
+    );
+  }
+
+  if (!Number.isSafeInteger(stateAnchor.sequence) || stateAnchor.sequence < 0) {
+    throw new TypeError(
+      "receiptMetadata.stateAnchor.sequence must be a non-negative safe integer"
+    );
+  }
+
+  if (stateAnchor.sequence === 0) {
+    if (stateAnchor.lastEventId !== null) {
+      throw new TypeError(
+        "receiptMetadata.stateAnchor.lastEventId must be null at sequence 0"
+      );
+    }
+  } else if (
+    typeof stateAnchor.lastEventId !== "string" ||
+    stateAnchor.lastEventId.trim().length === 0
+  ) {
+    throw new TypeError(
+      "receiptMetadata.stateAnchor.lastEventId must be a non-empty string after sequence 0"
+    );
+  }
+
+  return receiptMetadata;
+}
+
 function assertStoreAdapter(adapter, adapterName, requiredMethods) {
   if (
     !adapter ||
@@ -148,7 +234,10 @@ function assertStateRepositoryAdapter(adapter) {
 
 module.exports = {
   COMMAND_STATUSES,
+  COMMAND_RECEIPT_DOMAIN_EFFECTS,
+  CURRENT_COMMAND_RECEIPT_CONTRACT_VERSION,
   STORE_ADAPTER_METHODS,
+  assertCommandReceiptMetadata,
   assertLeaseTtlMs,
   createLeaseDeadline,
   materializedStateIdentity,

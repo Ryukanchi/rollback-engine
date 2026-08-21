@@ -3,6 +3,8 @@ const { randomUUID } = require("node:crypto");
 
 const {
   COMMAND_STATUSES,
+  COMMAND_RECEIPT_DOMAIN_EFFECTS,
+  CURRENT_COMMAND_RECEIPT_CONTRACT_VERSION,
   assertCommandStoreAdapter,
   assertEventStoreAdapter,
   assertLeaseTtlMs,
@@ -75,6 +77,17 @@ const RECONCILABLE_UNKNOWN_COMMAND_CODES = new Set([
   "COMMAND_RECONCILIATION_FAILED",
   "EVENT_APPEND_COMMIT_UNKNOWN",
 ]);
+
+function createReceiptMetadata(commandContext, stateAnchor) {
+  return {
+    contractVersion: CURRENT_COMMAND_RECEIPT_CONTRACT_VERSION,
+    domainEffect:
+      commandContext.committedEvents.length > 0
+        ? COMMAND_RECEIPT_DOMAIN_EFFECTS.EVENTS
+        : COMMAND_RECEIPT_DOMAIN_EFFECTS.NONE,
+    stateAnchor: stateAnchor ?? null,
+  };
+}
 
 class CommandExecutionCoordinator {
   #eventStore;
@@ -190,10 +203,13 @@ class CommandExecutionCoordinator {
     try {
       const result = executeCommand(commandContext);
 
-      this.#validateResult(result);
+      const stateAnchor = this.#validateResult(result);
 
       if (commandId) {
-        this.#commandStore.complete(commandId, result, { fencingToken: currentFencingToken });
+        this.#commandStore.complete(commandId, result, {
+          fencingToken: currentFencingToken,
+          receiptMetadata: createReceiptMetadata(commandContext, stateAnchor),
+        });
       }
 
       return result;
@@ -486,8 +502,11 @@ class CommandExecutionCoordinator {
 
           try {
             const result = executeCommand(commandContext);
-            this.#validateResult(result);
-            this.#commandStore.complete(record.commandId, result, { fencingToken: newToken });
+            const stateAnchor = this.#validateResult(result);
+            this.#commandStore.complete(record.commandId, result, {
+              fencingToken: newToken,
+              receiptMetadata: createReceiptMetadata(commandContext, stateAnchor),
+            });
             return result;
           } catch (caughtError) {
             return this.#handleExecutionError(caughtError, commandContext);

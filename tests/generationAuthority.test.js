@@ -15,6 +15,9 @@ const {
 const { RollbackEngine } = require("../src/application/rollbackEngine");
 const { COMMAND_STATUSES } = require("../src/application/storeContracts");
 const { createDomainEvent, EVENT_TYPES } = require("../src/domain/events");
+const {
+  commandReceiptMetadata,
+} = require("./support/commandReceiptFixtures");
 
 const PAYLOAD = { item: "Widget", quantity: 1, amount: 100 };
 
@@ -176,7 +179,10 @@ for (const storeType of ["memory", "sqlite"]) {
       // The identical call from the live generation is accepted, which proves
       // the rejections above were about the generation and nothing else.
       assert.equal(
-        store.complete(commandId, { hijacked: 4 }, { fencingToken: 4 }).status,
+        store.complete(commandId, { hijacked: 4 }, {
+          fencingToken: 4,
+          receiptMetadata: commandReceiptMetadata(),
+        }).status,
         COMMAND_STATUSES.COMPLETED
       );
 
@@ -201,7 +207,12 @@ for (const storeType of ["memory", "sqlite"]) {
         assert.equal(takeover.record.status, COMMAND_STATUSES.PROCESSING);
 
         const invoke = (token) => {
-          if (mutation === "complete") return store.complete(commandId, { ok: true }, { fencingToken: token });
+          if (mutation === "complete") {
+            return store.complete(commandId, { ok: true }, {
+              fencingToken: token,
+              receiptMetadata: commandReceiptMetadata(),
+            });
+          }
           if (mutation === "fail") return store.fail(commandId, { code: "X" }, { fencingToken: token });
           if (mutation === "release") return store.release(commandId, { fencingToken: token });
           return store.recordEvent(commandId, createEvent({ commandId }), { fencingToken: token });
@@ -454,7 +465,10 @@ for (const storeType of ["memory", "sqlite"]) {
       // Zombie A wakes up. Its command produced no events, so it never passes
       // through renewLease() and reaches complete() directly.
       assert.throws(
-        () => store.complete(commandId, { hijacked: true }, { fencingToken: 1 }),
+        () => store.complete(commandId, { hijacked: true }, {
+          fencingToken: 1,
+          receiptMetadata: commandReceiptMetadata(),
+        }),
         (error) => isStaleGeneration(error, { provided: 1, current: 2 })
       );
 
@@ -526,7 +540,10 @@ describe("Generation authority (SQLite atomicity)", () => {
 
       armed = true;
       assert.throws(
-        () => store.complete(commandId, { hijacked: true }, { fencingToken: 1 }),
+        () => store.complete(commandId, { hijacked: true }, {
+          fencingToken: 1,
+          receiptMetadata: commandReceiptMetadata(),
+        }),
         (error) => {
           assert.equal(error.code, "FENCING_TOKEN_STALE");
           return true;
@@ -632,7 +649,10 @@ describe("Generation authority (SQLite atomicity)", () => {
       armed = true;
       let mutationError = null;
       try {
-        storeA.complete(commandId, { byA: true }, { fencingToken: 1 });
+        storeA.complete(commandId, { byA: true }, {
+          fencingToken: 1,
+          receiptMetadata: commandReceiptMetadata(),
+        });
       } catch (error) {
         mutationError = error;
       }

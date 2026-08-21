@@ -18,6 +18,9 @@ const {
 const { RollbackEngine } = require("../src/application/rollbackEngine");
 const { COMMAND_STATUSES } = require("../src/application/storeContracts");
 const { createDomainEvent, EVENT_TYPES } = require("../src/domain/events");
+const {
+  commandReceiptMetadata,
+} = require("./support/commandReceiptFixtures");
 
 const TTL = 5000;
 const LONG_STEP = 12000;
@@ -446,7 +449,10 @@ for (const storeType of ["memory", "sqlite"]) {
     test("RACE-5/6: complete vs revoke yields exactly one terminal truth", () => {
       const completeFirst = createAdapters(storeType);
       seedPartialCommit(completeFirst, "race-complete");
-      completeFirst.commandStore.complete("race-complete", { ok: true }, { fencingToken: 1 });
+      completeFirst.commandStore.complete("race-complete", { ok: true }, {
+        fencingToken: 1,
+        receiptMetadata: commandReceiptMetadata({ domainEffect: "events" }),
+      });
       const revokeAfter = at(completeFirst.commandStore, 60_000).revokeExpired({
         commandId: "race-complete",
         expectedToken: 1,
@@ -577,7 +583,10 @@ for (const storeType of ["memory", "sqlite"]) {
       );
       assert.equal(appended.sequence, 2);
       assert.equal(
-        adapters.commandStore.complete("suspend-1", { ok: true }, { fencingToken: 1 }).status,
+        adapters.commandStore.complete("suspend-1", { ok: true }, {
+          fencingToken: 1,
+          receiptMetadata: commandReceiptMetadata({ domainEffect: "events" }),
+        }).status,
         COMMAND_STATUSES.COMPLETED
       );
       adapters.close();
@@ -1104,7 +1113,14 @@ describe("Lease authority under SQLite concurrency", () => {
   });
 
   for (const [label, ownerMutation] of [
-    ["SQLITE-2: complete", (store, commandId) => store.complete(commandId, { ok: true }, { fencingToken: 1 })],
+    [
+      "SQLITE-2: complete",
+      (store, commandId) =>
+        store.complete(commandId, { ok: true }, {
+          fencingToken: 1,
+          receiptMetadata: commandReceiptMetadata({ domainEffect: "events" }),
+        }),
+    ],
     [
       "SQLITE-3: renew",
       (store, commandId) =>

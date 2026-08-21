@@ -13,6 +13,9 @@ const { createSqliteDatabase } = require("../src/infrastructure/sqlite/sqliteDat
 const { SqliteCommandStore } = require("../src/infrastructure/sqlite/sqliteCommandStore");
 const { SqliteEventStore } = require("../src/infrastructure/sqlite/sqliteEventStore");
 const { EVENT_TYPES, createDomainEvent } = require("../src/domain/events");
+const {
+  commandReceiptMetadata,
+} = require("./support/commandReceiptFixtures");
 
 function createEngineWithCustomClock({
   storageType = "memory",
@@ -687,7 +690,11 @@ test("separation of protection layers: status check vs token check tested separa
       workerId: "worker-1",
       leaseTtlMs: 5000,
     });
-    commandStore.complete(cmdCompleted, { aggregateId: 102, status: "completed" }, { fencingToken: 1 });
+    commandStore.complete(
+      cmdCompleted,
+      { aggregateId: 102, status: "completed" },
+      { fencingToken: 1, receiptMetadata: commandReceiptMetadata() }
+    );
 
     const evtForCompleted = createDomainEvent({
       eventId: "evt-comp-1",

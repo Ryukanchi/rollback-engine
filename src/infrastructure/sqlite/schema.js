@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS commands (
     aggregate_id ANY,
     event_range TEXT,
     result TEXT,
+    receipt_metadata TEXT,
     error TEXT,
     lease_owner TEXT,
     lease_token INTEGER NOT NULL DEFAULT 1,
@@ -74,10 +75,20 @@ function initializeSchema(db) {
       db.exec("ALTER TABLE commands ADD COLUMN lease_expires_at INTEGER;");
     }
 
-    db.exec("CREATE INDEX IF NOT EXISTS idx_commands_lease ON commands (status, lease_expires_at);");
     db.exec("PRAGMA user_version = 2;");
-  } else {
-    db.exec("CREATE INDEX IF NOT EXISTS idx_commands_lease ON commands (status, lease_expires_at);");
+  }
+
+  db.exec("CREATE INDEX IF NOT EXISTS idx_commands_lease ON commands (status, lease_expires_at);");
+
+  if (currentVersion < 3) {
+    const tableInfo = db.prepare("PRAGMA table_info(commands);").all();
+    const cols = new Set(tableInfo.map((c) => c.name));
+
+    if (!cols.has("receipt_metadata")) {
+      db.exec("ALTER TABLE commands ADD COLUMN receipt_metadata TEXT;");
+    }
+
+    db.exec("PRAGMA user_version = 3;");
   }
 }
 

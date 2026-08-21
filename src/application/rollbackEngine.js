@@ -644,6 +644,28 @@ class RollbackEngine {
     if (!isDeepStrictEqual(result.state, authoritativeState)) {
       throw createCommandResultAuthorityError(result.aggregateId);
     }
+
+    if (authoritativeState === null) {
+      return null;
+    }
+
+    const sequence = authoritativeState.version;
+    const lastEvent =
+      sequence === 0
+        ? null
+        : this.#eventStore
+            .getByAggregateId(authoritativeState.aggregateId)
+            .find((event) => event.sequence === sequence);
+
+    if (sequence > 0 && !lastEvent) {
+      throw createCommandResultAuthorityError(result.aggregateId);
+    }
+
+    return {
+      aggregateId: authoritativeState.aggregateId,
+      sequence,
+      lastEventId: lastEvent?.eventId ?? null,
+    };
   }
 
   #recordEvent(aggregateId, eventType, payload, commandContext) {

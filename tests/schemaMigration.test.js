@@ -56,8 +56,8 @@ CREATE TABLE IF NOT EXISTS materialized_states (
 );
 `;
 
-test("schema migration: upgrades legacy v1 database to v2 with lease columns and user_version", () => {
-  const dbPath = join(tmpdir(), `rollback-migration-v1-to-v2-${randomUUID()}.db`);
+test("schema migration: upgrades legacy v1 database to v3 with lease and receipt columns", () => {
+  const dbPath = join(tmpdir(), `rollback-migration-v1-to-v3-${randomUUID()}.db`);
 
   // Step 1: Create a legacy v1 database manually
   const rawDb = new DatabaseSync(dbPath);
@@ -96,16 +96,17 @@ test("schema migration: upgrades legacy v1 database to v2 with lease columns and
   });
 
   try {
-    // Verify user_version is now 2
+    // Verify user_version is now 3
     const versionRow = adapters.db.prepare("PRAGMA user_version;").get();
     const version = Object.values(versionRow)[0];
-    assert.equal(version, 2);
+    assert.equal(version, 3);
 
     // Verify columns exist now
-    const colsV2 = adapters.db.prepare("PRAGMA table_info(commands);").all().map((c) => c.name);
-    assert.equal(colsV2.includes("lease_owner"), true);
-    assert.equal(colsV2.includes("lease_token"), true);
-    assert.equal(colsV2.includes("lease_expires_at"), true);
+    const colsV3 = adapters.db.prepare("PRAGMA table_info(commands);").all().map((c) => c.name);
+    assert.equal(colsV3.includes("lease_owner"), true);
+    assert.equal(colsV3.includes("lease_token"), true);
+    assert.equal(colsV3.includes("lease_expires_at"), true);
+    assert.equal(colsV3.includes("receipt_metadata"), true);
 
     // Verify legacy record is intact and accessible
     const legacyCmd = adapters.commandStore.get("legacy-cmd-1");
@@ -114,6 +115,7 @@ test("schema migration: upgrades legacy v1 database to v2 with lease columns and
     assert.equal(legacyCmd.leaseToken, 1);
     assert.equal(legacyCmd.leaseOwner, null);
     assert.equal(legacyCmd.leaseExpiresAt, null);
+    assert.equal(legacyCmd.receiptMetadata, null);
 
     // Verify new commands can be reserved with leases
     const newReservation = adapters.commandStore.reserve({

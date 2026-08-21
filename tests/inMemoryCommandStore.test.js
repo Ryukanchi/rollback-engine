@@ -5,6 +5,9 @@ const { EVENT_TYPES, createDomainEvent } = require("../src/domain/events");
 const {
   InMemoryCommandStore,
 } = require("../src/infrastructure/inMemoryCommandStore");
+const {
+  commandReceiptMetadata,
+} = require("./support/commandReceiptFixtures");
 
 function createEvent() {
   return createDomainEvent({
@@ -36,7 +39,10 @@ test("reserves, tracks and completes an idempotent command", () => {
   store.complete(
     descriptor.commandId,
     { aggregateId: 7, status: "completed" },
-    { fencingToken: 1 }
+    {
+      fencingToken: 1,
+      receiptMetadata: commandReceiptMetadata({ domainEffect: "events" }),
+    }
   );
 
   const stored = store.get(descriptor.commandId);
@@ -98,7 +104,10 @@ test("command records are isolated from caller mutation", () => {
     commandType: "CHECKOUT",
     payload,
   });
-  store.complete("checkout-command-1", result, { fencingToken: 1 });
+  store.complete("checkout-command-1", result, {
+    fencingToken: 1,
+    receiptMetadata: commandReceiptMetadata(),
+  });
 
   payload.item = "Changed";
   result.state.lifecycle = "Changed";
@@ -131,7 +140,7 @@ test("failed defensive copies leave command transitions untouched", () => {
       store.complete(
         "complete-clone-failure",
         { uncloneable: () => {} },
-        { fencingToken: 1 }
+        { fencingToken: 1, receiptMetadata: commandReceiptMetadata() }
       ),
     { name: "DataCloneError" }
   );
