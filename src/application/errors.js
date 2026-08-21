@@ -56,6 +56,32 @@ function createCommandHistoryInconsistentError(commandId, events = []) {
   return error;
 }
 
+function createCommandReceiptInconsistentError(
+  commandId,
+  events = [],
+  cause
+) {
+  const error = new Error(
+    "The completed command receipt is inconsistent with its historical anchor.",
+    { cause }
+  );
+  error.code = "COMMAND_RECEIPT_INCONSISTENT";
+  error.commandId = commandId;
+  error.eventCommitted = events.length > 0;
+  error.retrySafe = false;
+  error.retryAction = "MANUAL_RESOLUTION_REQUIRED";
+
+  if (events.length > 0) {
+    error.eventIds = events.map((event) => event.eventId);
+
+    if (events.every((event) => event.aggregateId === events[0].aggregateId)) {
+      error.aggregateId = events[0].aggregateId;
+    }
+  }
+
+  return error;
+}
+
 function createInterruptedCommandError(commandId, events) {
   const error = new Error(
     "Committed command events were found without a completed command result."
@@ -245,6 +271,7 @@ module.exports = {
   createCommandInProgressError,
   createPartiallyCommittedCommandError,
   createCommandHistoryInconsistentError,
+  createCommandReceiptInconsistentError,
   createInterruptedCommandError,
   createCommandStatePersistenceError,
   createAppendCommitUnknownError,

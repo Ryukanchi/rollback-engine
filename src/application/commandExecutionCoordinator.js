@@ -5,6 +5,7 @@ const {
   COMMAND_STATUSES,
   COMMAND_RECEIPT_DOMAIN_EFFECTS,
   CURRENT_COMMAND_RECEIPT_CONTRACT_VERSION,
+  assertCommandReceiptMetadata,
   assertCommandStoreAdapter,
   assertEventStoreAdapter,
   assertLeaseTtlMs,
@@ -19,6 +20,7 @@ const {
   createCommandInProgressError,
   createPartiallyCommittedCommandError,
   createCommandHistoryInconsistentError,
+  createCommandReceiptInconsistentError,
   createInterruptedCommandError,
   createCommandStatePersistenceError,
   createAppendCommitUnknownError,
@@ -106,6 +108,8 @@ class CommandExecutionCoordinator {
 
   #validateResult;
 
+  #validateHistoricalReceiptState;
+
   constructor({
     eventStore,
     commandStore,
@@ -117,6 +121,7 @@ class CommandExecutionCoordinator {
     diagnosticReporter,
     emitDiagnostic,
     validateResult = () => {},
+    validateHistoricalReceiptState = null,
   }) {
     if (typeof operationIdGenerator !== "function") {
       throw new TypeError("operationIdGenerator must be a function");
@@ -124,6 +129,15 @@ class CommandExecutionCoordinator {
 
     if (typeof validateResult !== "function") {
       throw new TypeError("validateResult must be a function");
+    }
+
+    if (
+      validateHistoricalReceiptState !== null &&
+      typeof validateHistoricalReceiptState !== "function"
+    ) {
+      throw new TypeError(
+        "validateHistoricalReceiptState must be a function or null"
+      );
     }
 
     // Lease time is the Command Store's, not the Coordinator's (TA-2/TA-3).
@@ -149,6 +163,7 @@ class CommandExecutionCoordinator {
     this.#emitDiagnostic =
       emitDiagnostic ?? createDiagnosticEmitter(diagnosticReporter);
     this.#validateResult = validateResult;
+    this.#validateHistoricalReceiptState = validateHistoricalReceiptState;
   }
 
   execute(commandType, payload, options, executeCommand) {
@@ -437,6 +452,9 @@ class CommandExecutionCoordinator {
         throw createCommandHistoryInconsistentError(record.commandId, events);
       }
 
+      this.#assertCompletedReceiptEnvelope(record, events);
+      this.#assertCompletedReceiptState(record, events);
+
       this.#emitDiagnostic({
         type: DIAGNOSTIC_TYPES.IDEMPOTENCY_DEDUPLICATED,
         status: DIAGNOSTIC_STATUSES.DEDUPLICATED,
@@ -647,6 +665,120 @@ class CommandExecutionCoordinator {
     }
 
     throw createCommandHistoryInconsistentError(record.commandId, events);
+  }
+
+  /**
+   * Establishes only that a completed receipt is a self-consistent historical
+   * envelope. Event History may prove the anchor's identity, but no projection
+   * runs here and the current aggregate head is deliberately irrelevant. The
+   * semantic equality of `result.state` remains the next validation layer.
+   */
+  #assertCompletedReceiptEnvelope(record, commandEvents) {
+    try {
+      const receiptMetadata = assertCommandReceiptMetadata(
+        record.receiptMetadata
+      );
+      const { domainEffect, stateAnchor } = receiptMetadata;
+      const { eventRange, result } = record;
+
+      if (
+        !result ||
+        typeof result !== "object" ||
+        Array.isArray(result) ||
+        !Object.prototype.hasOwnProperty.call(result, "state")
+      ) {
+        throw new TypeError("completed receipt result must contain state");
+      }
+
+      if (domainEffect === COMMAND_RECEIPT_DOMAIN_EFFECTS.EVENTS) {
+        if (!eventRange || stateAnchor === null) {
+          throw new TypeError(
+            "an eventful receipt requires an effect range and state anchor"
+          );
+        }
+
+        if (
+          stateAnchor.aggregateId !== eventRange.aggregateId ||
+          stateAnchor.sequence < eventRange.lastSequence
+        ) {
+          throw new TypeError(
+            "an eventful receipt anchor cannot precede its effect range"
+          );
+        }
+      } else if (eventRange !== null) {
+        throw new TypeError(
+          "an eventless receipt cannot claim an event effect range"
+        );
+      }
+
+      if (stateAnchor === null) {
+        if (result.state !== null) {
+          throw new TypeError(
+            "an unanchored receipt cannot contain a domain state"
+          );
+        }
+
+        return;
+      }
+
+      if (
+        result.aggregateId !== stateAnchor.aggregateId ||
+        !result.state ||
+        typeof result.state !== "object" ||
+        Array.isArray(result.state) ||
+        result.state.aggregateId !== stateAnchor.aggregateId ||
+        result.state.version !== stateAnchor.sequence
+      ) {
+        throw new TypeError(
+          "receipt result coordinates must match the historical state anchor"
+        );
+      }
+
+      if (stateAnchor.sequence === 0) {
+        return;
+      }
+
+      const anchorEvent = this.#eventStore
+        .getByAggregateId(stateAnchor.aggregateId)
+        .find((event) => event.sequence === stateAnchor.sequence);
+
+      if (!anchorEvent || anchorEvent.eventId !== stateAnchor.lastEventId) {
+        throw new TypeError(
+          "receipt state anchor must identify its historical event"
+        );
+      }
+    } catch (cause) {
+      throw createCommandReceiptInconsistentError(
+        record.commandId,
+        commandEvents,
+        cause
+      );
+    }
+  }
+
+  #assertCompletedReceiptState(record, commandEvents) {
+    try {
+      if (!this.#validateHistoricalReceiptState) {
+        throw new TypeError(
+          "completed receipt reads require a historical state validator"
+        );
+      }
+
+      this.#validateHistoricalReceiptState(
+        record.result,
+        record.receiptMetadata.stateAnchor
+      );
+    } catch (cause) {
+      if (cause?.code === "COMMAND_RECEIPT_INCONSISTENT") {
+        throw cause;
+      }
+
+      throw createCommandReceiptInconsistentError(
+        record.commandId,
+        commandEvents,
+        cause
+      );
+    }
   }
 
   #getEventsForCommand(commandId) {

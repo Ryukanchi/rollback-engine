@@ -223,6 +223,8 @@ class RollbackEngine {
       diagnosticReporter,
       emitDiagnostic: this.#emitDiagnostic,
       validateResult: (result) => this.#validateCommandResult(result),
+      validateHistoricalReceiptState: (result, stateAnchor) =>
+        this.#validateHistoricalReceiptState(result, stateAnchor),
     });
     this.#nextAggregateId = startingIds.aggregateId ?? 1;
     this.#nextReservationId = startingIds.reservationId ?? 1;
@@ -666,6 +668,57 @@ class RollbackEngine {
       sequence,
       lastEventId: lastEvent?.eventId ?? null,
     };
+  }
+
+  /**
+   * Reconstructs exactly the historical state named by the receipt. This path
+   * intentionally bypasses snapshots and materialized state; events after the
+   * anchor are loaded but excluded from the projected prefix.
+   */
+  #validateHistoricalReceiptState(result, stateAnchor) {
+    if (stateAnchor === null) {
+      if (
+        result.state !== null ||
+        (result.snapshot !== null && result.snapshot !== undefined)
+      ) {
+        throw new TypeError(
+          "an unanchored receipt cannot contain historical state"
+        );
+      }
+
+      return;
+    }
+
+    const historicalState = this.replayAtSequence(
+      stateAnchor.aggregateId,
+      stateAnchor.sequence
+    );
+
+    if (!isDeepStrictEqual(result.state, historicalState)) {
+      throw new TypeError(
+        "receipt result state does not match historical replay"
+      );
+    }
+
+    if (result.snapshot === null || result.snapshot === undefined) {
+      return;
+    }
+
+    const snapshot = result.snapshot;
+
+    if (
+      !snapshot ||
+      typeof snapshot !== "object" ||
+      Array.isArray(snapshot) ||
+      snapshot.aggregateId !== stateAnchor.aggregateId ||
+      snapshot.version !== stateAnchor.sequence ||
+      snapshot.lastEventId !== stateAnchor.lastEventId ||
+      !isDeepStrictEqual(snapshot.state, historicalState)
+    ) {
+      throw new TypeError(
+        "receipt snapshot does not match historical replay"
+      );
+    }
   }
 
   #recordEvent(aggregateId, eventType, payload, commandContext) {
